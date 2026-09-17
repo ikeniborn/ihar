@@ -1,0 +1,10 @@
+# Paths excluded from the iwiki source graph (gitignore syntax).
+# The task-log index is a process artifact (like docs/superpowers/), not a
+# documentable source — it must never pin the "needs a wiki page" Stop nag.
+.claude/
+.git-activity-venv/
+.playwright-mcp/
+.pytest_cache/
+.superpowers/
+docs/TODO.md
+docs/superpowers/
