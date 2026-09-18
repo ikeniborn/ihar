@@ -1,1 +1,103 @@
 # ihar
+
+One control and security plane for native coding agents.
+
+`ihar` launches the vendors' own `claude` and `codex` binaries — it does not wrap, patch
+or replace them. What it adds is the part the vendors leave to you: one place that decides
+what an agent may reach, proves the decision is actually in force before the agent starts,
+and refuses to launch when it cannot.
+
+## Why
+
+Two agents, two configuration formats, two hook systems, two sandbox models. Keeping a
+security rule true in both by hand is how it quietly stops being true in one. `ihar`
+renders both configurations from a single profile, verifies the vendor accepted them, and
+makes an unproven guarantee a failure rather than a footnote.
+
+## What a profile guarantees
+
+A profile is a set of guarantees, and `ihar check` prints the text of the one in force.
+
+| profile | in force |
+|---|---|
+| `standard` | Hooks advise. No network control. The vendor's own defaults, plus a single configuration. |
+| `protected` | Hooks are enforced. Model traffic goes through a local gateway that masks secrets and refuses what it cannot mask. MCP servers are limited to a registry allowlist. |
+| `remote-protected` | As `protected`, for a remote surface. |
+| `isolated` | As `protected`, inside a microVM. |
+
+A profile that enforces something and cannot prove it aborts the launch. There is no mode
+where a guarantee degrades silently.
+
+## Install
+
+Everything installs under your own user. No `sudo`, at any step.
+
+```bash
+git clone <this repository> ihar
+cd ihar
+./ihar.sh install
+```
+
+That builds the store, links `ihar` into `~/.local/bin`, creates the Python environment,
+downloads the components the lockfile pins — verifying each against its recorded digest —
+and runs the hook conformance suite the enforced profiles require.
+
+If `~/.local/bin` is not on your `PATH`, the installer says so; add it:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+## Use
+
+```bash
+ihar claude
+ihar codex
+ihar --profile protected codex
+ihar check
+ihar --dry-run --profile protected codex
+```
+
+Everything after `--` reaches the agent untouched:
+
+```bash
+ihar codex -- mcp list
+```
+
+`ihar --help` lists every command and flag.
+
+## Configure
+
+Per-project settings live in a `.ihar_config` file at the project root. Copy the generated
+example and edit it:
+
+```bash
+cp .ihar_config.example .ihar_config
+```
+
+The file is parsed, never sourced: only `IHAR_*` assignments are accepted, an unknown key
+is an error, and a value is data rather than something to execute. Precedence is defaults,
+then this file, then command-line flags — with one exception: a profile's masking level is
+a floor, and neither the file nor a flag may lower it.
+
+## Update
+
+```bash
+ihar update
+```
+
+Install and update are the same operation. Each component compares the version the
+lockfile pins with the one recorded beside it, so bumping the lockfile is what upgrades and
+an unchanged lockfile makes the run a no-op. A vendor upgrade re-runs the conformance suite,
+because the record is keyed by the binary's digest — a new binary has not earned the old
+pass.
+
+## Requirements
+
+Linux or macOS, Bash 5, Python 3.11 or newer, `flock`, and `curl` or `wget`.
+
+## Documentation
+
+- `docs/hld/unified-harness.md` — what the system is for and what it guarantees
+- `docs/lld/unified-harness.md` — how it is built
+- `CLAUDE.md` — the development and testing rules for this repository

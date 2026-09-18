@@ -812,13 +812,15 @@ In order, each fail-closed: hook integrity and, for Codex, trust state through `
 
 Merges iclaude's fields (`nodeVersion` and `claudeCodeVersion` from the jq object at `lib/lockfile/save.sh:176-202`; `claudeBinarySha256` written separately by `record_claude_binary_hash` at `save.sh:299-310`) with icodex's (`version`, `asset`, `sha256`, `lib/binary/lockfile.sh:9-18`).
 
+`claude.binarySha256` is the one optional field inside a component block, and it has to be: it is the digest of the binary npm produced, so it exists only after the install it describes. Requiring it would mean no lockfile pinning a Claude version could ever validate. `codex.sha256` is required by contrast, because it is the published release archive's digest and is checked before extraction rather than recorded after it.
+
 ### 14.2 Verification at launch
 
 Lockfile drift prompts or warns (iclaude `check_lockfile_changes`). A binary hash mismatch warns under `standard` and is exit 3 elsewhere. A hook or managed-hook hash mismatch is exit 3 in every profile. For enforced profiles, a missing, stale or failing conformance record is exit 3.
 
 ### 14.3 Commands
 
-`ihar install [--from-lockfile] [--acp] [--microvm] [--transparent] [--migrate-store]` installs the Node tree and `claude`, the Codex tarball with icodex's tamper guard (`lib/binary/install.sh:184-259`), `uv` and the venv, shims, hooks, managed hooks and manifests into the store with pins, then runs the conformance suite. `ihar update [--claude] [--codex] [--all]` stops managed daemons (§5.5), replaces binaries, re-pins, re-runs conformance, and restarts the daemons that were running; the icodex skip rule applies when the tag, the pin and the stamp already agree. `ihar check [--diff] [--conformance]` prints §12.4 and re-runs the suite on request. Store writes take `ihar_with_lock --required` on `$IHAR_STORE/.ihar-store.lock`.
+`ihar install [--acp] [--microvm] [--transparent] [--migrate-store]` installs the Node tree and `claude`, the Codex tarball with icodex's tamper guard (`lib/binary/install.sh:184-259`), `uv` and the venv, shims, hooks, managed hooks and manifests into the store with pins, then runs the conformance suite. There is no `--from-lockfile`: the lockfile is the only source of the versions installed, so the flag would name the sole behaviour. Install and update are one operation — each component compares its pinned version with the one stamped beside it, so bumping the lockfile is what upgrades and an unchanged lockfile makes the run a no-op. `ihar update [--claude] [--codex] [--all]` stops managed daemons (§5.5), replaces binaries, re-pins, re-runs conformance, and restarts the daemons that were running; the icodex skip rule applies when the tag, the pin and the stamp already agree. `ihar check [--diff] [--conformance]` prints §12.4 and re-runs the suite on request. Store writes take `ihar_with_lock --required` on `$IHAR_STORE/.ihar-store.lock`.
 
 ## 15. Data contracts
 

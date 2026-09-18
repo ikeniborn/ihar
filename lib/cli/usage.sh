@@ -11,6 +11,8 @@ usage: ihar [global flags] <command> [command flags] [-- agent args]
 commands
   claude | codex        launch the agent in this project
   check                 print the effective profile and what is enforced
+  install               install every pinned component under this user, no sudo
+  update                re-install what the lockfile now pins, then re-prove the hooks
   homes list | clean    project state directories
 
 global flags
@@ -34,6 +36,6 @@ everything after -- goes to the agent verbatim:
   ihar codex -- mcp list
 
 not yet delivered
-  sessions, switch, web, acp, install, update, daemon
+  sessions, switch, web, acp, daemon
 TEXT
 }

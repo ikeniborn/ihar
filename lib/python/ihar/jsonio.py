@@ -580,10 +580,18 @@ KINDS: dict[str, dict[str, Any]] = {
         },
         "optional": {
             "node": {"type": dict, "fields": {"version": {"type": str, "min_len": 1}}},
+            # The digest is of the installed binary, not of a published artefact, so
+            # it cannot be known before the install that produces it — requiring it
+            # made pinning a Claude version impossible, because no lockfile that
+            # named one could validate. Codex's `sha256` stays required: it is the
+            # release archive's digest, published with the release and checked
+            # before extraction.
             "claude": {
                 "type": dict,
                 "fields": {
                     "version": {"type": str, "min_len": 1},
+                },
+                "optional": {
                     "binarySha256": {"type": str, "pattern": _SHA256},
                 },
             },

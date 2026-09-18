@@ -27,6 +27,7 @@ source "$_IHAR_LIB/state/runtime.sh"
 source "$_IHAR_LIB/state/migrate.sh"
 source "$_IHAR_LIB/state/gc.sh"
 source "$_IHAR_LIB/store/lockfile.sh"
+source "$_IHAR_LIB/store/install.sh"
 source "$_IHAR_LIB/render/hooks.sh"
 source "$_IHAR_LIB/render/config.sh"
 source "$_IHAR_LIB/gateway/gateway.sh"
@@ -53,6 +54,8 @@ ihar_main() {
     help)         ihar_usage ;;
     claude|codex) ihar_cmd_launch "$IHAR_COMMAND" ;;
     check)        ihar_cmd_check ;;
+    install)      ihar_cmd_install ;;
+    update)       ihar_cmd_update ;;
     homes)        ihar_cmd_homes ;;
     *)            ihar_die 2 "unhandled command '$IHAR_COMMAND'" ;;
   esac
