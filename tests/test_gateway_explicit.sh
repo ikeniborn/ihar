@@ -126,4 +126,34 @@ metrics="$(curl -sS "http://127.0.0.1:$PORT/api/metrics" 2>/dev/null)"
 assert_contains "refusals are counted" "$metrics" '"refused"'
 assert_contains "and maskings are counted" "$metrics" '"masked"'
 
+# --- a requested port is a preference, never a requirement -------------------------------------
+#
+# The caller remembers the port an instance last used, because the base_url rendered
+# into the vendor's configuration embeds it: an ephemeral port on every restart
+# rewrote config.toml, and the runtime home keyed by that configuration then failed
+# its own drift check — a fail-closed abort of every second launch. A port already
+# taken must still start, on a different one, rather than refusing.
+
+start_gateway() { # <requested port> -> the port actually bound
+  local dir="$IHAR_TEST_TMP/reuse-$RANDOM"
+  mkdir -p "$dir"
+  python3 -m ihar.gateway.explicit --port "$1" --port-file "$dir/port" \
+    --log-dir "$dir/logs" --level standard --engine regex >"$dir/out" 2>"$dir/err" &
+  local pid=$! waited=0
+  while (( waited < 100 )) && [[ ! -s "$dir/port" ]]; do sleep 0.05; waited=$((waited + 1)); done
+  printf '%s %s\n' "$(cat "$dir/port" 2>/dev/null)" "$pid"
+}
+
+read -r first first_pid < <(start_gateway 0)
+kill "$first_pid" 2>/dev/null; wait "$first_pid" 2>/dev/null
+read -r again again_pid < <(start_gateway "$first")
+assert_eq "a free remembered port is reused exactly" "$first" "$again"
+
+# With the port still held, a second instance must fall back rather than fail.
+read -r other other_pid < <(start_gateway "$first")
+assert_exit "a taken port still starts" 1 test -z "$other"
+assert_exit "on a different port" 1 test "$other" = "$first"
+kill "$again_pid" "$other_pid" 2>/dev/null
+wait "$again_pid" "$other_pid" 2>/dev/null
+
 finish

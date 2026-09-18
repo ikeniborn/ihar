@@ -57,10 +57,20 @@ ihar_init() {
 # fallback is deliberate and bounded: the contract validator is pure stdlib, so a
 # machine without a built venv can still validate, while anything needing a
 # dependency fails on the import rather than silently degrading.
-ihar_python() {
+#
+# ihar_python_bin — the interpreter path alone. A caller that must `exec` the
+# interpreter, so that `$!` is the process it later signals, cannot go through the
+# function: `exec` takes a program, never a shell function.
+ihar_python_bin() {
   local interpreter="${IHAR_PY:-}"
   [[ -x "$interpreter" ]] || interpreter="$(command -v python3 || true)"
   [[ -n "$interpreter" ]] || ihar_die 3 "python3 is required and was not found"
+  printf '%s\n' "$interpreter"
+}
+
+ihar_python() {
+  local interpreter
+  interpreter="$(ihar_python_bin)" || return 3
   PYTHONPATH="${IHAR_ROOT:?IHAR_ROOT is not set}/lib/python${PYTHONPATH:+:$PYTHONPATH}" \
     "$interpreter" -m "$@"
 }

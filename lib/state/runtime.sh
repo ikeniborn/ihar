@@ -78,13 +78,43 @@ _ihar_runtime_materialise() {
     ihar_seal_runtime "$vendor" "$runtime"
   fi
 
-  if [[ "$mode" == "immutable" ]]; then
-    # Read-only to the agent as well as to us: under an enforced profile the sandbox
-    # denies the directory, and this is the second layer.
-    find "$runtime" -maxdepth 1 -type f -exec chmod 444 {} + 2>/dev/null || true
-  else
-    find "$runtime" -maxdepth 1 -type f -exec chmod 600 {} + 2>/dev/null || true
-  fi
+  _ihar_runtime_freeze "$runtime" "$render" "$mode"
+}
+
+# _ihar_runtime_freeze <runtime> <render> <mode> — seal what ihar rendered, and only
+# that.
+#
+# Freezing the whole directory was wrong, and fail-closed about it: sealing runs an
+# app-server against the published home, and Codex initialises its own sqlite state
+# there — goals, logs, memories, and their -wal/-shm companions. A blanket chmod 444
+# made those read-only, so the next launch's app-server aborted with "failed to
+# initialize sqlite state runtime" and hook verification could never pass.
+#
+# The rendered files are the security assets — hooks.json, ihar-policy.json,
+# config.toml, settings.json — and they are exactly the ones this seals. Vendor state
+# the vendor writes itself stays writable, because the vendor cannot run otherwise.
+_ihar_runtime_freeze() {
+  local runtime="$1" render="$2" mode="$3" perm=600 file name
+  [[ "$mode" == "immutable" ]] && perm=444
+  [[ -n "$render" && -d "$render" ]] || return 0
+
+  # Read-only to the agent as well as to us: under an enforced profile the sandbox
+  # denies the directory, and this is the second layer.
+  for file in "$render"/*; do
+    [[ -f "$file" ]] || continue
+    name="$(basename "$file")"
+    [[ -f "$runtime/$name" ]] && chmod "$perm" "$runtime/$name" 2>/dev/null
+  done
+  # ihar's own record of what it sealed, produced after publication rather than
+  # rendered, and therefore absent from the loop above.
+  [[ -f "$runtime/.ihar-sealed" ]] && chmod "$perm" "$runtime/.ihar-sealed" 2>/dev/null
+  return 0
+}
+
+# _ihar_rtrim_blank — stdin without its trailing blank lines.
+_ihar_rtrim_blank() {
+  awk '{ line[NR] = $0; if ($0 ~ /[^[:space:]]/) last = NR }
+       END { for (i = 1; i <= last; i++) print line[i] }'
 }
 
 # _ihar_runtime_verify <runtime> <render> — an existing home must match what this
@@ -104,7 +134,12 @@ _ihar_runtime_verify() {
     # the vendor itself reported, so it is derived state rather than rendered state.
     # Comparing it would make every sealed home look drifted.
     if [[ "$relative" == "config.toml" ]]; then
-      if ! cmp -s "$file" <(sed '/# ihar:hook-trust:start/,$d' "$runtime/$relative"); then
+      # The block is appended after a blank-line separator, so deleting the block
+      # leaves that separator behind and a byte comparison then reports a drift the
+      # second launch of an unchanged configuration always has. Trimming both sides
+      # makes the comparison about content rather than about the separator.
+      if ! cmp -s <(_ihar_rtrim_blank < "$file") \
+                  <(sed '/# ihar:hook-trust:start/,$d' "$runtime/$relative" | _ihar_rtrim_blank); then
         ihar_die 3 "runtime home $runtime has drifted at $relative; rendering into an existing home is never allowed"
       fi
       continue

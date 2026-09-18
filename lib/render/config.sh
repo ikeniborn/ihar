@@ -48,7 +48,10 @@ _ihar_render_codex_config() {
   # aborts — which is how this arrived as "render: unbound variable" on a line that
   # plainly assigns it.
   local render="$1"
-  local config="$render/config.toml"
+  local config="$render/.config-head"
+  local tables="$render/.config-tables"
+  : > "$config"
+  touch "$tables"
 
   if [[ "$IHAR_PROFILE_SANDBOX" != "vendor-default" ]]; then
     local mode permissions approval="on-request"
@@ -68,30 +71,37 @@ _ihar_render_codex_config() {
       printf '# ihar:mode:end\n'
     } >> "$config"
 
-    # Git must stay writable or the agent cannot commit its own work.
+    # Git must stay writable or the agent cannot commit its own work. A table, so it
+    # belongs after every bare key.
     {
       printf '# ihar:git:start\n'
       printf '[permissions.%s.filesystem.":workspace_roots"]\n' "$permissions"
       printf '".git/" = "write"\n'
       printf '# ihar:git:end\n'
-    } >> "$config"
+    } >> "$tables"
   fi
 
   if [[ "${IHAR_GATEWAY_MODE:-off}" == "explicit" ]]; then
     local prefix
     prefix="$(ihar_codex_auth_prefix)"
+    # The selector is a bare key and the provider itself is a table, so the two go to
+    # different fragments even though they are one decision.
     {
       printf '# ihar:provider:start\n'
       printf 'model_provider = "ihar"\n'
-      printf '\n[model_providers.ihar]\n'
+      printf '# ihar:provider:end\n'
+    } >> "$config"
+    {
+      printf '# ihar:provider-table:start\n'
+      printf '[model_providers.ihar]\n'
       printf 'name = "ihar gateway"\n'
       printf 'base_url = "http://127.0.0.1:%s/%s"\n' "$IHAR_GATEWAY_ACTIVE_PORT" "$prefix"
       printf 'wire_api = "responses"\n'
       # Keeps ChatGPT OAuth working through a custom base URL; without it Codex
       # would demand an API key and a subscription user could not launch at all.
       printf 'requires_openai_auth = true\n'
-      printf '# ihar:provider:end\n'
-    } >> "$config"
+      printf '# ihar:provider-table:end\n'
+    } >> "$tables"
   fi
 
   {
@@ -99,7 +109,22 @@ _ihar_render_codex_config() {
     printf '[projects."%s"]\n' "$IHAR_PROJECT_ROOT"
     printf 'trust_level = "trusted"\n'
     printf '# ihar:projects:end\n'
-  } >> "$config"
+  } >> "$tables"
+}
+
+# ihar_render_config_assemble <render-dir> — join the fragments in the only order
+# TOML accepts: every bare key, then every table.
+#
+# Assembled rather than appended in place, because three renderers produce regions in
+# whatever order suits them and TOML cares about an order none of them knows. Getting
+# this wrong made `sandbox_mode` a member of whichever table happened to precede it,
+# and Codex then failed to parse the file at all and reported no hooks.
+ihar_render_config_assemble() {
+  local render="$1"
+  local config="$render/config.toml"
+  [[ -f "$render/.config-head" || -f "$render/.config-tables" ]] || return 0
+  cat "$render/.config-head" "$render/.config-tables" > "$config" 2>/dev/null
+  rm -f "$render/.config-head" "$render/.config-tables"
 }
 
 # ihar_codex_auth_prefix — the path segment the gateway route expects for the auth

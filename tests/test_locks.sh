@@ -79,6 +79,29 @@ else
   echo "SKIP [contended lock cases]: flock is not installed"
 fi
 
+# --- a daemon started under a lock must not keep holding it ------------------------
+#
+# A forked child inherits the lock descriptor, and flock releases only when the last
+# descriptor on the file closes. The gateway is started under its own lock and outlives
+# the function holding it, so without ihar_close_lock_fds the lock stayed held for the
+# gateway's whole life and the next launch's release sat there until it timed out.
+
+if command -v flock >/dev/null 2>&1; then
+  SPAWN="$IHAR_TEST_TMP/spawn.lock"
+  spawn_under_lock() { # <close|keep>
+    bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/lock.sh'
+             child() { ( [[ '$1' == close ]] && ihar_close_lock_fds; exec sleep 20 ) & printf '%s\n' \"\$!\" > '$SPAWN.pid'; }
+             ihar_with_lock --required '$SPAWN' 5 child"
+    local pid; pid="$(cat "$SPAWN.pid")"
+    local taken=free
+    flock -w 2 "$SPAWN" -c true 2>/dev/null || taken=held
+    kill "$pid" 2>/dev/null
+    printf '%s\n' "$taken"
+  }
+  assert_eq "a child that closes the lock fds releases the lock" "free" "$(spawn_under_lock close)"
+  assert_eq "and one that does not still holds it" "held" "$(spawn_under_lock keep)"
+fi
+
 # --- every security call site asks for --required --------------------------------
 # A new caller that forgets the mode would be a silent downgrade, so the call sites
 # are asserted rather than trusted.
