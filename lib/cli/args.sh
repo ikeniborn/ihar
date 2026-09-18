@@ -51,7 +51,7 @@ running now would report success while doing nothing"
 
 # Commands this build implements. A command a later slice adds is not listed, so
 # asking for it is an error naming the slice rather than a silent no-op.
-_IHAR_COMMANDS=(claude codex check homes)
+_IHAR_COMMANDS=(claude codex check homes install update)
 
 _ihar_is_command() {
   local candidate="$1" known

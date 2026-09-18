@@ -78,7 +78,31 @@ render_codex() { # <sandbox> [approval]
   : > "$dir/config.toml"
   IHAR_PROFILE_SANDBOX="$1" IHAR_FLAG_APPROVAL="${2:-}" IHAR_GATEWAY_MODE=off \
     IHAR_PROJECT_ROOT="$PROJECT" _ihar_render_codex_config "$dir"
+  # The renderer emits fragments and the assembly orders them; reading the fragments
+  # would test half the contract and miss the ordering the assembly exists for.
+  ihar_render_config_assemble "$dir"
   cat "$dir/config.toml"
+}
+
+# The settings that must live at the document's top level. A key after a table header
+# belongs to that table — which is right for `".git/"` inside `[permissions.…]` and
+# fatal for these four, because Codex then finds no sandbox settings at all. It parsed
+# such a file without complaint and reported no hooks, which is how this surfaced.
+_IHAR_TOP_LEVEL_KEYS='^(sandbox_mode|approval_policy|default_permissions|model_provider) *='
+
+# assert_toml_order <name> <text> — none of those keys falls after a table header.
+assert_toml_order() {
+  local name="$1" text="$2" first_table=0 late="" n=0 line
+  while IFS= read -r line; do
+    n=$((n + 1))
+    case "$line" in
+      '['*) (( first_table )) || first_table=$n ;;
+      *) if (( first_table )) && [[ "$line" =~ $_IHAR_TOP_LEVEL_KEYS ]]; then
+           late="${line%% *} at line $n, after the table at line $first_table"
+         fi ;;
+    esac
+  done <<<"$text"
+  assert_eq "$name" "" "$late"
 }
 
 # `vendor-default` writes nothing. HLD section 8 calls the sandbox optional for
@@ -93,6 +117,7 @@ out="$(render_codex vendor)"
 assert_contains "vendor renders workspace-write" "$out" 'sandbox_mode = "workspace-write"'
 assert_contains "with managed permissions" "$out" 'default_permissions = "dev-safe"'
 assert_contains "and the git grant" "$out" '".git/" = "write"'
+assert_toml_order "and the assembled file is valid TOML order" "$out"
 
 out="$(render_codex read-only)"
 assert_contains "read-only renders read-only" "$out" 'sandbox_mode = "read-only"'
@@ -101,6 +126,32 @@ assert_contains "and still names permissions" "$out" 'default_permissions'
 out="$(render_codex vendor never)"
 assert_contains "--approval changes the approval policy" "$out" 'approval_policy = "never"'
 assert_contains "and nothing else" "$out" 'sandbox_mode = "workspace-write"'
+
+# Under a gateway the provider is one decision written as two regions — the selector
+# is a bare key and the provider itself is a table — so it is the case the ordering
+# broke on first.
+render_codex_gateway() {
+  local dir="$IHAR_TEST_TMP/render-gw-$RANDOM"
+  mkdir -p "$dir"
+  IHAR_PROFILE_SANDBOX=vendor IHAR_FLAG_APPROVAL="" \
+    IHAR_GATEWAY_MODE=explicit IHAR_GATEWAY_ACTIVE_PORT=41234 \
+    IHAR_PROJECT_ROOT="$PROJECT" _ihar_render_codex_config "$dir"
+  ihar_render_config_assemble "$dir"
+  cat "$dir/config.toml"
+}
+out="$(render_codex_gateway)"
+assert_contains "the gateway selects the ihar provider" "$out" 'model_provider = "ihar"'
+assert_contains "and defines it" "$out" 'base_url = "http://127.0.0.1:41234/'
+assert_toml_order "with the selector still at the top level" "$out"
+
+# The assertion above would pass on an empty file too, so prove it fails on the shape
+# the defect produced: the provider table written before the bare keys. Run in a
+# subshell, whose FAIL count is discarded with it.
+neg="$( (assert_toml_order "negative" '[model_providers.ihar]
+name = "x"
+sandbox_mode = "workspace-write"') )"
+assert_contains "and the order check rejects a table-first document" "$neg" \
+  "FAIL [negative]"
 
 # --- the gateway instance key covers the whole configuration -----------------------------------
 #

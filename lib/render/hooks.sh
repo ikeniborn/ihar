@@ -44,8 +44,11 @@ ihar_render_all() {
       ;;
   esac
 
-  ihar_render_mcp "$vendor" "$render"
+  # Config before MCP: the config renderer creates the head and table fragments the
+  # MCP region appends to, and the assembly puts bare keys before tables.
   ihar_render_config "$vendor" "$render"
+  ihar_render_mcp "$vendor" "$render"
+  [[ "$vendor" == codex ]] && ihar_render_config_assemble "$render"
   ihar_render_policy "$vendor" "$render"
 }
 
@@ -63,9 +66,13 @@ ihar_render_mcp() {
   local registry="$IHAR_ROOT/manifests/mcp/registry.json"
   [[ -f "$registry" ]] || return 0
 
+  # Stdout only. The renderer reports skipped servers and capability gaps on stderr,
+  # and merging the two put a line of prose inside config.toml, which made the file
+  # invalid TOML and left Codex reporting no hooks at all.
   local out status=0
-  out="$(ihar_python ihar.render.mcp "$vendor" "$IHAR_PROFILE" "$registry" 2>&1)" || status=$?
-  (( status == 0 )) || ihar_die 3 "cannot render the MCP registry for $vendor: ${out:-no output}"
+  out="$(ihar_python ihar.render.mcp "$vendor" "$IHAR_PROFILE" "$registry" 2>/dev/null)" \
+    || status=$?
+  (( status == 0 )) || ihar_die 3 "cannot render the MCP registry for $vendor"
 
   case "$vendor" in
     claude)
@@ -73,13 +80,13 @@ ihar_render_mcp() {
       printf '%s\n' "$out" > "$render/mcp/ihar.json"
       ;;
     codex)
-      # Appended to the same config.toml the trust block is appended to, inside its
-      # own marked region so a later render can replace exactly this part.
+      # Into the table fragment, never the head: every bare key must precede the
+      # first table, and `[mcp_servers.*]` is a table.
       {
         printf '# ihar:mcp:start\n'
         printf '%s\n' "$out"
         printf '# ihar:mcp:end\n'
-      } >> "$render/config.toml"
+      } >> "$render/.config-tables"
       ;;
   esac
 }

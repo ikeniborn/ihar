@@ -54,18 +54,39 @@ _ihar_gateway_acquire_locked() {
     return 0
   fi
 
-  # Whatever was here is not answering. Removing the stale files rather than reusing
-  # them keeps a dead instance from being attached to forever.
+  # Whatever was here is not answering, so the stale files go rather than being
+  # attached to forever. The port it used is carried forward as a preference: the
+  # base_url rendered into the vendor's configuration embeds it, so an ephemeral port
+  # on every restart rewrote config.toml, and the runtime home keyed by that
+  # configuration then failed its own drift check — a fail-closed abort of every
+  # second launch.
+  # Held in a variable and cleared on disk, so the wait loop below cannot mistake the
+  # remembered value for a port the new server has already published.
+  local preferred="${port:-0}"
   rm -f "$dir/pid" "$dir/port"
 
   local enforced=()
   [[ "$IHAR_PROFILE_HOOKS" == "enforced" ]] && enforced=(--enforced)
 
-  ihar_python ihar.gateway.explicit \
-    --port 0 --port-file "$dir/port" --log-dir "$dir/logs" \
-    --level "$IHAR_GATEWAY_MASKING_LEVEL" \
-    --engine "${IHAR_GATEWAY_ENGINE:-presidio}" \
-    "${enforced[@]}" >/dev/null 2>"$dir/stderr" &
+  # The server outlives this function by design, so the child must first drop the
+  # flock descriptor it inherits: flock releases only when the last descriptor on the
+  # file closes, and keeping it would hold the gateway lock for the gateway's whole
+  # life — the next launch's release then sat there until it timed out.
+  #
+  # `exec` the interpreter rather than calling ihar_python, so that the pid recorded
+  # here is the server itself and not a shell that happens to be its parent; a kill
+  # aimed at that shell would leave the server running.
+  local py
+  py="$(ihar_python_bin)"
+  (
+    ihar_close_lock_fds
+    exec env PYTHONPATH="$IHAR_ROOT/lib/python${PYTHONPATH:+:$PYTHONPATH}" \
+      "$py" -m ihar.gateway.explicit \
+      --port "$preferred" --port-file "$dir/port" --log-dir "$dir/logs" \
+      --level "$IHAR_GATEWAY_MASKING_LEVEL" \
+      --engine "${IHAR_GATEWAY_ENGINE:-presidio}" \
+      "${enforced[@]}"
+  ) </dev/null >/dev/null 2>"$dir/stderr" &
   printf '%s\n' "$!" > "$dir/pid"
 
   local waited=0
@@ -123,7 +144,9 @@ _ihar_gateway_release_locked() {
   pid="$(cat "$dir/pid" 2>/dev/null || true)"
   [[ -n "$pid" ]] || return 0
   kill "$pid" 2>/dev/null || true
-  rm -f "$dir/pid" "$dir/port"
+  # The port file outlives the instance on purpose — it is what the next start asks
+  # for, so that the configuration rendered for this key stays the same one.
+  rm -f "$dir/pid"
 }
 
 # ihar_gateway_status — every instance, for ihar check.

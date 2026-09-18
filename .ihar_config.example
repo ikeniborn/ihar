@@ -1,0 +1,75 @@
+# ihar project configuration — copy to .ihar_config and edit.
+#
+# Parsed, never sourced: only KEY=value lines with an IHAR_* name are accepted, and
+# an unknown key is an error rather than something quietly ignored. A value is data,
+# so a command substitution written here is stored as text, not executed.
+#
+# Precedence is defaults < this file < command-line flags, with one exception: the
+# profile's masking level is a floor that neither this file nor a flag may lower.
+#
+# Every line below is commented out and shows the default.
+
+# Which guarantees this project runs under. `ihar check` prints the text of each.
+# accepted: standard | protected | remote-protected | isolated
+# IHAR_PROFILE=standard
+
+# Which agent a bare `ihar` launches.
+# accepted: claude | codex
+# IHAR_DEFAULT_AGENT=claude
+
+# May tighten the profile's floor, never loosen it. Any level above `off` needs a
+# gateway, so it is refused under a profile that has none.
+# accepted: off | secrets | standard
+# IHAR_GATEWAY_MASKING_LEVEL=the profile's floor
+
+# `presidio` falls back to regexes when it is not installed, and `ihar check`
+# reports which one actually ran.
+# accepted: presidio | regex
+# IHAR_GATEWAY_ENGINE=presidio
+
+# Binaries, hooks, credentials and the CA. Must stay outside any directory an
+# agent can write, which is why it is not in the checkout.
+# accepted: an absolute path
+# IHAR_STORE=${XDG_DATA_HOME:-~/.local/share}/ihar
+
+# Project state and runtime homes. Kept short because a Codex daemon socket
+# lives under it and the platform caps that path near 108 bytes.
+# accepted: an absolute path
+# IHAR_STATE_ROOT=${XDG_STATE_HOME:-~/.local/state}/ihar
+
+# The socket budget the state preflight checks against.
+# accepted: an integer
+# IHAR_SOCKET_PATH_MAX=107
+
+# Telemetry export.
+# accepted: off | otel | langfuse | both
+# IHAR_TELEMETRY=off
+
+# How a handoff summary is produced. `fork` asks the source agent on a fork of
+# its own session, so the transcript is never mutated.
+# accepted: fork | local | off
+# IHAR_DISTILLER=fork
+
+# Conversation language for the agents.
+# accepted: a language name
+# IHAR_CHAT_LANG=unset
+
+# Documentation language for the agents.
+# accepted: a language name
+# IHAR_DOC_LANG=unset
+
+# Corporate egress proxy, used by installs only.
+# accepted: a URL
+# IHAR_PROXY_URL=unset
+
+# CA bundle for that proxy.
+# accepted: a path
+# IHAR_PROXY_CA=unset
+
+# Only for a proxy whose certificate cannot be verified any other way.
+# accepted: 1 to skip verification
+# IHAR_PROXY_INSECURE=unset
+
+# Any IHAR_IWIKI_* key is accepted and forwarded to the iwiki MCP server.
+# accepted: a URL
+# IHAR_IWIKI_REMOTE_URL=unset

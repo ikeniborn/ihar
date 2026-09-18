@@ -46,7 +46,7 @@ run 'ihar install' first"
   local marker="$IHAR_STORE/.last-lockfile-hash"
   recorded="$(cat "$marker" 2>/dev/null || true)"
   if [[ -n "$recorded" && "$recorded" != "$current" ]]; then
-    ihar_warn "the lockfile changed since the last install; run 'ihar install --from-lockfile'"
+    ihar_warn "the lockfile changed since the last install; run 'ihar install'"
   fi
 
   ihar_store_verify_hooks "$strict"
@@ -100,7 +100,7 @@ ihar_store_verify_hooks() {
     case "$status" in
       0) ;;
       1) ihar_die 3 "$out differs from the lockfile
-run 'ihar install --from-lockfile'" ;;
+run 'ihar install'" ;;
       *) ihar_die 3 "cannot verify $key integrity: ${out:-no output}" ;;
     esac
   done

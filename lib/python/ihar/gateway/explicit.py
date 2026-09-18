@@ -257,11 +257,23 @@ def main(argv: list[str]) -> int:
 
     log.open_log(args.log_dir)
 
+    # A requested port is a preference, not a requirement. The caller remembers the
+    # port an instance last used so that the base_url rendered into the vendor's
+    # configuration stays the same across restarts — an ephemeral port every time
+    # would change that file, and the runtime home keyed by it would read as drifted
+    # on the very next launch. If something else has taken the port meanwhile, an
+    # ephemeral one is correct: the home is then genuinely a different configuration.
     try:
         server = build(args.port, args.level, args.engine, args.enforced)
     except OSError as error:
-        print(f"ihar: the gateway cannot bind: {error}", file=sys.stderr)
-        return 3
+        if args.port == 0:
+            print(f"ihar: the gateway cannot bind: {error}", file=sys.stderr)
+            return 3
+        try:
+            server = build(0, args.level, args.engine, args.enforced)
+        except OSError as fallback:
+            print(f"ihar: the gateway cannot bind: {fallback}", file=sys.stderr)
+            return 3
 
     port = server.server_address[1]
     if args.port_file:

@@ -160,6 +160,18 @@ writable="$(ihar_runtime_materialise codex "$h3" "$RENDER" writable)"
 assert_eq "a writable runtime file stays owner-only" "600" \
   "$(stat -c '%a' "$writable/settings.json")"
 
+# The seal covers what ihar rendered, and nothing else. Sealing runs an app-server
+# against the published home and Codex initialises its own sqlite state there; a
+# blanket chmod made that read-only and the next launch aborted with "failed to
+# initialize sqlite state runtime", so hook verification could never pass.
+ihar_seal_runtime() { printf 'vendor state\n' > "$2/logs_2.sqlite"; }
+sealed="$(ihar_runtime_materialise claude "$(ihar_config_hash s e a l e d 1 2)" "$RENDER")"
+unset -f ihar_seal_runtime
+assert_eq "the seal covers the rendered files" "444" \
+  "$(stat -c '%a' "$sealed/settings.json")"
+# Writability, not an exact mode: the umask decides the group and other bits.
+assert_exit "and leaves vendor-written state writable" 0 test -w "$sealed/logs_2.sqlite"
+
 # --- links -------------------------------------------------------------------------
 
 mkdir -p "$IHAR_STORE/skills" "$IHAR_STORE/hooks"
