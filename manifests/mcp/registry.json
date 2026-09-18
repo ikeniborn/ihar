@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "servers": [
+    {
+      "name": "iwiki-remote",
+      "transport": "http",
+      "url": "${IHAR_IWIKI_REMOTE_URL}",
+      "headers": {
+        "Authorization": "Bearer ${IWIKI_REMOTE_TOKEN}"
+      },
+      "env_names": ["IWIKI_REMOTE_TOKEN"],
+      "requires_env": ["IHAR_IWIKI_REMOTE_URL", "IWIKI_REMOTE_TOKEN"],
+      "egress": ["${IHAR_IWIKI_REMOTE_HOST}:443"],
+      "scope": "user",
+      "profiles": ["*"]
+    },
+    {
+      "name": "iwiki-local",
+      "transport": "stdio",
+      "command": "iwiki-mcp",
+      "args": [],
+      "env": {
+        "IWIKI_PROJECT_DIR": "${IHAR_PROJECT_ROOT}"
+      },
+      "env_names": ["IWIKI_LLM_KEY", "IWIKI_DB_PASSWORD"],
+      "requires_env": ["IWIKI_LLM_KEY"],
+      "scope": "project",
+      "profiles": ["standard", "protected"]
+    }
+  ]
+}

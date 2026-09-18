@@ -61,6 +61,20 @@ def decide(event, active):
     if level == "off":
         hookio.allow()
 
+    # 3a. MCP is a second egress channel, not a tool call that stays on this machine:
+    #     a registered server sends whatever it is given, wherever it points. The
+    #     model egress gateway never sees that traffic, so this is the only content
+    #     check on it (LLD 7.3).
+    if event.raw_tool.startswith("mcp__"):
+        masked, kinds = _redact_tree(event.input)
+        if kinds:
+            event.input.clear()
+            event.input.update(masked)
+            print(f"ihar: masked {', '.join(sorted(set(kinds)))} in an MCP call",
+                  file=sys.stderr)
+            hookio.update_input(event)
+        hookio.allow()
+
     rewrote = False
     kinds: list[str] = []
     for pointer, text in hookio.text_fields(event):
@@ -75,6 +89,34 @@ def decide(event, active):
         hookio.update_input(event)
 
     hookio.allow()
+
+
+def _redact_tree(value, kinds=None):
+    """Mask every string anywhere in an MCP argument tree.
+
+    An MCP tool's arguments have no schema this hook knows, so there is no field list
+    to work from the way there is for a shell command or a file write. Every string
+    is therefore scanned: under-scanning here would leave the one egress channel the
+    gateway cannot see unchecked.
+    """
+    kinds = [] if kinds is None else kinds
+    if isinstance(value, str):
+        masked, found = patterns.redact(value)
+        kinds.extend(found)
+        return masked, kinds
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            masked, kinds = _redact_tree(item, kinds)
+            out.append(masked)
+        return out, kinds
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            masked, kinds = _redact_tree(item, kinds)
+            out[key] = masked
+        return out, kinds
+    return value, kinds
 
 
 def _path_tokens(command: str):

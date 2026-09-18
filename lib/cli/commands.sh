@@ -51,7 +51,7 @@ use --profile standard until then"
   # shellcheck disable=SC2064
   trap "rm -rf '$render'" RETURN
   hooks_digest="$(ihar_manifest_digest)"
-  registry_digest="none"
+  registry_digest="$(ihar_registry_digest)"
   ihar_render_all "$vendor" "$render"
 
   # 7. runtime home, keyed by the configuration and never rewritten
@@ -152,9 +152,33 @@ ihar_cmd_check() {
     fi
   done
 
+  ihar_check_mcp
+
   if [[ "${IHAR_SUBCOMMAND:-}" == "--conformance" || "${IHAR_FLAG_CONFORMANCE:-false}" == true ]]; then
     ihar_cmd_conformance
   fi
+}
+
+# ihar_check_mcp — which registry entries this profile offers, and which it cannot.
+#
+# A skipped server is worth saying out loud: the profile's guarantee names an MCP
+# allowlist, and a user who believes a server is allowlisted when it was skipped for
+# a missing variable has a false picture of what is reachable.
+ihar_check_mcp() {
+  local registry="$IHAR_ROOT/manifests/mcp/registry.json"
+  [[ -f "$registry" ]] || { printf 'mcp          no registry\n'; return 0; }
+
+  local strict="not enforced"
+  [[ "${IHAR_PROFILE_MCP_STRICT:-false}" == true ]] && strict="strict: only registry servers load"
+
+  printf 'mcp          %s\n' "$strict"
+  local vendor notes
+  for vendor in claude codex; do
+    notes="$(ihar_python ihar.render.mcp "$vendor" "$IHAR_PROFILE" "$registry" --report 2>&1)" || true
+    while IFS= read -r note; do
+      [[ -n "$note" ]] && printf '             %s: %s\n' "$vendor" "$note"
+    done <<< "$notes"
+  done
 }
 
 # ihar_cmd_conformance — run the live suite and record the result (LLD 6.6).
