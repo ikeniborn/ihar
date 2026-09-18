@@ -44,7 +44,43 @@ ihar_render_all() {
       ;;
   esac
 
+  ihar_render_mcp "$vendor" "$render"
   ihar_render_policy "$vendor" "$render"
+}
+
+# ihar_registry_digest — an input to the configuration hash, so a registry change
+# produces a new runtime home rather than reusing one rendered from the old registry.
+ihar_registry_digest() {
+  local registry="$IHAR_ROOT/manifests/mcp/registry.json"
+  [[ -f "$registry" ]] || { printf 'none\n'; return 0; }
+  sha256sum "$registry" | cut -c1-16
+}
+
+# ihar_render_mcp <vendor> <render-dir> — the MCP servers this profile offers.
+ihar_render_mcp() {
+  local vendor="$1" render="$2"
+  local registry="$IHAR_ROOT/manifests/mcp/registry.json"
+  [[ -f "$registry" ]] || return 0
+
+  local out status=0
+  out="$(ihar_python ihar.render.mcp "$vendor" "$IHAR_PROFILE" "$registry" 2>&1)" || status=$?
+  (( status == 0 )) || ihar_die 3 "cannot render the MCP registry for $vendor: ${out:-no output}"
+
+  case "$vendor" in
+    claude)
+      mkdir -p "$render/mcp"
+      printf '%s\n' "$out" > "$render/mcp/ihar.json"
+      ;;
+    codex)
+      # Appended to the same config.toml the trust block is appended to, inside its
+      # own marked region so a later render can replace exactly this part.
+      {
+        printf '# ihar:mcp:start\n'
+        printf '%s\n' "$out"
+        printf '# ihar:mcp:end\n'
+      } >> "$render/config.toml"
+      ;;
+  esac
 }
 
 # ihar_render_policy <vendor> <render-dir> — the effective policy, next to the vendor
