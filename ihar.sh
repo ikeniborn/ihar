@@ -36,7 +36,16 @@ source "$_IHAR_LIB/cli/usage.sh"
 source "$_IHAR_LIB/cli/commands.sh"
 
 ihar_main() {
+  # The project and its configuration come first: the parser reads
+  # IHAR_DEFAULT_AGENT, and every command resolves its state under the roots the
+  # project may override. Parsing before this made both work only from the ambient
+  # environment, so a key set in a project file did nothing.
+  IHAR_PROJECT_ROOT="$(ihar_project_root)"
+  export IHAR_PROJECT_ROOT
+  ihar_config_load
+
   ihar_args_parse "$@"
+  ihar_guard_undelivered
   case "$IHAR_COMMAND" in
     help)         ihar_usage ;;
     claude|codex) ihar_cmd_launch "$IHAR_COMMAND" ;;

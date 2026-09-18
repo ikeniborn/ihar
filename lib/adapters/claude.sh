@@ -63,6 +63,8 @@ _adapter_claude_argv() {
     fi
   fi
 
+  if [[ -n "${IHAR_FLAG_PROMPT:-}" ]]; then IHAR_ARGV+=("$IHAR_FLAG_PROMPT"); fi
+
   # Claude accepts `--` and dispatches what follows, including its own subcommands.
   if (( ${#IHAR_PASSTHROUGH[@]} )); then IHAR_ARGV+=(-- "${IHAR_PASSTHROUGH[@]}"); fi
   return 0

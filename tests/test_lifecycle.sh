@@ -63,6 +63,34 @@ claude_home="$(ihar --dry-run claude | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
 codex_home="$(ihar --dry-run codex | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
 assert_exit "each vendor gets its own runtime home" 1 test "$claude_home" = "$codex_home"
 
+# --- the project's own configuration is what is read ------------------------------------
+#
+# Regression. The loader defaulted to the harness checkout, so a project pinning a
+# strict profile silently ran `standard`: the one file whose purpose is to raise a
+# project's floor was read from somewhere else entirely.
+
+printf 'IHAR_PROFILE=protected\n' > "$PROJECT/.ihar_config"
+out="$(ihar --dry-run claude)"
+# It aborts at the store check, which runs before the gateway guard; what matters is
+# that the pinned profile was in force at all rather than silently replaced by
+# `standard`, which is what a launch resolving successfully would prove.
+assert_contains "a profile pinned by the project is in force" "$out" "protected"
+assert_eq "and the launch does not resolve as standard" "0" \
+  "$(grep -c '"profile": "standard"' <<<"$out")"
+
+printf 'IHAR_DEFAULT_AGENT=codex\n' > "$PROJECT/.ihar_config"
+out="$(ihar --dry-run)"
+assert_contains "the default agent comes from the project file" "$out" '"vendor": "codex"'
+
+printf 'IHAR_DEFAULT_AGENT=gemini\n' > "$PROJECT/.ihar_config"
+assert_exit "an unknown default agent is a usage error" 2 ihar --dry-run
+assert_contains "and it names the key" "$(ihar --dry-run)" "IHAR_DEFAULT_AGENT"
+
+printf 'IHAR_NONESUCH=1\n' > "$PROJECT/.ihar_config"
+assert_exit "an unknown key in the project file is a usage error" 2 ihar check
+
+rm -f "$PROJECT/.ihar_config"
+
 # --- state is created once and reused ------------------------------------------------
 
 # runtime is <state>/r/<config-hash>/<vendor>, so the state root is three levels up.

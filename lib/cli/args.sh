@@ -21,8 +21,34 @@ IHAR_FLAG_EFFORT=""
 IHAR_FLAG_APPROVAL=""
 IHAR_FLAG_MASK_LEVEL=""
 IHAR_FLAG_WEB=false
+IHAR_FLAG_PROMPT=""
 IHAR_SUBCOMMAND=""
 IHAR_ARGS=()
+
+# Flags the parser accepts but no slice has delivered yet. Advertised in the usage
+# text, so silently ignoring one would make the harness report success while doing
+# the opposite of what was asked — `--mask-level secrets` running with masking off.
+# Refused with the slice that will deliver them, the same rule the gateway guard uses.
+_IHAR_UNDELIVERED_SLICE=( "--approval:S7" "--mask-level:S7" "--web:S12" "--json:S9" )
+
+ihar_guard_undelivered() {
+  local entry flag slice value
+  for entry in "${_IHAR_UNDELIVERED_SLICE[@]}"; do
+    flag="${entry%%:*}"; slice="${entry##*:}"
+    case "$flag" in
+      --approval)   value="$IHAR_FLAG_APPROVAL" ;;
+      --mask-level) value="$IHAR_FLAG_MASK_LEVEL" ;;
+      --web)        value="$([[ "$IHAR_FLAG_WEB" == true ]] && echo set || true)" ;;
+      --json)       value="$([[ "$IHAR_FLAG_JSON" == true ]] && echo set || true)" ;;
+    esac
+    [[ -z "$value" ]] || ihar_die 2 "$flag is accepted but not yet enforced; slice $slice delivers it
+running now would report success while doing nothing"
+  done
+
+  if [[ "$IHAR_FLAG_FORK" == true && -z "$IHAR_FLAG_RESUME" ]]; then
+    ihar_die 2 "--fork needs --resume: there is nothing to fork from"
+  fi
+}
 
 # Commands this build implements. A command a later slice adds is not listed, so
 # asking for it is an error naming the slice rather than a silent no-op.
@@ -59,6 +85,11 @@ ihar_args_parse() {
 
   if (( $# == 0 )); then
     IHAR_COMMAND="${IHAR_DEFAULT_AGENT:-claude}"
+    # Validated here rather than left to the dispatcher: an unknown value would
+    # otherwise surface as an internal "unhandled command" from the entry point,
+    # which tells the user nothing about the key that caused it.
+    _ihar_is_command "$IHAR_COMMAND" \
+      || ihar_die 2 "IHAR_DEFAULT_AGENT is '$IHAR_COMMAND', which is not an agent; use claude or codex"
     return 0
   fi
 
@@ -98,9 +129,19 @@ try: ihar $1 $IHAR_COMMAND ..."
 use -- to forward it to the agent, as in 'ihar $IHAR_COMMAND -- $1'"
         ;;
       *)
-        # A positional belongs to the command: a subcommand for `homes`, otherwise
-        # an argument the command defines.
-        if [[ -z "$IHAR_SUBCOMMAND" ]]; then IHAR_SUBCOMMAND="$1"; else IHAR_ARGS+=("$1"); fi
+        # A positional belongs to the command. For an agent it is the initial
+        # prompt, which both vendors accept; an earlier draft collected it into a
+        # variable nothing read, so `ihar claude "fix the bug"` dropped the prompt
+        # silently — the very defect this parser exists to prevent.
+        if [[ "$IHAR_COMMAND" == claude || "$IHAR_COMMAND" == codex ]]; then
+          [[ -z "$IHAR_FLAG_PROMPT" ]] \
+            || ihar_die 2 "only one prompt is accepted; quote it as a single argument"
+          IHAR_FLAG_PROMPT="$1"
+        elif [[ -z "$IHAR_SUBCOMMAND" ]]; then
+          IHAR_SUBCOMMAND="$1"
+        else
+          IHAR_ARGS+=("$1")
+        fi
         shift
         ;;
     esac

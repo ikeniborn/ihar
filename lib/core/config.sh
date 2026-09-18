@@ -39,8 +39,13 @@ _ihar_config_key_known() {
 # ihar_config_load [file] — parse the file and export what it sets. Values already
 # in the environment win, so the precedence is defaults < file < flags only because
 # the caller applies flags after this.
+#
+# The file belongs to the project being worked on, not to the harness checkout. An
+# earlier draft defaulted to $IHAR_ROOT/.ihar_config, so a project pinning a strict
+# profile silently ran `standard`: the one file whose whole purpose is to raise a
+# project's floor was read from somewhere else entirely.
 ihar_config_load() {
-  local file="${1:-$IHAR_ROOT/.ihar_config}"
+  local file="${1:-${IHAR_PROJECT_ROOT:-$PWD}/.ihar_config}"
   [[ -f "$file" ]] || return 0
 
   local line number=0 key value
@@ -74,13 +79,30 @@ ihar_config_load() {
   done < "$file"
 }
 
-# Harness-internal names, never exported to a vendor (LLD 1.3).
+# Exported names the child must not inherit, and which the harness no longer needs
+# once it is about to exec.
+#
+# Only exported names belong here. An earlier draft also listed the launcher's own
+# shell arrays, and `ihar_env_apply` then unset IHAR_ARGV immediately before
+# `exec "${IHAR_ARGV[@]}"`, which under `set -u` expands to nothing: every launch
+# became a bare `exec`, a no-op that returned 0 without starting the agent. Shell
+# variables that were never exported cannot reach a child anyway, so unsetting them
+# buys nothing and costs exactly that.
 _IHAR_ENV_DENY=(
   IHAR_ROOT IHAR_STORE IHAR_STATE_ROOT IHAR_NVM IHAR_PY IHAR_LOCKFILE
-  IHAR_CLAUDE_BIN IHAR_CODEX_BIN IHAR_SOCKET_PATH_MAX IHAR_FLOCK_BIN
-  IHAR_PASSTHROUGH IHAR_ARGV IHAR_ENV
+  IHAR_CLAUDE_BIN IHAR_CODEX_BIN IHAR_SOCKET_PATH_MAX IHAR_FLOCK_BIN IHAR_TRACE
   IHAR_GATEWAY_ANTHROPIC_UPSTREAM IHAR_GATEWAY_OPENAI_UPSTREAM IHAR_GATEWAY_CHATGPT_UPSTREAM
   CHROME_DESKTOP
+)
+
+# Launcher state: shell variables, never exported, never unset before the exec that
+# reads them. Named so the map below can refuse to sweep them.
+_IHAR_INTERNAL=(
+  IHAR_ARGV IHAR_ENV IHAR_ENV_DROPPED IHAR_PASSTHROUGH IHAR_ARGS
+  IHAR_COMMAND IHAR_SUBCOMMAND
+  IHAR_FLAG_PROFILE IHAR_FLAG_DRY_RUN IHAR_FLAG_JSON IHAR_FLAG_RESUME IHAR_FLAG_FORK
+  IHAR_FLAG_NAME IHAR_FLAG_MODEL IHAR_FLAG_EFFORT IHAR_FLAG_APPROVAL
+  IHAR_FLAG_MASK_LEVEL IHAR_FLAG_WEB IHAR_FLAG_PROMPT
 )
 
 # Kept under an enforced profile even though nothing lists them: without these a
@@ -147,7 +169,12 @@ ihar_env_apply() {
   local name
   if (( ${#IHAR_ENV[@]} )); then return 0; fi   # allowlist mode hands over via env -i
   for name in "${IHAR_ENV_DROPPED[@]:-}"; do
-    if [[ -n "$name" ]]; then unset -v "$name" 2>/dev/null || true; fi
+    if [[ -z "$name" ]]; then continue; fi
+    # Never touch launcher state. `exec "${IHAR_ARGV[@]}"` runs one line after this,
+    # and an unset array expands to nothing under `set -u`, turning the exec into a
+    # silent no-op. Only exported names are dropped, which is all a child can see.
+    if _ihar_name_in "$name" "${_IHAR_INTERNAL[@]}"; then continue; fi
+    unset -v "$name" 2>/dev/null || true
   done
 }
 
@@ -155,27 +182,36 @@ ihar_env_apply() {
 # native list go verbatim; the rest are exported de-prefixed, so IHAR_PROXY_URL
 # becomes PROXY_URL for the modules that expect it.
 ihar_env_map() {
-  local name native bare denied
-  for name in $(compgen -v | grep '^IHAR_' || true); do
-    # Harness-internal names are not configuration and must not reach the child. Two
-    # of them are arrays, where ${!name} silently yields element zero, so a sweep
-    # that did not skip them would export a fragment of the argv as ARGV=.
-    denied=false
-    for bare in "${_IHAR_ENV_DENY[@]}"; do
-      if [[ "$name" == "$bare" ]]; then denied=true; break; fi
-    done
-    if [[ "$denied" == true ]]; then continue; fi
-    [[ -n "${!name:-}" ]] || continue
-    native=false
-    for bare in "${_IHAR_NATIVE_LIST[@]}"; do
-      [[ "$name" == "$bare" ]] && native=true && break
-    done
-    if [[ "$native" == true ]]; then
-      export "${name?}"
-    else
-      bare="${name#IHAR_}"
-      printf -v "$bare" '%s' "${!name}"
-      export "${bare?}"
-    fi
+  local name bare
+
+  # Native names go verbatim.
+  for name in "${_IHAR_NATIVE_LIST[@]}"; do
+    if [[ -n "${!name:-}" ]]; then export "${name?}"; fi
   done
+
+  # Configuration keys go de-prefixed, so IHAR_PROXY_URL becomes PROXY_URL for the
+  # modules that expect it.
+  #
+  # An explicit set, not a sweep over every IHAR_* variable. The sweep exported the
+  # launcher's own parser state under generic names — COMMAND, TRACE, FLAG_MODEL —
+  # which are names other tools in the agent's shell honour, and it read element zero
+  # of any array it met. What reaches a vendor is now what the key table names, and
+  # nothing else.
+  for name in "${_IHAR_CONFIG_KEYS[@]}" $(compgen -v | grep '^IHAR_IWIKI_' || true); do
+    if [[ -z "${!name:-}" ]]; then continue; fi
+    if _ihar_name_in "$name" "${_IHAR_NATIVE_LIST[@]}"; then continue; fi
+    if _ihar_name_in "$name" "${_IHAR_ENV_DENY[@]}"; then continue; fi
+    bare="${name#IHAR_}"
+    printf -v "$bare" '%s' "${!name}"
+    export "${bare?}"
+  done
+}
+
+_ihar_name_in() {
+  local needle="$1"; shift
+  local candidate
+  for candidate in "$@"; do
+    if [[ "$needle" == "$candidate" ]]; then return 0; fi
+  done
+  return 1
 }

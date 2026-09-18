@@ -16,8 +16,8 @@ ihar_uuid() {
 ihar_cmd_launch() {
   local vendor="$1"
 
-  # 1. project configuration
-  ihar_config_load
+  # 1. the project and its configuration are resolved by the entry point, before the
+  #    parser runs: IHAR_DEFAULT_AGENT is a configuration key the parser reads.
 
   # 2. profile, before anything reads its severity
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
@@ -29,8 +29,7 @@ ihar_cmd_launch() {
   # setup exports IHAR_STATE, and a subshell would drop that export while still
   # returning the path, so everything downstream would look right and be unset.
   local root state
-  root="$(ihar_project_root)"
-  IHAR_PROJECT_ROOT="$root"; export IHAR_PROJECT_ROOT
+  root="$IHAR_PROJECT_ROOT"
   ihar_state_setup "$root" >/dev/null
   state="$IHAR_STATE"
 
@@ -110,7 +109,6 @@ ihar_dry_run() {
 
 # ihar_cmd_check — what is in force right now (LLD 12.4). Grows with every slice.
 ihar_cmd_check() {
-  ihar_config_load
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
   printf 'profile      %s\n' "$IHAR_PROFILE"
   printf 'guarantee    %s\n' "$IHAR_PROFILE_GUARANTEE"

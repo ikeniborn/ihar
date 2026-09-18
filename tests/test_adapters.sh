@@ -102,4 +102,63 @@ assert_contains "codex runs from the store" "$(ihar --dry-run codex)" "/store/bi
 assert_exit "launching without the binary installed fails" 1 ihar codex
 assert_contains "and names the remedy" "$(ihar codex)" "run 'ihar install'"
 
+# --- a real launch actually execs the agent ---------------------------------------------
+#
+# Regression, and the reason this fixture exists. Every other case here uses
+# --dry-run, which returns before the exec; with the exec path untested, the
+# launcher spent a whole slice unsetting IHAR_ARGV immediately before expanding it,
+# so `exec "${IHAR_ARGV[@]}"` became a bare `exec` — a no-op that started no agent
+# and exited 0. The harness reported success and did nothing.
+
+FAKE="$IHAR_TEST_TMP/fake-codex"
+cp "$ROOT/tests/fakes/record-exec.sh" "$FAKE"
+chmod +x "$FAKE"
+RECORD="$IHAR_TEST_TMP/record"
+
+real() { # <args...>
+  ( cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
+      IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_RECORD="$RECORD" \
+      "$ROOT/ihar.sh" "$@" ) 2>&1
+}
+
+rm -f "$RECORD"
+real codex -- mcp list >/dev/null
+assert_exit "a launch reaches the agent binary" 0 test -f "$RECORD"
+assert_contains "and hands it the passthrough" "$(cat "$RECORD" 2>/dev/null)" $'arg\tmcp'
+
+rm -f "$RECORD"
+real codex "fix the bug" >/dev/null
+assert_contains "a positional prompt reaches the agent" "$(cat "$RECORD" 2>/dev/null)" $'arg\tfix the bug'
+
+assert_exit "two prompts are a usage error" 2 real codex "one" "two"
+
+# --- launcher state never reaches the agent's environment ---------------------------------
+#
+# The environment map used to sweep every IHAR_* variable and export it de-prefixed,
+# so the parser's own state arrived as COMMAND, TRACE and FLAG_MODEL — names other
+# tools in the agent's shell honour.
+
+rm -f "$RECORD"
+( cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
+    IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_RECORD="$RECORD" IHAR_TRACE="" \
+    "$ROOT/ihar.sh" codex --model gpt ) >/dev/null 2>&1
+child_env="$(grep '^env' "$RECORD" 2>/dev/null | cut -f2 | sort)"
+for leaked in COMMAND TRACE FLAG_MODEL FLAG_DRY_RUN FLAG_JSON FLAG_FORK FLAG_WEB ARGV SUBCOMMAND; do
+  assert_exit "the agent does not inherit $leaked" 1 \
+    bash -c "grep -qx '$leaked' <<< '$child_env'"
+done
+assert_contains "but it does inherit its own vendor variables" "$child_env" "CODEX_HOME"
+
+# --- flags the harness accepts but does not yet enforce -------------------------------------
+#
+# The usage text advertises them. Ignoring one silently would make the harness report
+# success while doing the opposite of what was asked.
+
+for flag in "--approval never" "--mask-level secrets" "--web"; do
+  # shellcheck disable=SC2086
+  assert_exit "$flag is refused rather than ignored" 2 ihar codex $flag
+done
+assert_contains "and the refusal names the slice" "$(ihar codex --mask-level secrets)" "slice S7 delivers it"
+assert_exit "--fork without --resume is a usage error" 2 ihar codex --fork
+
 finish

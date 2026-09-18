@@ -58,6 +58,8 @@ _adapter_codex_argv() {
 
   # Codex is clap and rejects a bare `--`: `codex -- mcp list` answers
   # "unexpected argument 'list' found". The tokens go on unseparated.
+  if [[ -n "${IHAR_FLAG_PROMPT:-}" ]]; then IHAR_ARGV+=("$IHAR_FLAG_PROMPT"); fi
+
   if (( ${#IHAR_PASSTHROUGH[@]} )); then IHAR_ARGV+=("${IHAR_PASSTHROUGH[@]}"); fi
   return 0
 }
