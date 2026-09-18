@@ -92,10 +92,19 @@ def test_session_partial_relaxes_only_the_named_keys():
     rejects("profile", PROFILE, "has no partial form", partial=True)
 
 
+def test_semantic_rules_run_on_the_partial_shape_too():
+    """The partial record is the one a SessionStart hook appends, so it is exactly
+    the shape the session rules must police (LLD 10.3)."""
+    same = "0" * 8 + "-0000-0000-0000-" + "0" * 12
+    partial = {"schema": 1, "ihar_id": same, "vendor": "codex", "source": "hook",
+               "parent_ihar_id": same}
+    rejects("session", partial, "points at itself", partial=True)
+
+
 def test_free_form_maps_validate_keys_and_values():
     record = {
         "schema": 1, "vendor": "codex", "version": "0.154.0",
-        "binary_sha256": "ab12", "manifest_digest": "cd34",
+        "binary_sha256": "a" * 64, "manifest_digest": "b" * 64,
         "created_at": "2026-09-18T10:00:00Z",
         "cases": {"deny": {"status": "passed"}},
     }
@@ -106,7 +115,7 @@ def test_free_form_maps_validate_keys_and_values():
 
 def test_timestamps_must_be_iso_utc():
     record = {
-        "schema": 1, "pid": 1, "socket": "/tmp/s", "binary_sha256": "ab",
+        "schema": 1, "pid": 1, "socket": "/tmp/s", "binary_sha256": "a" * 64,
         "codex_version": "0.154.0", "config_hash": "abcd1234",
         "started_at": "1758186000", "remote_control": False,
     }
@@ -153,6 +162,29 @@ def test_merge_managed_replaces_managed_keys_and_keeps_the_rest():
     managed = {"hooks": {"new": True}}
     merged = jsonio.merge_managed(base, managed, ["hooks", "statusLine"])
     assert merged == {"model": "opus", "hooks": {"new": True}}, merged
+
+
+def test_merge_managed_refuses_to_drop_a_rendered_key():
+    """A render that emits a key the caller's list lags behind would otherwise write
+    settings without it, leaving enforcement absent rather than failing closed."""
+    try:
+        jsonio.merge_managed({"a": 1}, {"hooks": {}, "newKey": 2}, ["hooks"])
+    except jsonio.SchemaError as error:
+        assert "newKey" in str(error)
+        return
+    raise AssertionError("merge_managed dropped a rendered key")
+
+
+def test_integrity_pins_are_length_checked():
+    record = {
+        "schema": 1, "pid": 1, "socket": "/tmp/s", "binary_sha256": "ab",
+        "codex_version": "0.154.0", "config_hash": "abcd1234",
+        "started_at": "2026-09-18T10:00:00Z", "remote_control": False,
+    }
+    rejects("daemon-record", record, "binary_sha256")
+    record["binary_sha256"] = "a" * 64
+    jsonio.check("daemon-record", record)
+    rejects("daemon-record", {**record, "config_hash": "abc"}, "config_hash")
 
 
 if __name__ == "__main__":

@@ -42,10 +42,18 @@ _TYPE_NAMES = {str: "string", int: "integer", bool: "boolean", list: "array", di
 # ISO-8601 in UTC, the only timestamp representation any contract uses. A reader
 # converting from epoch seconds converts before the check, never after (LLD 10.1).
 _TS = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
-_HEX = r"[0-9a-f]+"
+# Integrity pins are length-checked, not merely hex-shaped. A truncated digest that
+# validates here would compare unequal at launch and abort the session, turning a
+# write-time defect into a fail-closed abort at the worst possible moment.
+_SHA256 = r"[0-9a-f]{64}"
+_HASH8 = r"[0-9a-f]{8}"
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _SLUG = r"[a-z][a-z0-9-]*"
 _ENVVAR = r"[A-Z][A-Z0-9_]*"
+# A path that stays inside the directory it is resolved against: no leading slash,
+# no `..` segment. Both `netpolicy` and a hook `script` are interpolated into a path,
+# one by the renderer and one into the command a vendor executes.
+_SAFE_REL = r"(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*"
 _VENDOR = ("claude", "codex")
 
 
@@ -80,6 +88,12 @@ def _check_field(path: str, value: Any, spec: Mapping[str, Any]) -> None:
 
     if spec.get("min_len") and len(value) < spec["min_len"]:
         raise SchemaError(f"{path}: shorter than {spec['min_len']}")
+
+    if "min" in spec and value < spec["min"]:
+        raise SchemaError(f"{path}: {value!r} is below {spec['min']}")
+
+    if "max" in spec and value > spec["max"]:
+        raise SchemaError(f"{path}: {value!r} is above {spec['max']}")
 
     if "items" in spec:
         for index, item in enumerate(value):
@@ -160,39 +174,90 @@ def _profile_rules(obj: Mapping[str, Any]) -> None:
             "the guest boundary is where a network policy is enforced"
         )
 
+    # LLD 13.1: Claude Remote Control refuses a custom ANTHROPIC_BASE_URL, so a
+    # profile that offers a Claude web surface cannot also run an explicit gateway.
+    # Without this the contradiction surfaces as an exit 2 when the user asks for
+    # --web, rather than when the profile is written.
+    if "claude" in obj["remote"] and obj["gateway"] == "explicit":
+        raise SchemaError(
+            f"profile {name!r}: lists 'claude' in remote but the gateway is 'explicit'; "
+            "Claude Remote Control refuses a custom base URL, so the web surface "
+            "would never start"
+        )
+
+
+def _overlap(left: list[str], right: list[str]) -> set[str]:
+    """Entries that both lists select, treating `*` as every value."""
+    if "*" in left:
+        return set(right)
+    if "*" in right:
+        return set(left)
+    return set(left) & set(right)
+
 
 def _hook_manifest_rules(obj: Mapping[str, Any]) -> None:
-    """At most one input-rewriting hook per event and tool set (LLD 6.1).
+    """At most one input-rewriting hook can match any single tool call (LLD 6.1).
 
     Codex runs the matching command hooks of one event concurrently, so two hooks
     that both return `updatedInput` race and one rewrite is silently lost.
+
+    The hazard is that two entries *can match the same call*, which is tool-set
+    intersection, not tool-set equality: entries on `["shell", "file-write"]` and on
+    `["shell"]` both fire for a Bash call. Conversely two entries that never run in
+    the same process, because they target different vendors or disjoint profiles,
+    cannot race and must not be rejected.
     """
-    seen: dict[tuple[str, tuple[str, ...]], str] = {}
     ids: set[str] = set()
+    rewriters: list[Mapping[str, Any]] = []
     for entry in obj["entries"]:
         if entry["id"] in ids:
             raise SchemaError(f"hook manifest: duplicate entry id {entry['id']!r}")
         ids.add(entry["id"])
-        if not entry.get("rewrites_input"):
-            continue
-        key = (entry["event"], tuple(sorted(entry["tools"])))
-        if key in seen:
+        if entry.get("rewrites_input"):
+            rewriters.append(entry)
+
+    for index, left in enumerate(rewriters):
+        for right in rewriters[index + 1:]:
+            if left["event"] != right["event"]:
+                continue
+            vendors = _overlap(left["vendors"], right["vendors"])
+            if not vendors:
+                continue
+            if not _overlap(left["profiles"], right["profiles"]):
+                continue
+            tools = _overlap(left["tools"], right["tools"])
+            if not tools:
+                continue
             raise SchemaError(
-                f"hook manifest: {entry['id']!r} and {seen[key]!r} both rewrite input on "
-                f"{entry['event']} for tools {', '.join(key[1])}; "
-                "the winning rewrite would be a race"
+                f"hook manifest: {left['id']!r} and {right['id']!r} both rewrite input on "
+                f"{left['event']} for {', '.join(sorted(tools))} "
+                f"under {', '.join(sorted(vendors))}; the winning rewrite would be a race"
             )
-        seen[key] = entry["id"]
 
 
 def _netpolicy_rules(obj: Mapping[str, Any]) -> None:
+    name = obj["name"]
+
     # A deny-by-default policy that allows nothing cannot reach a model provider, so
     # the profile using it could never run. Catch it here rather than at launch.
     if obj["default"] == "deny" and not obj["allow"]:
         raise SchemaError(
-            f"netpolicy {obj['name']!r}: default is 'deny' with an empty allow list; "
+            f"netpolicy {name!r}: default is 'deny' with an empty allow list; "
             "nothing, including the gateway, would be reachable"
         )
+
+    # Every rule must name something a renderer can turn into a filter. An entry with
+    # neither a kind nor a host is unenforceable, and a non-empty list of such entries
+    # would satisfy the check above while the policy still denies everything.
+    for index, entry in enumerate(obj["allow"]):
+        where = f"netpolicy {name!r}: allow[{index}]"
+        if ("kind" in entry) == ("host" in entry):
+            raise SchemaError(
+                f"{where} must name exactly one of 'kind' or 'host'; "
+                "an entry naming neither, or both, is not enforceable"
+            )
+        if "port" in entry and "host" not in entry:
+            raise SchemaError(f"{where} names a port without a host")
 
 
 def _mcp_registry_rules(obj: Mapping[str, Any]) -> None:
@@ -237,7 +302,8 @@ KINDS: dict[str, dict[str, Any]] = {
             "gateway": {"type": str, "enum": ("off", "explicit", "transparent")},
             "masking_level": {"type": str, "enum": ("off", "secrets", "standard")},
             "sandbox": {"type": str, "enum": ("vendor-default", "read-only", "vendor", "microvm")},
-            "netpolicy": _NULLABLE_STR,
+            # Resolved as manifests/netpolicy/<name>.json, so it is a slug, not a path.
+            "netpolicy": {"type": (str, type(None)), "pattern": _SLUG},
             "remote": {"type": list, "items": {"type": str, "enum": _VENDOR}},
             "mcp": {"type": dict, "fields": {"strict": {"type": bool}}},
             "acp": {"type": str, "enum": ("allow", "refuse")},
@@ -260,7 +326,7 @@ KINDS: dict[str, dict[str, Any]] = {
                     "optional": {
                         "kind": {"type": str, "enum": ("gateway", "mcp-declared")},
                         "host": {"type": str, "min_len": 1},
-                        "port": {"type": int},
+                        "port": {"type": int, "min": 1, "max": 65535},
                         "reason": {"type": str, "min_len": 1},
                     },
                 },
@@ -280,9 +346,12 @@ KINDS: dict[str, dict[str, Any]] = {
                         "id": {"type": str, "pattern": _SLUG},
                         "event": {"type": str, "min_len": 1},
                         "tools": {"type": list, "items": {"type": str, "min_len": 1}},
-                        "script": {"type": str, "min_len": 1},
+                        # Rendered into the command a vendor executes, so it must stay
+                        # inside the hooks directory it is resolved against.
+                        "script": {"type": str, "pattern": _SAFE_REL},
                         "args": {"type": list, "items": {"type": str}},
-                        "timeout": {"type": int},
+                        # Neither vendor documents a non-positive timeout.
+                        "timeout": {"type": int, "min": 1, "max": 300},
                         "vendors": {"type": list, "items": {"type": str, "enum": _VENDOR}},
                         "profiles": {"type": list, "items": {"type": str, "min_len": 1}},
                     },
@@ -386,7 +455,7 @@ KINDS: dict[str, dict[str, Any]] = {
             "ihar_id": {"type": str, "pattern": _UUID},
             "vendor": {"type": str, "enum": _VENDOR},
             "profile": {"type": str, "pattern": _SLUG},
-            "runtime_hash": {"type": str, "pattern": _HEX},
+            "runtime_hash": {"type": str, "pattern": _HASH8},
             "counter": {"type": int},
             "created_at": {"type": str, "pattern": _TS},
         },
@@ -452,9 +521,9 @@ KINDS: dict[str, dict[str, Any]] = {
             "schema": {"type": int, "const": 1},
             "pid": {"type": int},
             "socket": {"type": str, "min_len": 1},
-            "binary_sha256": {"type": str, "pattern": _HEX},
+            "binary_sha256": {"type": str, "pattern": _SHA256},
             "codex_version": {"type": str, "min_len": 1},
-            "config_hash": {"type": str, "pattern": _HEX},
+            "config_hash": {"type": str, "pattern": _HASH8},
             "started_at": {"type": str, "pattern": _TS},
             "remote_control": {"type": bool},
         },
@@ -466,8 +535,8 @@ KINDS: dict[str, dict[str, Any]] = {
             "schema": {"type": int, "const": 1},
             "vendor": {"type": str, "enum": _VENDOR},
             "version": {"type": str, "min_len": 1},
-            "binary_sha256": {"type": str, "pattern": _HEX},
-            "manifest_digest": {"type": str, "pattern": _HEX},
+            "binary_sha256": {"type": str, "pattern": _SHA256},
+            "manifest_digest": {"type": str, "pattern": _SHA256},
             "created_at": {"type": str, "pattern": _TS},
             "cases": {
                 "type": dict,
@@ -489,7 +558,7 @@ KINDS: dict[str, dict[str, Any]] = {
             "vendors": {"type": list, "items": {"type": str, "enum": _VENDOR}},
             "runtimes": {
                 "type": dict,
-                "key_pattern": _HEX,
+                "key_pattern": _HASH8,
                 "values": {
                     "type": dict,
                     "fields": {
@@ -515,7 +584,7 @@ KINDS: dict[str, dict[str, Any]] = {
                 "type": dict,
                 "fields": {
                     "version": {"type": str, "min_len": 1},
-                    "binarySha256": {"type": str, "pattern": _HEX},
+                    "binarySha256": {"type": str, "pattern": _SHA256},
                 },
             },
             "codex": {
@@ -523,16 +592,16 @@ KINDS: dict[str, dict[str, Any]] = {
                 "fields": {
                     "version": {"type": str, "min_len": 1},
                     "asset": {"type": str, "min_len": 1},
-                    "sha256": {"type": str, "pattern": _HEX},
+                    "sha256": {"type": str, "pattern": _SHA256},
                 },
             },
             "uv": {"type": dict, "fields": {"version": {"type": str, "min_len": 1}}},
-            "python": {"type": dict, "fields": {"requirementsSha256": {"type": str, "pattern": _HEX}}},
+            "python": {"type": dict, "fields": {"requirementsSha256": {"type": str, "pattern": _SHA256}}},
             "mitmproxy": {"type": dict, "fields": {"version": {"type": str, "min_len": 1}}},
-            "hooks": {"type": dict, "values": {"type": str, "pattern": _HEX}},
-            "managedHooks": {"type": dict, "values": {"type": str, "pattern": _HEX}},
+            "hooks": {"type": dict, "values": {"type": str, "pattern": _SHA256}},
+            "managedHooks": {"type": dict, "values": {"type": str, "pattern": _SHA256}},
             "acp": {"type": dict, "values": {"type": str, "min_len": 1}},
-            "microvm": {"type": dict, "values": {"type": str, "pattern": _HEX}},
+            "microvm": {"type": dict, "values": {"type": str, "pattern": _SHA256}},
         },
         "rules": [],
     },
@@ -549,8 +618,11 @@ def check(kind: str, obj: Any, *, partial: bool = False) -> Any:
 
     Raises SchemaError on any violation. `partial` relaxes the required set to the
     kind's `partial_required` tuple, for the field-by-field records the session index
-    supersedes; semantic rules do not run on a partial document, because they read
-    fields a partial record may legitimately omit.
+    supersedes.
+
+    Semantic rules run on a partial document too. The partial session record is the
+    one a SessionStart hook appends (LLD 10.3), so it is the shape those rules most
+    need to police; a rule must therefore read optional fields with `.get`.
     """
     try:
         spec = KINDS[kind]
@@ -569,9 +641,8 @@ def check(kind: str, obj: Any, *, partial: bool = False) -> Any:
         partial=partial,
         partial_required=spec.get("partial_required", ()),
     )
-    if not partial:
-        for rule in spec["rules"]:
-            rule(obj)
+    for rule in spec["rules"]:
+        rule(obj)
     return obj
 
 
@@ -604,6 +675,15 @@ def write(kind: str, path: str | os.PathLike[str], obj: Any, *, mode: int = 0o60
         handle.close()
         os.chmod(handle.name, mode)
         os.replace(handle.name, target)
+        # Fsync the directory too: the contents are durable after the flush above,
+        # but the rename itself is not, so a crash here could leave neither the old
+        # file nor the new name. An absent home marker or daemon record is as bad as
+        # a torn one.
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
     except BaseException:
         handle.close()
         try:
@@ -620,7 +700,18 @@ def merge_managed(base: Mapping[str, Any], managed: Mapping[str, Any], keys: lis
     there, so a key the render no longer emits disappears instead of lingering. Keys
     outside the list are never touched: that is what keeps a user's own settings
     surviving a launch.
+
+    A managed key missing from `keys` is an error, not a silent drop. The managed
+    block carries the hook configuration; a render that starts emitting a new key
+    while the caller's list lags behind would quietly write settings without it, and
+    enforcement would be absent rather than failing closed.
     """
+    unlisted = sorted(set(managed) - set(keys))
+    if unlisted:
+        raise SchemaError(
+            f"merge_managed: rendered keys {', '.join(unlisted)} are not in the managed list; "
+            "add them or they would be dropped from the written document"
+        )
     result = {key: value for key, value in base.items() if key not in keys}
     for key in keys:
         if key in managed:

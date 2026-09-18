@@ -58,18 +58,37 @@ assert_eq "every named netpolicy exists" "" "$missing"
 
 # --- semantic rules reject the configurations the LLD forbids --------------------
 
+# A rejection exits 7, never 1. Python exits 1 for an uncaught exception, an import
+# failure and a syntax error in the interpolated literal, so asserting 1 would let a
+# crashing validator report PASS. Only a SchemaError reaches 7.
 reject() { # <desc> <kind> <python dict literal>
   local desc="$1" kind="$2" doc="$3"
-  assert_exit "$desc" 1 py "
+  assert_exit "$desc" 7 py "
 import sys
 from ihar import jsonio
 try:
     jsonio.check(sys.argv[1], $doc)
 except jsonio.SchemaError:
-    sys.exit(1)
+    sys.exit(7)
 sys.exit(0)
 " "$kind"
 }
+
+accept() { # <desc> <kind> <python dict literal>
+  local desc="$1" kind="$2" doc="$3"
+  assert_exit "$desc" 0 py "
+import sys
+from ihar import jsonio
+jsonio.check(sys.argv[1], $doc)
+" "$kind"
+}
+
+# The rejection helper must itself fail on a crash rather than pass.
+assert_exit "a crashing snippet is not mistaken for a rejection" 1 py "
+import sys
+from ihar import jsonio
+raise RuntimeError('boom')
+"
 
 base='{"schema":1,"name":"x","guarantee":"g","hooks":"best-effort","gateway":"off",
        "masking_level":"off","sandbox":"vendor-default","netpolicy":None,"remote":[],
@@ -83,32 +102,63 @@ reject "enforced hooks with acp allow is rejected" profile \
 reject "microvm sandbox with no netpolicy is rejected" profile \
   "{**$base, 'sandbox':'microvm', 'acp':'refuse', 'hooks':'enforced', 'gateway':'explicit',
     'masking_level':'standard'}"
+reject "claude remote with an explicit gateway is rejected" profile \
+  "{**$base, 'remote':['claude'], 'gateway':'explicit', 'masking_level':'standard',
+    'hooks':'enforced', 'acp':'refuse'}"
 reject "unknown key is rejected" profile "{**$base, 'extra':1}"
 reject "wrong enum value is rejected" profile "{**$base, 'gateway':'sideways'}"
+reject "a netpolicy name that escapes its directory is rejected" profile \
+  "{**$base, 'netpolicy':'../../../tmp/open'}"
+
+accept "a valid minimal profile is accepted" profile "$base"
+accept "claude remote with a transparent gateway is accepted" profile \
+  "{**$base, 'remote':['claude'], 'gateway':'transparent', 'masking_level':'standard',
+    'hooks':'enforced', 'acp':'refuse'}"
+
+# --- network policy entries must name something enforceable ----------------------
+
 reject "deny-by-default with an empty allow list is rejected" netpolicy \
   "{'schema':1,'name':'x','default':'deny','allow':[]}"
-
-assert_exit "a valid minimal profile is accepted" 0 py "
-from ihar import jsonio
-jsonio.check('profile', $base)
-"
+reject "an allow entry naming neither kind nor host is rejected" netpolicy \
+  "{'schema':1,'name':'x','default':'deny','allow':[{'reason':'why'}]}"
+reject "an allow entry naming both kind and host is rejected" netpolicy \
+  "{'schema':1,'name':'x','default':'deny','allow':[{'kind':'gateway','host':'h'}]}"
+reject "a port with no host is rejected" netpolicy \
+  "{'schema':1,'name':'x','default':'deny','allow':[{'port':443}]}"
+reject "a port outside the valid range is rejected" netpolicy \
+  "{'schema':1,'name':'x','default':'deny','allow':[{'host':'h','port':0}]}"
 
 # --- the hook manifest linter ----------------------------------------------------
 
 entry="{'id':'a','event':'PreToolUse','tools':['shell'],'script':'s.py','args':[],
         'timeout':10,'vendors':['codex'],'profiles':['*']}"
+rw="{**$entry,'rewrites_input':True}"
 
-reject "two input-rewriting hooks on one event and tool set are rejected" hook-manifest \
-  "{'schema':1,'entries':[{**$entry,'rewrites_input':True},
-                          {**$entry,'id':'b','rewrites_input':True}]}"
+reject "two input-rewriting hooks on the same tool set are rejected" hook-manifest \
+  "{'schema':1,'entries':[$rw, {**$rw,'id':'b'}]}"
+# The hazard is that both hooks match the same call, which is intersection, not
+# equality: a Bash call fires both of these.
+reject "two input-rewriting hooks on overlapping tool sets are rejected" hook-manifest \
+  "{'schema':1,'entries':[{**$rw,'tools':['shell','file-write']}, {**$rw,'id':'b'}]}"
 reject "duplicate hook ids are rejected" hook-manifest \
   "{'schema':1,'entries':[$entry, $entry]}"
+reject "a script path that escapes the hooks directory is rejected" hook-manifest \
+  "{'schema':1,'entries':[{**$entry,'script':'../../../tmp/evil.py'}]}"
+reject "a non-positive hook timeout is rejected" hook-manifest \
+  "{'schema':1,'entries':[{**$entry,'timeout':0}]}"
 
-assert_exit "one rewriting hook beside a non-rewriting one is accepted" 0 py "
-from ihar import jsonio
-jsonio.check('hook-manifest', {'schema':1,'entries':[{**$entry,'rewrites_input':True},
-                                                     {**$entry,'id':'b'}]})
-"
+accept "one rewriting hook beside a non-rewriting one is accepted" hook-manifest \
+  "{'schema':1,'entries':[$rw, {**$entry,'id':'b'}]}"
+# Two hooks that never run in the same process cannot race.
+accept "rewriting hooks on different vendors are accepted" hook-manifest \
+  "{'schema':1,'entries':[$rw, {**$rw,'id':'b','vendors':['claude']}]}"
+accept "rewriting hooks on disjoint profiles are accepted" hook-manifest \
+  "{'schema':1,'entries':[{**$rw,'profiles':['standard']},
+                          {**$rw,'id':'b','profiles':['protected']}]}"
+accept "rewriting hooks on disjoint tool sets are accepted" hook-manifest \
+  "{'schema':1,'entries':[$rw, {**$rw,'id':'b','tools':['file-read']}]}"
+accept "a nested script path inside the hooks directory is accepted" hook-manifest \
+  "{'schema':1,'entries':[{**$entry,'script':'claude-only/caveman.js'}]}"
 
 # --- every JSON contract the LLD specifies has a registered kind ------------------
 
