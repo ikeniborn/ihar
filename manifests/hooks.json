@@ -1,0 +1,27 @@
+{
+  "entries": [
+    {
+      "args": [],
+      "event": "PreToolUse",
+      "id": "security-pretool",
+      "profiles": ["*"],
+      "required_in": ["protected", "remote-protected", "isolated"],
+      "rewrites_input": true,
+      "script": "security-pretool.py",
+      "timeout": 10,
+      "tools": ["shell", "file-read", "file-write", "mcp:*"],
+      "vendors": ["claude", "codex"]
+    },
+    {
+      "args": [],
+      "event": "SessionStart",
+      "id": "session-register",
+      "profiles": ["*"],
+      "script": "session-register.py",
+      "timeout": 5,
+      "tools": ["any"],
+      "vendors": ["claude", "codex"]
+    }
+  ],
+  "schema": 1
+}

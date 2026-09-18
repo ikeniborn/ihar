@@ -51,6 +51,36 @@ run 'ihar install' first"
 
   ihar_store_verify_hooks "$strict"
   ihar_store_verify_binaries "$strict"
+  ihar_store_verify_conformance "$strict"
+}
+
+# ihar_store_verify_conformance <strict> — a profile that claims hook enforcement
+# must be able to point at evidence that this vendor, at this version, honours a hook
+# decision (LLD 6.6).
+#
+# Rendering a hook is not evidence the vendor fired it. Without this, `hooks:
+# enforced` would be a claim about a file rather than about behaviour.
+ihar_store_verify_conformance() {
+  local strict="$1"
+  [[ "$strict" == true ]] || return 0
+  [[ "${IHAR_PROFILE_HOOKS:-best-effort}" == "enforced" ]] || return 0
+
+  local vendor="${IHAR_VENDOR:-}" binary version record
+  [[ -n "$vendor" ]] || return 0
+  case "$vendor" in
+    claude) binary="$IHAR_CLAUDE_BIN" ;;
+    codex)  binary="$IHAR_CODEX_BIN" ;;
+  esac
+  [[ -x "$binary" ]] || ihar_die 3 "profile '$IHAR_PROFILE' enforces hooks but the $vendor binary is absent"
+
+  version="$(ihar_version_slug "$binary")"
+  record="$IHAR_STORE/verification/$vendor-$version.json"
+  [[ -f "$record" ]] || ihar_die 3 "hook enforcement is unproven for $vendor $version
+run 'ihar check --conformance'"
+
+  local stale
+  stale="$(ihar_python ihar.conformance.check "$record" "$binary" "$IHAR_ROOT/manifests/hooks.json" 2>&1)" \
+    || ihar_die 3 "the conformance record for $vendor $version does not hold: ${stale:-no detail}"
 }
 
 # ihar_store_verify_hooks <strict> — hook scripts are the enforcement itself, so a

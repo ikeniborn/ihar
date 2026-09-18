@@ -59,24 +59,32 @@ _ihar_runtime_materialise() {
 
   ihar_link_runtime "$vendor" "$build" "$IHAR_STATE"
 
-  if [[ "$mode" == "immutable" ]]; then
-    # Read-only to the agent as well as to us: under an enforced profile the sandbox
-    # denies the directory, and this is the second layer.
-    find "$build" -maxdepth 1 -type f -exec chmod 444 {} + 2>/dev/null || true
-  else
-    find "$build" -maxdepth 1 -type f -exec chmod 600 {} + 2>/dev/null || true
-  fi
-
   mkdir -p "$IHAR_STATE/r/$hash"
   if ! mv "$build" "$runtime" 2>/dev/null; then
-    # Another launch of the same configuration won the race and published first.
-    # Its content is ours by construction, so adopt it rather than failing.
+    # Another launch of the same configuration won the race and published first. Its
+    # content is ours by construction, so adopt it rather than failing.
     rm -rf "$staging"
     [[ -d "$runtime" ]] || ihar_die 1 "cannot publish the runtime home at $runtime"
     _ihar_runtime_verify "$runtime" "$render"
     return 0
   fi
   rm -rf "$staging"
+
+  # Sealing happens after publication and before the files are sealed read-only. The
+  # key a Codex hook is trusted under embeds the absolute path of the rendered
+  # hooks.json, so a seal performed in the staging directory would record a path the
+  # publish then renames away.
+  if declare -F ihar_seal_runtime >/dev/null; then
+    ihar_seal_runtime "$vendor" "$runtime"
+  fi
+
+  if [[ "$mode" == "immutable" ]]; then
+    # Read-only to the agent as well as to us: under an enforced profile the sandbox
+    # denies the directory, and this is the second layer.
+    find "$runtime" -maxdepth 1 -type f -exec chmod 444 {} + 2>/dev/null || true
+  else
+    find "$runtime" -maxdepth 1 -type f -exec chmod 600 {} + 2>/dev/null || true
+  fi
 }
 
 # _ihar_runtime_verify <runtime> <render> — an existing home must match what this
@@ -91,6 +99,15 @@ _ihar_runtime_verify() {
     relative="${file#"$render"/}"
     if [[ ! -f "$runtime/$relative" ]]; then
       ihar_die 3 "runtime home $runtime is missing $relative; it does not match its configuration hash"
+    fi
+    # The hook trust block is appended to config.toml after publication, from digests
+    # the vendor itself reported, so it is derived state rather than rendered state.
+    # Comparing it would make every sealed home look drifted.
+    if [[ "$relative" == "config.toml" ]]; then
+      if ! cmp -s "$file" <(sed '/# ihar:hook-trust:start/,$d' "$runtime/$relative"); then
+        ihar_die 3 "runtime home $runtime has drifted at $relative; rendering into an existing home is never allowed"
+      fi
+      continue
     fi
     if ! cmp -s "$file" "$runtime/$relative"; then
       ihar_die 3 "runtime home $runtime has drifted at $relative; rendering into an existing home is never allowed"

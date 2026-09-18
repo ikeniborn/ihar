@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 4 (state layout corrected by measurement during slice S3) |
+| Status | revision 5 (Codex hook trust corrected by measurement during slice S5) |
 | Date | 2026-09-18 |
 | Derived from | `docs/hld/unified-harness.md` revision 2 (commit `ec2df36`) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -98,7 +98,6 @@ Revision 3 of this document specified a readable id, `<sanitized-basename>-<sha2
 | `bin/uv`, `bin/rg`, `bin/tree`, `bin/firecracker`, `bin/vmlinux`, `bin/rootfs.ext4` | tools and microVM assets | `ihar install` |
 | `venv/` | `requests`, `presidio-analyzer`, `presidio-anonymizer`, optional spaCy models, optional `claude-agent-sdk`, `mitmproxy` when transparent mode is installed | `ihar install` |
 | `skills/`, `hooks/`, `manifests/` | copies of the tracked trees, sha256-pinned | `ihar install` |
-| `managed-hooks/codex/` | the directory Codex reads as `hooks.managed_dir` (§6.4) | `ihar install` |
 | `auth/claude/.credentials.json`, `auth/codex/auth.json` | shared vendor logins | vendors |
 | `plugins/claude/`, `plugins/codex/` | plugin caches | vendors |
 | `verification/<vendor>-<version>.json` | live hook conformance records (§6.6) | `ihar install`, `ihar update` |
@@ -276,7 +275,7 @@ ihar_with_lock --best-effort  warn and run unlocked, the iclaude behaviour
 
 Claude managed keys are `hooks`, `enabledPlugins`, `statusLine`, `extraKnownMarketplaces`, `sandbox`. Because a runtime home is immutable, there is no merge-on-launch step: `ConfigRenderer` produces the complete `settings.json` from the store template plus the managed block, and user-owned keys come from `manifests/config/claude/settings.json` and from `.ihar_config`. A user who edits a runtime `settings.json` under `standard` changes the configuration hash on the next launch and gets a new runtime home, which is visible in `ihar check --diff`.
 
-Codex `config.toml` is likewise rendered whole from the template plus regions, using the same `ihar.toml_regions` writer so that a migrated user file can still be adopted once. Regions: `mode` (top of file; `sandbox_mode`, `approval_policy`, `default_permissions`), `hooks` (top of file; `hooks.managed_dir`, `managed_hooks_only` per §6.4), `provider` (top of file; `model_provider`), `provider-table`, `mcp`, `projects`, `telemetry` (all at the end, since TOML requires top-level keys before the first table).
+Codex `config.toml` is likewise rendered whole from the template plus regions, using the same `ihar.toml_regions` writer so that a migrated user file can still be adopted once. Regions: `mode` (top of file; `sandbox_mode`, `approval_policy`, `default_permissions`), `hook-trust` (end of file; `[hooks.state.*]` entries written after publication, per §6.4), `provider` (top of file; `model_provider`), `provider-table`, `mcp`, `projects`, `telemetry` (all at the end, since TOML requires top-level keys before the first table).
 
 ### 4.5 Migration
 
@@ -454,15 +453,30 @@ The security hook fails closed: any exception ends in `deny`. The workflow gates
 
 Revision 2 rendered `bypass_hook_trust = true` permanently. The key is global: it disables the trust gate for every hook that can affect the thread, including a `.codex/hooks.json` committed in whatever repository the agent is working on. A mechanism meant to trust ihar's own hooks would have trusted an attacker's.
 
-The 0.154 binary carries the proper mechanism, confirmed in its strings and its app-server schema: the configuration keys `hooks.managed_dir`, `hooks.windows_managed_dir` and `managed_hooks_only`, and the method `hooks/list` returning `HookMetadata {key, currentHash, trustStatus, isManaged, enabled, eventName, matcher, source, sourcePath, …}` with `HookTrustStatus ∈ {managed, untrusted, trusted, modified}` and `HookSource ∈ {system, user, project, mdm, plugin, …}`.
+Revision 3 read the configuration keys `hooks.managed_dir`, `hooks.windows_managed_dir` and `managed_hooks_only` out of the binary's strings and chose them, leaving one open item: whether a project `config.toml` may set them. Slice S5 measured it against the pinned 0.154.0 app-server before writing any code, and the answer removes the option:
 
-The design therefore is:
+| what was tried | what `hooks/list` reported |
+|----------------|----------------------------|
+| `hooks.managed_dir` in a project `config.toml` | no entries at all |
+| the same as a `-c` override | no entries at all |
+| the same with the file named `hooks.json` | no entries at all |
+| a plain `$CODEX_HOME/hooks.json` | listed, `trustStatus: "untrusted"`, `source: "user"` |
+| `[hooks.state."<key>"] trusted_hash = "sha256:<64 hex>"` | listed, **`trustStatus: "trusted"`** |
+| the same with a wrong or unprefixed value | listed, `trustStatus: "modified"` |
+| `bypass_hook_trust = true` | listed, still `"untrusted"` |
 
-1. `ihar install` writes the rendered Codex hook definitions into `$IHAR_STORE/managed-hooks/codex/` and pins them in the lockfile.
-2. The `hooks` region of `config.toml` sets `hooks.managed_dir` to that directory. Under enforced profiles it also sets `managed_hooks_only = true`, so project and plugin hooks do not run at all; under `standard` it does not, and project hooks keep the ordinary Codex trust flow.
-3. `bypass_hook_trust` is never written.
-4. Whether `hooks.managed_dir` is honoured from a project `config.toml` or only from a managed configuration location is the one open item (§20); the fallback is an install-time consent that persists an exact `trusted_hash` per hook, never a blanket bypass.
-5. Verification does not depend on which of the two applied, because it reads `hooks/list` (§6.5).
+Two conclusions. The managed directory is unreachable from anything a harness can write on a user's machine, so it is not the mechanism. And `bypass_hook_trust` does not confer trust at all — it suppresses the interactive prompt without changing the reported status — so the key the architecture review objected to was never the right mechanism for this purpose, quite apart from being too broad.
+
+The design is therefore the fallback this section already named, with one mechanical addition:
+
+1. The renderer writes `$CODEX_HOME/hooks.json` into the runtime home, as both wrappers do today.
+2. After the home is published and inside the materialisation lock, `ihar.codex.hooks_trust --seal` asks `hooks/list` for the key and `currentHash` of every hook whose `sourcePath` is that home's `hooks.json`, and appends `[hooks.state."<key>"] trusted_hash = "<hash>"` for each, inside an `# ihar:hook-trust:` region.
+3. Only hooks ihar rendered are trusted. A project or plugin hook keeps the vendor's ordinary trust flow, which is the whole objection to a blanket bypass.
+4. `bypass_hook_trust` is written nowhere.
+
+The seal runs after publication rather than in the staging directory because the key embeds the absolute path of the rendered `hooks.json`, which the atomic rename would change; and the drift check of §4.2 compares `config.toml` only up to the trust marker, because the block is derived from digests the vendor reported rather than rendered by ihar.
+
+Editing a sealed hook flips its status to `modified`, so the launch-time check of §6.5 catches a hook an agent rewrote between two runs — the property the whole mechanism exists for.
 
 ### 6.5 Trust verification at launch
 
@@ -741,7 +755,7 @@ The payload has exactly one carrier. Revision 2 put the same text in both the in
  "env_passthrough": [], "handoff": {"system_prompt": false}}
 ```
 
-`hooks` is `enforced` or `best-effort`. `enforced` means the profile's guarantees depend on hooks running, which is HLD §6.9's condition for refusing ACP, and it also switches on `managed_hooks_only`, the trust verification of §6.5 and the conformance requirement of §6.6.
+`hooks` is `enforced` or `best-effort`. `enforced` means the profile's guarantees depend on hooks running, which is HLD §6.9's condition for refusing ACP, and it also switches on the trust verification of §6.5 and the conformance requirement of §6.6.
 
 | Profile | hooks | gateway | masking floor | sandbox | network | remote | mcp.strict | acp |
 |---------|-------|---------|---------------|---------|---------|--------|-----------|-----|
@@ -841,7 +855,7 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | S2 | `tests/test_adapters.sh` | dry-run argv and environment per vendor; **passthrough per vendor**, `--` for Claude and none for Codex; unknown flag exit 2; capabilities validate |
 | S2 | `tests/test_lifecycle.sh` | step order: profile before store verify, gateway before render, render before materialise, daemon reconcile before launch; the gateway port reaches the Codex provider region |
 | S3 | `tests/test_hooks.sh` | rendered outputs match golden files per profile; **matcher regex translation** and a real match against `mcp__iwiki-local__wiki_update_page`; `args` rendered outside the quoted path; `python3 -I` in the command; one decision per security hook on fixtures for both vendors; fail-closed against fail-open classes; `hookio` rejects disallowed keys; the store-write refusal has no exclusion for store hook paths |
-| S3 | `tests/test_hook_trust.sh` | `hooks/list` responses drive the decision: `untrusted`, `modified`, `source: project` and a hash mismatch each abort with exit 3 under `protected`; the same responses warn under `standard`; `managed_hooks_only` is rendered only for enforced profiles; `bypass_hook_trust` appears in no render |
+| S3 | `tests/test_hook_trust.sh` | `hooks/list` responses drive the decision: `untrusted`, `modified`, `source: project` and a hash mismatch each abort with exit 3 under `protected`; the same responses warn under `standard`; sealing makes only ihar's own hooks trusted and a project hook is never in the trust block; `bypass_hook_trust` appears in no render |
 | S3 | `tests/test_conformance.py` | the suite's own cases run against fakes; a missing or stale record aborts an enforced launch |
 | S4 | `tests/test_mcp.sh` | renders match golden files at the runtime path; `requires_env` skip; `${IHAR_PROJECT_ROOT}` expansion; an unexpanded reference in a Codex render is exit 3; the header limitation is a notice; MCP input masking; a non-allowlisted server is absent from the render |
 | S5a | `tests/test_gateway_explicit.sh`, `tests/test_gateway_routes.py` | masked bodies on every model route; **an unknown route is refused when masking is on and relayed when off**; **an unknown content block and an image block are refused under enforced profiles**; structural keys keep their values but a secret inside one is caught; unparseable 400; compressed 415; limits enforced; streaming relay; websocket transit; probe answered locally; **instance key separates two masking levels**; refcount acquire and release; an unhealthy gateway aborts with exit 3 |
@@ -918,7 +932,7 @@ The review is right that the original slice order puts feature work before the c
 
 - **Codex titles** use `thread/name/set {threadId, name}` (`ThreadSetNameParams`), not `thread/metadata/update`, which carries only `threadId` and `gitInfo`.
 - **`--` is not a universal passthrough separator.** `codex -- mcp list` fails; `claude -- mcp list` works. HLD §6.1's rule holds as a user-facing convention only.
-- **`bypass_hook_trust` must not be used.** HLD §6.4 proposes it as the way to trust store-pinned hooks; it is global and would extend trust to any repository's `.codex/hooks.json`. Codex ships `hooks.managed_dir`, `managed_hooks_only` and `hooks/list` for exactly this purpose (§6.4).
+- **`bypass_hook_trust` must not be used.** HLD §6.4 proposes it as the way to trust store-pinned hooks; it is global and would extend trust to any repository's `.codex/hooks.json`. Measured in S5: the key does not even confer trust, leaving the status `untrusted`, so it is both too broad and ineffective. Per-hook `trusted_hash` verified through `hooks/list` is the mechanism (§6.4).
 - **A single per-project home cannot hold per-launch profiles.** HLD §6.3's home must be split into project state and profile-scoped runtime homes (§2.4).
 - **The store must not live in the checkout.** Under a workspace-write sandbox the agent can rewrite its own hooks, which no launch-time hash check can prevent (§2.1).
 - **The Codex daemon does not isolate per-client environment**, so HLD §6.6's assumption that a SessionStart hook can read launch-specific environment does not hold (§5.5).
@@ -930,7 +944,6 @@ The review is right that the original slice order puts feature work before the c
 
 ## 20. Open implementation decisions
 
-- Whether `hooks.managed_dir` and `managed_hooks_only` are honoured from a project `config.toml` or only from a managed-configuration location (§6.4). Resolve in S3; the fallback is per-hook `trusted_hash` after install-time consent.
 - The `app-server-control` socket framing over a socket transport against stdio (§5.4). Resolve in S3 or S6 at first daemon start.
 - Claude `sandbox` settings key names for 2.1.274 (§9.1). Resolve in S5a.
 - Codex `auth.json` field names for auth-mode detection (§8.7). Resolve in S5a.
@@ -945,7 +958,7 @@ The review is right that the original slice order puts feature work before the c
 
 | Finding | Disposition |
 |---------|-------------|
-| P0.1 global hook trust bypass | accepted and improved. The review offered three fallbacks; the 0.154 binary carries `hooks.managed_dir`, `managed_hooks_only` and `hooks/list` with `HookTrustStatus` and `currentHash`, so §6.4 uses the official managed-hook path and §6.5 verifies it. `bypass_hook_trust` is gone |
+| P0.1 global hook trust bypass | accepted. Revision 3 proposed the managed-hook directory; S5 measured it and found it unreachable from a project configuration, so §6.4 uses per-hook `trusted_hash` verified through `hooks/list`. `bypass_hook_trust` is gone, and it turned out not to confer trust in the first place |
 | P0.2 transparent interception scope | accepted. Positive cgroup matching, no host `/etc/hosts`, `route_localnet` preflight, tagged cleanup (§8.5) |
 | P0.3 gateway keyed by mode | accepted. Instance key over the full configuration (§8.1) |
 | P0.4 masking without a gateway | accepted. Exit 2 with an explicit message, no silent promotion (§12.3) |

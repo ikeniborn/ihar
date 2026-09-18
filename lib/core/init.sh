@@ -64,3 +64,12 @@ ihar_python() {
   PYTHONPATH="${IHAR_ROOT:?IHAR_ROOT is not set}/lib/python${PYTHONPATH:+:$PYTHONPATH}" \
     "$interpreter" -m "$@"
 }
+
+# ihar_version_slug <binary> — the filename-safe vendor version, in the same form
+# ihar.conformance.run writes. `codex --version` answers "codex-cli 0.154.0", whose
+# space makes a raw record path awkward to quote and easy to break.
+ihar_version_slug() {
+  local raw
+  raw="$("$1" --version 2>/dev/null | head -1)"
+  printf '%s\n' "$raw" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//'
+}

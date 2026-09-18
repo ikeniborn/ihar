@@ -44,10 +44,15 @@ ihar_cmd_launch() {
 use --profile standard until then"
   fi
 
-  # 6. render. Slices S5 to S7 produce the hook, MCP and config fragments; with none
-  #    the runtime home is still built, with its links.
-  local render=""
-  local hooks_digest="none" registry_digest="none"
+  # 6. render. The hook block and the effective policy are produced here; the MCP
+  #    registry and the managed config regions arrive with S6 and S7.
+  local render hooks_digest registry_digest
+  render="$(mktemp -d "${TMPDIR:-/tmp}/ihar-render-XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$render'" RETURN
+  hooks_digest="$(ihar_manifest_digest)"
+  registry_digest="none"
+  ihar_render_all "$vendor" "$render"
 
   # 7. runtime home, keyed by the configuration and never rewritten
   local version hash runtime
@@ -60,6 +65,10 @@ use --profile standard until then"
   if [[ "${IHAR_PROFILE_HOOKS:-best-effort}" == "enforced" ]]; then mode=immutable; fi
   ihar_runtime_materialise "$vendor" "$hash" "$render" "$mode" >/dev/null
   runtime="$IHAR_RUNTIME"
+
+  # 7b. the hooks the profile depends on must be trusted by the vendor itself, not
+  #     merely rendered by us (LLD 6.5).
+  ihar_verify_hook_trust "$vendor" "$runtime"
 
   # 8. session index: slice S9.
 
@@ -121,11 +130,44 @@ ihar_cmd_check() {
   printf 'store        %s\n' "$IHAR_STORE"
   printf 'state root   %s\n' "$IHAR_STATE_ROOT"
   printf 'lockfile     %s\n' "$([[ -f "$IHAR_LOCKFILE" ]] && echo present || echo absent)"
-  local vendor
+
+  local vendor binary version record
   for vendor in claude codex; do
-    printf '%-12s %s\n' "$vendor" \
-      "$([[ -x "$(eval echo "\$IHAR_${vendor^^}_BIN")" ]] && echo installed || echo "not installed")"
+    binary="$(eval echo "\$IHAR_${vendor^^}_BIN")"
+    if [[ ! -x "$binary" ]]; then
+      printf '%-12s not installed\n' "$vendor"
+      continue
+    fi
+    version="$("$binary" --version 2>/dev/null | head -1)"
+    record="$IHAR_STORE/verification/$vendor-$(ihar_version_slug "$binary").json"
+    if [[ -f "$record" ]]; then
+      if ihar_python ihar.conformance.check "$record" "$binary" \
+           "$IHAR_ROOT/manifests/hooks.json" >/dev/null 2>&1; then
+        printf '%-12s %s, hook enforcement proven\n' "$vendor" "$version"
+      else
+        printf '%-12s %s, conformance record is stale\n' "$vendor" "$version"
+      fi
+    else
+      printf '%-12s %s, hook enforcement unproven\n' "$vendor" "$version"
+    fi
   done
+
+  if [[ "${IHAR_SUBCOMMAND:-}" == "--conformance" || "${IHAR_FLAG_CONFORMANCE:-false}" == true ]]; then
+    ihar_cmd_conformance
+  fi
+}
+
+# ihar_cmd_conformance — run the live suite and record the result (LLD 6.6).
+ihar_cmd_conformance() {
+  local vendor binary status=0
+  for vendor in claude codex; do
+    binary="$(eval echo "\$IHAR_${vendor^^}_BIN")"
+    [[ -x "$binary" ]] || continue
+    printf '\n%s conformance\n' "$vendor"
+    ihar_python ihar.conformance.run "$vendor" "$binary" "$IHAR_STORE" \
+      "$IHAR_ROOT/manifests/hooks.json" || status=$?
+  done
+  return "$status"
 }
 
 # ihar_cmd_homes <subcommand>
