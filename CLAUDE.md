@@ -18,6 +18,16 @@ Read the slice table on iwiki topic `unified-harness-implementation` before star
 
 **If code and a document disagree, the document wins and the code is wrong.** Never edit a document to match code. If the document is wrong, stop and say so.
 
+**Keep the HLD and the LLD current in the same change that makes them stale.** They bind the work only while they describe it; a document that is six slices behind is read once, found wrong, and then ignored — at which point nothing binds anything. So:
+
+- A slice that resolves an open decision from LLD §20 writes the answer into the section that owned it and removes the entry, in the same commit.
+- A slice that measures something the document asserts, and finds it different, corrects the assertion and records the measurement so the next reader sees why. The state layout of revision 4 is the worked example: §2.2 claimed about 90 bytes, the real path was 120, and the section now carries both.
+- A slice that changes a contract, a schema, an algorithm or a failure class updates the LLD section and the contract table in §15, and bumps the revision line at the top.
+- A slice that changes what a profile guarantees, a requirement, or the shape of the architecture updates the HLD too.
+- Correcting a document to match measured reality is not the same as editing it to match code. The first is required; the second is forbidden. The test is whether the code or the world decided: measurement wins, convenience does not.
+
+Both are proposal-first (see the intent's autonomy zones): propose the revision with the evidence, wait, then write it. A pull request that changes behaviour without touching the document that describes it is incomplete.
+
 ## Structure
 
 - **Bash 5** — CLI, launcher, state, locks, profiles, adapters, install. `set -euo pipefail` in `ihar.sh`. Public functions `ihar_<area>_<verb>`, private `_ihar_<area>_<verb>`.
@@ -185,6 +195,8 @@ Delete a branch only when it is listed by `git branch --merged origin/master`, `
 
 ## Documentation
 
-Every change altering behaviour: update the iwiki subsystem page, update `README.md` (and `docs/README.ru.md` if it exists) when usage or setup changed, and record the ledger event on the topic.
+Every change altering behaviour updates, in the same pull request: the HLD or the LLD when it describes what changed (see **Authority**), the iwiki subsystem page, `README.md` and `docs/README.ru.md` when usage or setup changed, and the ledger event on the topic.
+
+The definition of done in **Verification** includes this. A slice is not finished while a document still describes the previous behaviour.
 
 Documentation and code comments are English; conversation is Russian.

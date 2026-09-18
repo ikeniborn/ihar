@@ -20,7 +20,7 @@ ihar_state_list() {
     size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
     used="$(date -u -r "$dir" +%Y-%m-%d 2>/dev/null || echo unknown)"
     mark=""
-    [[ "$root" != unknown && ! -d "$root" ]] && mark=" orphan"
+    if [[ "$root" != unknown && ! -d "$root" ]]; then mark=" orphan"; fi
     printf '%-40s %-10s %-12s %s%s\n' "$id" "${size:-?}" "$used" "$root" "$mark"
   done
 }

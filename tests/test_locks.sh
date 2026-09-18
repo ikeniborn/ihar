@@ -21,6 +21,23 @@ assert_eq "best-effort lock runs the command" "ran" \
 assert_exit "the command's exit status is propagated" 3 \
   ihar_with_lock --required "$LOCK" 5 bash -c 'exit 3'
 
+# --- stderr survives taking a lock ------------------------------------------------
+#
+# Regression. `exec {fd}>"$lockfile" 2>/dev/null` applies the stderr redirection to
+# the shell itself, permanently, so every diagnostic after the first lock vanished —
+# including the abort message of a fail-closed check. The symptom was a launch that
+# exited non-zero and printed nothing at all.
+
+after_lock="$(bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/lock.sh'
+                       ihar_with_lock --required '$LOCK' 5 true
+                       ihar_warn 'still audible'" 2>&1 >/dev/null)"
+assert_contains "a warning after a lock still reaches stderr" "$after_lock" "still audible"
+
+after_die="$(bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/lock.sh'
+                      ihar_with_lock --required '$LOCK' 5 true
+                      ihar_die 3 'fail-closed message'" 2>&1 >/dev/null)"
+assert_contains "a fail-closed abort after a lock is not silent" "$after_die" "fail-closed message"
+
 # --- a mode is mandatory --------------------------------------------------------
 
 assert_exit "a missing mode is a usage error" 2 \
