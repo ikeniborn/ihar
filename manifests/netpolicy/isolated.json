@@ -1,0 +1,15 @@
+{
+  "allow": [
+    {
+      "kind": "gateway",
+      "reason": "model requests reach the provider through the gateway"
+    },
+    {
+      "kind": "mcp-declared",
+      "reason": "destinations declared by an allowlisted MCP server"
+    }
+  ],
+  "default": "deny",
+  "name": "isolated",
+  "schema": 1
+}

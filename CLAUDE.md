@@ -139,7 +139,7 @@ A profile that has not passed its gate is absent from `manifests/profiles/` — 
 | G4 | transparent spike | `remote-protected`, or it is dropped |
 | G5 | microVM and guest network | `isolated` |
 
-Never implement a later phase's enforcement to unblock an earlier one. If a gate cannot be met, report it; a profile is dropped, never weakened.
+Never implement a later phase's enforcement to unblock an earlier one. **If a gate cannot be met, stop and report the evidence.** Dropping a profile is the user's decision, not yours, because it removes a capability they may be relying on; weakening one to pass its gate is never an option, because the profile's name is the guarantee.
 
 ## Scope
 

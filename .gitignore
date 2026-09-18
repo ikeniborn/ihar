@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Runtime roots live outside the checkout by design (LLD 2.1); these entries only
+# catch a local override that points one of them back in here.
+.ihar-isolated/
+.ihar-nvm/
+.ihar-homes/
+.ihar_config

@@ -1,0 +1,19 @@
+{
+  "acp": "refuse",
+  "env_passthrough": [],
+  "gateway": "explicit",
+  "guarantee": "Machine egress: deny by default at the guest boundary; only the gateway, allowlisted MCP endpoints and profile-listed hosts are reachable. This is the only profile whose claim covers arbitrary tool traffic.",
+  "handoff": {
+    "system_prompt": false
+  },
+  "hooks": "enforced",
+  "masking_level": "standard",
+  "mcp": {
+    "strict": true
+  },
+  "name": "isolated",
+  "netpolicy": "isolated",
+  "remote": [],
+  "sandbox": "microvm",
+  "schema": 1
+}
