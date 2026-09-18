@@ -30,15 +30,13 @@ IHAR_ARGS=()
 # text, so silently ignoring one would make the harness report success while doing
 # the opposite of what was asked — `--mask-level secrets` running with masking off.
 # Refused with the slice that will deliver them, the same rule the gateway guard uses.
-_IHAR_UNDELIVERED_SLICE=( "--approval:S7" "--mask-level:S7" "--web:S12" "--json:S9" )
+_IHAR_UNDELIVERED_SLICE=( "--web:S12" "--json:S9" )
 
 ihar_guard_undelivered() {
   local entry flag slice value
   for entry in "${_IHAR_UNDELIVERED_SLICE[@]}"; do
     flag="${entry%%:*}"; slice="${entry##*:}"
     case "$flag" in
-      --approval)   value="$IHAR_FLAG_APPROVAL" ;;
-      --mask-level) value="$IHAR_FLAG_MASK_LEVEL" ;;
       --web)        value="$([[ "$IHAR_FLAG_WEB" == true ]] && echo set || true)" ;;
       --json)       value="$([[ "$IHAR_FLAG_JSON" == true ]] && echo set || true)" ;;
     esac

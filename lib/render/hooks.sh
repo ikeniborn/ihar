@@ -45,6 +45,7 @@ ihar_render_all() {
   esac
 
   ihar_render_mcp "$vendor" "$render"
+  ihar_render_config "$vendor" "$render"
   ihar_render_policy "$vendor" "$render"
 }
 

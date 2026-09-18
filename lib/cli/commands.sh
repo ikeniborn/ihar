@@ -36,12 +36,24 @@ ihar_cmd_launch() {
   # 4b. seed vendor state from a legacy wrapper home, once
   ihar_migrate_vendor "$vendor" "$state" "$root" >/dev/null || true
 
-  # 5. enforcement points. Slice S7 starts the gateway and the sandbox here; until
-  #    then a profile that requires one cannot be honoured, so it is refused rather
-  #    than launched with the enforcement silently absent.
-  if [[ "${IHAR_PROFILE_GATEWAY:-off}" != "off" ]]; then
-    ihar_die 3 "profile '$IHAR_PROFILE' requires a '$IHAR_PROFILE_GATEWAY' model egress gateway, which slice S7 delivers
-use --profile standard until then"
+  # 5. enforcement points, before the render, because the gateway port is an input
+  #    to the Codex provider region.
+  case "${IHAR_PROFILE_GATEWAY:-off}" in
+    off) ;;
+    explicit)
+      ihar_gateway_acquire
+      # The last consumer of an instance stops it, so the launch must stay in the
+      # foreground rather than exec: an exec would leave the refcount held forever.
+      trap ihar_gateway_release EXIT INT TERM
+      ;;
+    transparent)
+      ihar_die 3 "profile '$IHAR_PROFILE' requires a transparent gateway, which slice S11 delivers
+use --profile protected for an explicit one"
+      ;;
+  esac
+
+  if [[ "$IHAR_PROFILE_SANDBOX" == "microvm" ]]; then
+    ihar_die 3 "profile '$IHAR_PROFILE' requires a microVM, which slice S13 delivers"
   fi
 
   # 6. render. The hook block and the effective policy are produced here; the MCP
@@ -123,10 +135,13 @@ ihar_cmd_check() {
   printf 'guarantee    %s\n' "$IHAR_PROFILE_GUARANTEE"
   printf 'hooks        %s\n' "$IHAR_PROFILE_HOOKS"
   printf 'gateway      %s%s\n' "$IHAR_PROFILE_GATEWAY" \
-    "$([[ "$IHAR_PROFILE_GATEWAY" != off ]] && printf ' (unavailable until slice S7)')"
-  printf 'masking      %s\n' "$IHAR_PROFILE_MASKING_LEVEL"
+    "$([[ "$IHAR_PROFILE_GATEWAY" == transparent ]] && printf ' (unavailable until slice S11)')"
+  printf 'masking      %s (floor %s, engine %s)\n' \
+    "$IHAR_GATEWAY_MASKING_LEVEL" "$IHAR_PROFILE_MASKING_LEVEL" \
+    "$(ihar_python ihar.mask.describe "$IHAR_GATEWAY_MASKING_LEVEL" 2>/dev/null || echo unknown)"
   printf 'sandbox      %s%s\n' "$IHAR_PROFILE_SANDBOX" \
-    "$([[ "$IHAR_PROFILE_SANDBOX" != vendor-default ]] && printf ' (unavailable until slice S7)')"
+    "$([[ "$IHAR_PROFILE_SANDBOX" == microvm ]] && printf ' (unavailable until slice S13)')"
+  ihar_gateway_status
   printf 'store        %s\n' "$IHAR_STORE"
   printf 'state root   %s\n' "$IHAR_STATE_ROOT"
   printf 'lockfile     %s\n' "$([[ -f "$IHAR_LOCKFILE" ]] && echo present || echo absent)"
