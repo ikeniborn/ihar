@@ -69,7 +69,12 @@ ihar_state_setup() {
 # older schema in place. Schema 1 is the iclaude marker and schema 2 was LLD
 # revision 2's; both predate the split of state from runtime configuration.
 _ihar_state_marker() {
-  local state="$1" root="$2" marker="$state/home.json"
+  # Split deliberately. In one `local`, a right-hand side referring to a name on the
+  # same line is evaluated against the enclosing scope, not the new local: this line
+  # only ever worked because the caller happens to have a `state` holding the same
+  # path. Without that coincidence it would abort under `set -u`.
+  local state="$1" root="$2"
+  local marker="$state/home.json"
   ihar_python ihar.state_marker "$marker" "$root" \
     || ihar_die 1 "cannot write the state marker at $marker"
 }

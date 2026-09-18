@@ -32,6 +32,13 @@ adapter_claude_env() {
   # keeps the ACP surface on the same pinned binary as the native launch.
   CLAUDE_CODE_EXECUTABLE="$IHAR_CLAUDE_BIN"
   export CLAUDE_CONFIG_DIR CLAUDE_CODE_EXECUTABLE
+  # Explicit mode costs Claude Remote Control, which refuses a custom base URL since
+  # 2.1.196. The profile schema already refuses that combination, so reaching here
+  # with both set is impossible rather than merely unlikely.
+  if [[ "${IHAR_GATEWAY_MODE:-off}" == "explicit" ]]; then
+    ANTHROPIC_BASE_URL="http://127.0.0.1:${IHAR_GATEWAY_ACTIVE_PORT}"
+    export ANTHROPIC_BASE_URL
+  fi
 }
 
 # _adapter_claude_argv <runtime> — the command this launch would run.

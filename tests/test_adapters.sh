@@ -154,11 +154,19 @@ assert_contains "but it does inherit its own vendor variables" "$child_env" "COD
 # The usage text advertises them. Ignoring one silently would make the harness report
 # success while doing the opposite of what was asked.
 
-for flag in "--approval never" "--mask-level secrets" "--web"; do
+for flag in "--web"; do
   # shellcheck disable=SC2086
   assert_exit "$flag is refused rather than ignored" 2 ihar codex $flag
 done
-assert_contains "and the refusal names the slice" "$(ihar codex --mask-level secrets)" "slice S7 delivers it"
+assert_contains "and the refusal names the slice" "$(ihar codex --web)" "slice S12 delivers it"
 assert_exit "--fork without --resume is a usage error" 2 ihar codex --fork
+
+# --approval and --mask-level were on that list until slice S7 delivered them. The
+# masking flag now meets the floor rule instead: under `standard` there is no
+# gateway, so any level above `off` is refused for a reason rather than as a stub.
+assert_exit "--approval is accepted now that it is rendered" 0 ihar --dry-run codex --approval never
+out="$(ihar codex --mask-level secrets)"
+assert_contains "--mask-level is enforced rather than ignored" "$out" \
+  "has no model egress gateway"
 
 finish
