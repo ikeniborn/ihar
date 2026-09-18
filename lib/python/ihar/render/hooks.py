@@ -22,9 +22,13 @@ _MATCHERS = {
     "shell": {"claude": "Bash", "codex": "Bash"},
     "file-write": {"claude": r"Write|Edit|MultiEdit", "codex": r"apply_patch|Write|Edit"},
     "file-read": {"claude": "Read", "codex": "Read"},
-    # Codex exposes no Skill tool in its 0.154 hook schema, so a workflow gate that
-    # asks for one is rendered for Claude alone rather than given a matcher that can
-    # never fire.
+    # Codex exposes no Skill tool: `app-server generate-json-schema` leaves a hook's
+    # `toolName` a free string with no enum, its `Skill*` definitions are the
+    # app-server's own listing API rather than a tool, and the binary carries no such
+    # tool name. An entry asking for one is therefore rendered for Claude alone rather
+    # than given a matcher that can never fire — and a gate that needs to see a skill
+    # on Codex asks for `file-read` and `shell` as well, which is how one shows up
+    # there (LLD 6.1).
     "skill": {"claude": "Skill"},
     "any": {"claude": None, "codex": None},
 }

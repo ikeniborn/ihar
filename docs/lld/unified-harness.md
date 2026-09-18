@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 5 (Codex hook trust corrected by measurement during slice S5) |
+| Status | revision 6 (the workflow gates' manifest and frontmatter parsing corrected by measurement during slice S17) |
 | Date | 2026-09-18 |
 | Derived from | `docs/hld/unified-harness.md` revision 2 (commit `ec2df36`) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -391,13 +391,18 @@ The Codex app-server daemon is long-lived and shared. Its README states that cli
    "tools": ["shell", "file-read", "file-write", "mcp:*"],
    "script": "security-pretool.py", "args": [], "timeout": 10,
    "vendors": ["claude", "codex"], "profiles": ["*"], "required_in": ["protected", "remote-protected", "isolated"]},
-  {"id": "chain-gate-pre", "event": "PreToolUse", "tools": ["skill", "file-write"],
+  {"id": "chain-gate-pre", "event": "PreToolUse", "tools": ["skill", "file-read", "file-write", "shell"],
    "script": "chain-gate.py", "args": [], "timeout": 10, "vendors": ["claude", "codex"], "profiles": ["*"]},
   {"id": "chain-gate-post", "event": "PostToolUse", "tools": ["file-write"],
    "script": "chain-gate.py", "args": ["--post"], "timeout": 10, "vendors": ["claude", "codex"], "profiles": ["*"]},
   {"id": "gwt-gate-pre", "event": "PreToolUse",
    "tools": ["mcp:iwiki*__wiki_update_page", "tool:wiki_update_page"],
    "script": "gwt-gate.py", "args": [], "timeout": 10, "vendors": ["claude", "codex"], "profiles": ["*"]},
+  {"id": "gwt-gate-post", "event": "PostToolUse",
+   "tools": ["mcp:iwiki*__wiki_status", "tool:wiki_status",
+             "mcp:iwiki*__wiki_spec_context", "tool:wiki_spec_context",
+             "mcp:iwiki*__wiki_update_page", "tool:wiki_update_page"],
+   "script": "gwt-gate.py", "args": ["--post"], "timeout": 10, "vendors": ["claude", "codex"], "profiles": ["*"]},
   {"id": "session-register", "event": "SessionStart", "tools": ["any"],
    "script": "session-register.py", "args": [], "timeout": 5, "vendors": ["claude", "codex"], "profiles": ["*"]},
   {"id": "handoff-inject", "event": "SessionStart", "tools": ["any"],
@@ -406,6 +411,10 @@ The Codex app-server daemon is long-lived and shared. Its README states that cli
 ```
 
 `args` is separate from `script` because the rendered command quotes the script path and because the lockfile pins hooks by file path. `required_in` names the profiles whose enforcement depends on the entry; those are the hooks §6.5 verifies and §6.6 proves.
+
+`chain-gate-pre` carries `file-read` and `shell` for the same reason the `skill` set exists at all: Codex exposes no Skill tool, so invoking a skill there shows up as a `Read` of its `SKILL.md` or a `Bash` command that names it. Measured on 0.154.0 rather than assumed, which is what §20 asked S3 to do: `app-server generate-json-schema` gives `HookEventName` an enum but leaves `toolName` a free string, so there is no tool enum to consult; the schema's `Skill*` definitions are the app-server's own listing and metadata API (`SkillsList`, `SkillMetadata`, `SkillScope`), not a tool a hook ever sees; and the binary contains no `Skill`, `use_skill`, `invoke_skill` or `run_skill` tool name at all. Revision 5 listed only `skill` and `file-write`, which rendered on Codex as `apply_patch|Write|Edit` — the gate then caught the spec-to-plan and plan-to-code transitions and was blind to every skill transition, including `finishing-a-development-branch`, which is the one the `execute` route ends on. The added cost is one more process on calls that already spawn a hook, because `security-pretool` matches `shell` and `file-read` already.
+
+Revision 5 listed no `gwt-gate-post` entry, which contradicted §6.3's own table and made the gate incapable of working: its post role is what records each domain's effective specification mode, records a context read, and consumes that evidence once a mutation succeeds. Without the entry nothing is ever recorded, so every update is refused for want of a mode; and nothing is ever consumed, so one context read would license every later rewrite of the same scenario. Its tool set is deliberately wider than the pre entry's, because what it records arrives on `wiki_status` and `wiki_spec_context`, not on the update it later gates. The set is measured from icodex's live wiring (`.codex-isolated/hooks.json`), which is the only place the gate has ever run.
 
 **One security hook per event.** Codex runs matching command hooks of one event concurrently, so two hooks that both return `updatedInput` would race and one rewrite would be lost. `security-pretool.py` therefore performs protected-path checking, secret detection, redaction and MCP input policy in one process and emits exactly one decision. Workflow gates stay separate because they never rewrite input. The invariant, asserted by a manifest linter: for any event and tool set, at most one entry may return `updatedInput`.
 
@@ -447,7 +456,9 @@ Canonicalisation absorbed here: Codex `apply_patch` → `Edit`, `Shell` → `Bas
 | `session-register.py` | SessionStart | appends a partial index record keyed by the payload `session_id` (§10.3) | fail-soft |
 | `handoff-inject.py` | SessionStart | reads `handoff/pending/<token>.md` resolved through the control-plane mapping, emits `context`, deletes the file (§11.5) | fail-soft |
 
-The security hook fails closed: any exception ends in `deny`. The workflow gates fail open: a crash there must not stop editing.
+The security hook fails closed: any exception ends in `deny`. The workflow gates fail open: a crash there must not stop editing. Malformed frontmatter is the one exception inside `chain-gate.py`, and it is a decision rather than a crash: frontmatter nobody can read is not a passed check, and reading it as one walks an unvalidated artifact through the gate.
+
+**The gates parse frontmatter with the standard library.** Both wrappers imported PyYAML lazily and fell open when the import failed. A hook here runs under the system interpreter by the rule of §6.2 — it must work when the venv is broken — so on an ordinary machine that import is absent and the gate would never gate anything at all. `chain-gate.py` therefore carries a parser for the subset `check-chain` writes: nested maps, lists of maps, scalars, flow sequences and block scalars. Anything outside the subset raises, and a raise is a blocked transition. The parser lives in the one file that uses it rather than in `_shared/`, because a second caller does not exist. One divergence from PyYAML is deliberate: a bare date stays a string, since the gate only ever compares such values for equality.
 
 ### 6.4 Codex hook trust, without a global bypass
 
@@ -949,7 +960,6 @@ The review is right that the original slice order puts feature work before the c
 - The `app-server-control` socket framing over a socket transport against stdio (§5.4). Resolve in S3 or S6 at first daemon start.
 - Claude `sandbox` settings key names for 2.1.274 (§9.1). Resolve in S5a.
 - Codex `auth.json` field names for auth-mode detection (§8.7). Resolve in S5a.
-- Whether Codex exposes a `Skill` tool name for the workflow matcher (§6.1). Resolve in S3 from the hook schema enum.
 - Whether `-m cgroup --path` is available on the target kernels or a mark-based variant is needed (§8.5). Resolve in S5b.
 - Whether `--append-system-prompt-file` works in 2.1.274 despite being absent from `--help` (§11.5). Resolve in S8.
 - Claude's documented behaviour when a hook exceeds its timeout, recorded rather than assumed by the conformance suite (§6.6).
