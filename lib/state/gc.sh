@@ -59,10 +59,10 @@ ihar_state_clean_orphans() {
 # its configuration, a transcript does not.
 ihar_state_clean_runtimes() {
   local days="${1:-30}" state="${2:-$IHAR_STATE}" dir removed=0
-  [[ -d "$state/rt" ]] || { printf '0\n'; return 0; }
+  [[ -d "$state/r" ]] || { printf '0\n'; return 0; }
   while IFS= read -r -d '' dir; do
     rm -rf "$dir"
     removed=$((removed + 1))
-  done < <(find "$state/rt" -mindepth 1 -maxdepth 1 -type d -mtime "+$days" -print0)
+  done < <(find "$state/r" -mindepth 1 -maxdepth 1 -type d -mtime "+$days" -print0)
   printf '%s\n' "$removed"
 }

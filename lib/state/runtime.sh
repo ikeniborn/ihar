@@ -29,7 +29,7 @@ ihar_runtime_materialise() {
   local vendor="$1" hash="$2" render="${3:-}" mode="${4:-immutable}"
   [[ -n "${IHAR_STATE:-}" ]] || ihar_die 1 "ihar_runtime_materialise: IHAR_STATE is not set"
 
-  local runtime="$IHAR_STATE/rt/$hash/$vendor"
+  local runtime="$IHAR_STATE/r/$hash/$vendor"
   ihar_with_lock --required "$IHAR_STATE/.ihar.lock" 30 \
     _ihar_runtime_materialise "$vendor" "$hash" "$render" "$mode" "$runtime"
 
@@ -47,8 +47,8 @@ _ihar_runtime_materialise() {
   fi
 
   local staging
-  staging="$(mktemp -d "$IHAR_STATE/rt/.staging-XXXXXX")" \
-    || ihar_die 1 "cannot stage a runtime home under $IHAR_STATE/rt"
+  staging="$(mktemp -d "$IHAR_STATE/r/.staging-XXXXXX")" \
+    || ihar_die 1 "cannot stage a runtime home under $IHAR_STATE/r"
 
   local build="$staging/$vendor"
   mkdir -p "$build"
@@ -67,7 +67,7 @@ _ihar_runtime_materialise() {
     find "$build" -maxdepth 1 -type f -exec chmod 600 {} + 2>/dev/null || true
   fi
 
-  mkdir -p "$IHAR_STATE/rt/$hash"
+  mkdir -p "$IHAR_STATE/r/$hash"
   if ! mv "$build" "$runtime" 2>/dev/null; then
     # Another launch of the same configuration won the race and published first.
     # Its content is ours by construction, so adopt it rather than failing.

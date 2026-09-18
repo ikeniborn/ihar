@@ -10,17 +10,20 @@ ihar_project_root() {
   git -C "$dir" rev-parse --show-toplevel 2>/dev/null || (cd "$dir" && pwd -P)
 }
 
-# ihar_home_id <root> — <sanitized-basename>-<sha256(root)[:12]>, the iclaude rule
-# (lifted from iclaude:lib/config/isolated.sh:resolve_claude_home_id). Hashing the
-# full path means a moved checkout or a worktree gets its own state, while every
-# launch from inside one checkout resolves the same id.
+# ihar_home_id <root> — sha256(project root), first eight characters.
+#
+# iclaude prefixes the sanitised basename (lib/config/isolated.sh:resolve_claude_home_id)
+# and that is friendlier to read, but it does not fit here: the Codex daemon opens a
+# socket under this directory and the platform caps that path near 108 bytes. The
+# readable form measured 120 for an ordinary project, so the id is the hash alone and
+# the project it belongs to is read from the marker instead.
+#
+# Eight hex is 32 bits, so distinct projects can in principle collide. The marker
+# guard is what makes that safe rather than silent: a state directory recording a
+# different project aborts instead of attaching a session to the wrong one.
 ihar_home_id() {
-  local root="$1" base hash
-  base="$(basename "$root")"
-  base="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
-  [[ -n "$base" ]] || base="project"
-  hash="$(printf '%s' "$root" | sha256sum | cut -c1-12)"
-  printf '%s-%s\n' "$base" "$hash"
+  local root="$1"
+  printf '%s' "$root" | sha256sum | cut -c1-8
 }
 
 # ihar_state_preflight <state-dir> — refuse a state path the Codex daemon socket
@@ -29,12 +32,12 @@ ihar_home_id() {
 # because a half-built tree under an unusable path helps nobody.
 ihar_state_preflight() {
   local state="$1"
-  local socket="$state/rt/00000000/codex/app-server-control/app-server-control.sock"
+  local socket="$state/r/00000000/codex/app-server-control/app-server-control.sock"
   local length=${#socket}
   # Defaulted here as well as in ihar_init, so the check holds for a caller that
   # sourced only this module. A preflight that silently does not run is worse than
   # no preflight, because the failure then surfaces as a daemon that will not start.
-  local limit="${IHAR_SOCKET_PATH_MAX:-100}"
+  local limit="${IHAR_SOCKET_PATH_MAX:-107}"
   if (( length > limit )); then
     ihar_die 2 "state path too long for a Codex daemon socket ($length > $limit bytes): $socket
 set IHAR_STATE_ROOT to a shorter directory"
@@ -50,7 +53,7 @@ ihar_state_setup() {
 
   ihar_state_preflight "$state"
 
-  mkdir -p "$state/st/claude" "$state/st/codex" "$state/rt" \
+  mkdir -p "$state/st/claude" "$state/st/codex" "$state/r" \
            "$state/handoff/pending" "$state/daemons" "$state/launches" \
     || ihar_die 1 "cannot create the state tree at $state"
   chmod 700 "$state/handoff" 2>/dev/null || true

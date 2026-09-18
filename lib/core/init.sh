@@ -42,8 +42,11 @@ ihar_init() {
   : "${IHAR_CODEX_BIN:="$IHAR_STORE/bin/codex"}"
   : "${IHAR_LOCKFILE:="$IHAR_ROOT/.ihar-lockfile.json"}"
 
-  # Headroom under the platform limit, checked by ihar_state_preflight.
-  : "${IHAR_SOCKET_PATH_MAX:=100}"
+  # The platform's usable sun_path: 108 bytes including the terminating NUL on
+  # Linux, so 107 characters. No headroom is subtracted, because the preflight
+  # computes the exact socket path rather than an estimate; an arbitrary margin
+  # would reject layouts that work.
+  : "${IHAR_SOCKET_PATH_MAX:=107}"
 
   export IHAR_ROOT IHAR_STORE IHAR_STATE_ROOT IHAR_NVM IHAR_PY \
          IHAR_CLAUDE_BIN IHAR_CODEX_BIN IHAR_LOCKFILE IHAR_SOCKET_PATH_MAX

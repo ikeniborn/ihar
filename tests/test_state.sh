@@ -23,15 +23,19 @@ mkdir -p "$PROJECT"
 id_a="$(ihar_home_id "$PROJECT")"
 id_b="$(ihar_home_id "$PROJECT")"
 assert_eq "the id is stable for one root" "$id_a" "$id_b"
-assert_contains "the basename is sanitised" "$id_a" "my-project-"
-assert_eq "the hash is twelve characters" "12" \
-  "$(printf '%s' "${id_a##*-}" | wc -c | awk '{print $1-0}')"
+# The id is the hash alone: the readable basename iclaude prefixes does not fit
+# under the Codex socket limit, and the project is read from the marker instead.
+assert_eq "the id is eight characters" "8" \
+  "$(printf '%s' "$id_a" | wc -c | awk '{print $1-0}')"
+assert_exit "the id is lowercase hex" 0 \
+  bash -c "[[ '$id_a' =~ ^[0-9a-f]{8}$ ]]"
 
 other="$(ihar_home_id "$IHAR_TEST_TMP/other")"
 assert_exit "a different root gets a different id" 1 test "$id_a" = "$other"
 
 upper="$(ihar_home_id "$IHAR_TEST_TMP/UPPER!!Case")"
-assert_contains "runs outside the safe set collapse" "$upper" "upper-case-"
+assert_exit "an awkward basename still yields a clean id" 0 \
+  bash -c "[[ '$upper' =~ ^[0-9a-f]{8}$ ]]"
 
 # --- socket path preflight -------------------------------------------------------
 
@@ -43,23 +47,21 @@ assert_exit "a state path that overflows the socket limit is refused" 2 \
   bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/state/state.sh'
            IHAR_SOCKET_PATH_MAX=100 ihar_state_preflight '$long'"
 
-# The LLD's default state root does not fit a Codex daemon socket: measured at 112
-# to 120 bytes against a usable sun_path of 107, for every project tried. The
-# preflight is what keeps that from becoming a daemon that mysteriously will not
-# start, and this asserts the preflight catches it. The layout itself is an open
-# decision for the user, since changing it changes an LLD contract.
-default_socket="$HOME/.local/state/ihar/$id_a/rt/00000000/codex/app-server-control/app-server-control.sock"
-assert_exit "the documented default layout is caught by the preflight" 2 \
+# This layout exists to fit this path. The readable id of LLD revision 3 measured
+# 120 bytes against a usable sun_path of 107, which is why the id is a bare hash and
+# the runtime segment is one character.
+default_socket="$HOME/.local/state/ihar/$id_a/r/00000000/codex/app-server-control/app-server-control.sock"
+assert_exit "the default layout fits a Codex daemon socket" 0 \
+  test "${#default_socket}" -le 107
+assert_exit "and it clears the preflight" 0 \
   bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/state/state.sh'
            ihar_state_preflight '$HOME/.local/state/ihar/$id_a'"
-assert_exit "and it is indeed over the platform limit" 1 \
-  test "${#default_socket}" -le 107
 
 # --- state tree and marker -------------------------------------------------------
 
 STATE="$(ihar_state_setup "$PROJECT")"
 assert_exit "the state tree is created" 0 test -d "$STATE/st/claude"
-assert_exit "the runtime parent is created" 0 test -d "$STATE/rt"
+assert_exit "the runtime parent is created" 0 test -d "$STATE/r"
 assert_exit "the marker is written" 0 test -f "$STATE/home.json"
 
 marker_root="$(ihar_python ihar.state_marker --read "$STATE/home.json")"
@@ -122,7 +124,7 @@ assert_exit "the runtime home is published" 0 test -d "$rt"
 assert_exit "the render is present" 0 test -f "$rt/settings.json"
 assert_eq "an immutable runtime file is read-only" "444" \
   "$(stat -c '%a' "$rt/settings.json")"
-staging_left="$(find "$STATE/rt" -maxdepth 1 -name '.staging-*' | wc -l)"
+staging_left="$(find "$STATE/r" -maxdepth 1 -name '.staging-*' | wc -l)"
 assert_eq "no staging directory is left behind" "0" "$staging_left"
 
 # A second launch of the same configuration reuses the directory rather than
