@@ -22,6 +22,7 @@ IHAR_FLAG_APPROVAL=""
 IHAR_FLAG_MASK_LEVEL=""
 IHAR_FLAG_WEB=false
 IHAR_FLAG_PROMPT=""
+IHAR_FLAG_CONFORMANCE=false
 IHAR_SUBCOMMAND=""
 IHAR_ARGS=()
 
@@ -123,6 +124,12 @@ ihar_args_parse() {
       --profile|--profile=*|--dry-run|--json|--assume-yes)
         ihar_die 2 "'${1%%=*}' is a global flag and goes before the command
 try: ihar $1 $IHAR_COMMAND ..."
+        ;;
+      --conformance)
+        # Before the catch-all below, or it would never be reached.
+        [[ "$IHAR_COMMAND" == check ]] \
+          || ihar_die 2 "--conformance belongs to 'ihar check'"
+        IHAR_FLAG_CONFORMANCE=true; shift; continue
         ;;
       -*)
         ihar_die 2 "unknown flag '$1' for '$IHAR_COMMAND'
