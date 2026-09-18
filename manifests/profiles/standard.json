@@ -1,0 +1,22 @@
+{
+  "acp": "allow",
+  "env_passthrough": [],
+  "gateway": "off",
+  "guarantee": "No guarantee. Masking is off and no egress is controlled.",
+  "handoff": {
+    "system_prompt": false
+  },
+  "hooks": "best-effort",
+  "masking_level": "off",
+  "mcp": {
+    "strict": false
+  },
+  "name": "standard",
+  "netpolicy": null,
+  "remote": [
+    "claude",
+    "codex"
+  ],
+  "sandbox": "vendor-default",
+  "schema": 1
+}
