@@ -28,7 +28,11 @@ ihar_with_lock() {
 
   if [[ -z "$reason" ]]; then
     local fd
-    if exec {fd}>"$lockfile" 2>/dev/null; then
+    # The braces matter. `exec {fd}>… 2>/dev/null` applies the stderr redirection to
+    # the shell itself, permanently, so every later diagnostic — including the
+    # abort message of a fail-closed check — would vanish into /dev/null. Grouping
+    # scopes the redirection to the open attempt.
+    if { exec {fd}>"$lockfile"; } 2>/dev/null; then
       if "$flock_bin" -w "$timeout" "$fd"; then
         local status=0
         "$@" || status=$?
