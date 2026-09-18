@@ -41,10 +41,13 @@ assert_contains() { # <desc> <haystack> <needle>
 # ihar_sandbox <desc> — export IHAR_STORE and IHAR_STATE_ROOT into a fresh temporary
 # directory and register its removal. Call once per test file, before anything reads
 # either root.
+# The template is short on purpose: a Codex daemon socket lives under the state root,
+# and the platform caps that path near 108 bytes, so a chatty temporary directory
+# would make every state test fail the preflight for a reason unrelated to the test.
 ihar_sandbox() {
-  IHAR_TEST_TMP="$(mktemp -d -t ihar-test-XXXXXX)"
+  IHAR_TEST_TMP="$(mktemp -d /tmp/ihXXXXXX)"
   export IHAR_STORE="$IHAR_TEST_TMP/store"
-  export IHAR_STATE_ROOT="$IHAR_TEST_TMP/state"
+  export IHAR_STATE_ROOT="$IHAR_TEST_TMP/s"
   mkdir -p "$IHAR_STORE" "$IHAR_STATE_ROOT"
   trap 'rm -rf "$IHAR_TEST_TMP"' EXIT
 }
