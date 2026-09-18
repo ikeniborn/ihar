@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | reviewed draft, revision 3 (architecture review incorporated) |
+| Status | revision 4 (state layout corrected by measurement during slice S3) |
 | Date | 2026-09-18 |
 | Derived from | `docs/hld/unified-harness.md` revision 2 (commit `ec2df36`) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -79,14 +79,16 @@ Both are overridable for tests and for machines where `$HOME` is unusual. The No
 
 ### 2.2 Path length budget
 
-`IHAR_STATE_ROOT` is short by design because the Codex daemon opens `<CODEX_HOME>/app-server-control/app-server-control.sock`, and a Unix socket path over roughly 108 bytes fails at bind. `ihar_state_preflight` computes the canonical socket path at home setup and aborts with a specific message when it exceeds `IHAR_SOCKET_PATH_MAX` (default 100, leaving headroom):
+`IHAR_STATE_ROOT` is short by design because the Codex daemon opens `<CODEX_HOME>/app-server-control/app-server-control.sock`, and a Unix socket path over `sun_path` fails at bind: 108 bytes including the terminating NUL on Linux, so 107 characters. `ihar_state_preflight` computes the exact socket path at state setup and aborts with a specific message when it exceeds `IHAR_SOCKET_PATH_MAX` (default 107; no margin is subtracted, because the computed path is the real one and an arbitrary margin would reject layouts that work):
 
 ```text
 state path too long for a Codex daemon socket (<n> > <max> bytes)
 set IHAR_STATE_ROOT to a shorter directory
 ```
 
-The default layout `~/.local/state/ihar/<id>/rt/<hash>/codex/app-server-control/app-server-control.sock` measures about 90 bytes for a 12-character home id, which is why the runtime segment is `rt` and the hash is truncated to 8 characters.
+The default layout is `~/.local/state/ihar/<id>/r/<hash>/codex/app-server-control/app-server-control.sock`, measured at 102 characters. Every segment after the state root is sized by that budget: the vendor's own `codex/app-server-control/app-server-control.sock` costs 49 characters and cannot be changed, which leaves 58 for everything else.
+
+Revision 3 of this document specified a readable id, `<sanitized-basename>-<sha256[:12]>`, and a two-character runtime segment. Measured on a real machine that produced 112 characters for this project and 120 for an ordinary longer name, so the documented layout would never have started a daemon anywhere. The id is therefore the hash alone and the runtime segment is one character. The project a state directory belongs to is read from its marker instead, which `ihar homes list` already does.
 
 ### 2.3 Store `$IHAR_STORE`
 
@@ -117,24 +119,24 @@ $IHAR_STATE_ROOT/<id>/
   daemons/codex.json            managed daemon record (§5.5)
   st/claude/                    Claude vendor state: projects/ sessions/ session-env/ history.jsonl .claude.json
   st/codex/                     Codex vendor state: sessions/ *.sqlite app-server-control/
-  rt/<config-hash>/claude/      = CLAUDE_CONFIG_DIR
-  rt/<config-hash>/codex/       = CODEX_HOME
+  r/<config-hash>/claude/       = CLAUDE_CONFIG_DIR
+  r/<config-hash>/codex/        = CODEX_HOME
 ```
 
-`<id>` is `<sanitized-basename>-<sha256(project_root)[:12]>`, the iclaude rule (`resolve_claude_home_id`, `lib/config/isolated.sh:82-89`).
+`<id>` is `sha256(project_root)` truncated to eight characters. iclaude prefixes the sanitised basename (`resolve_claude_home_id`, `lib/config/isolated.sh:82-89`) and that reads better, but it does not fit the socket budget above. Eight hex is 32 bits, so two projects can in principle collide; the marker guard makes that an abort rather than a silent cross-attachment.
 
 **`<config-hash>` is the first 8 hex characters of `sha256` over everything that decides how the vendor behaves**: profile name, effective masking level, gateway mode, sandbox mode, MCP strictness, the rendered hook manifest digest, the registry digest, and the pinned vendor version. Two launches with the same effective configuration share a runtime home and race on nothing; two launches with different configurations get different directories, which is what removes the last-writer-wins window of revision 2. A runtime home is written once, under the state lock, and is thereafter **immutable**: a configuration change produces a new directory rather than a rewrite.
 
 A runtime home contains the rendered configuration plus symlinks:
 
 ```text
-rt/<hash>/claude/
+r/<hash>/claude/
   settings.json  mcp/ihar.json                       rendered, read-only (444) under enforced profiles
   hooks commands agents scripts plugins CLAUDE.md
   .credentials.json router.json skills               → store
   projects sessions session-env history.jsonl
   .claude.json                                       → ../../st/claude/*
-rt/<hash>/codex/
+r/<hash>/codex/
   config.toml  hooks.json  AGENTS.md                 rendered, read-only under enforced profiles
   hooks plugins auth.json rules agents profiles skills  → store
   sessions state_5.sqlite thread_history_1.sqlite
@@ -220,7 +222,7 @@ Order is fixed by four dependencies: the profile decides how severe a store mism
 | 4 | `ihar_state_setup "$root"` | marker, `st/`, socket path preflight (§2.2) | runtime |
 | 5 | `ihar_enforce_start` | gateway (§8.1), sandbox and network policy (§9), all fail-closed | fail-closed |
 | 6 | `ihar_render_all <vendor>` | hooks, MCP, config fragments, using the gateway result; compute `<config-hash>` | fail-closed |
-| 7 | `ihar_runtime_materialise <vendor>` | create `rt/<hash>/<vendor>/` if absent, under a **required** lock; verify it if present; never rewrite | fail-closed |
+| 7 | `ihar_runtime_materialise <vendor>` | create `r/<hash>/<vendor>/` if absent, under a **required** lock; verify it if present; never rewrite | fail-closed |
 | 8 | `ihar_codex_daemon_reconcile` | Codex only: stop or refuse a daemon whose binary version or config hash differs (§5.5) | fail-closed |
 | 9 | `ihar_index_append` | launch record | fail-soft |
 | 10 | `ihar_env_prepare <vendor>` | child environment (§3.4) | — |
@@ -253,7 +255,7 @@ Schema 1 is iclaude's marker and schema 2 was revision 2's; both are upgraded in
 |----------|-----------|
 | `ihar_project_root` | `git rev-parse --show-toplevel` else `pwd -P` |
 | `ihar_state_setup root` | resolve `<id>`, create the state tree and `st/<vendor>/`, run `ihar_state_preflight`, write the marker; exports `IHAR_STATE` |
-| `ihar_runtime_materialise vendor hash` | under `ihar_with_lock --required "$IHAR_STATE/.ihar.lock" 30`: if `rt/<hash>/<vendor>` exists, verify its rendered files against the fragments and abort on drift; else build it in a temporary directory, link the store and `st/` entries, write the rendered files, `chmod 444` under enforced profiles, then rename into place. Exports `IHAR_RUNTIME` |
+| `ihar_runtime_materialise vendor hash` | under `ihar_with_lock --required "$IHAR_STATE/.ihar.lock" 30`: if `r/<hash>/<vendor>` exists, verify its rendered files against the fragments and abort on drift; else build it in a temporary directory, link the store and `st/` entries, write the rendered files, `chmod 444` under enforced profiles, then rename into place. Exports `IHAR_RUNTIME` |
 | `ihar_state_link_assets` | whole-entry symlinks, iclaude `link_shared_assets` rules (`lib/config/isolated.sh:112-135`): a correct link is untouched, a wrong link or a materialised copy is replaced with a warning, a stale link is pruned, an absent store entry is skipped, the store is never mutated |
 | `ihar_with_lock MODE lockfile timeout cmd…` | §4.3 |
 
@@ -834,7 +836,7 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | Slice | File | Cases |
 |-------|------|-------|
 | S0 | `tests/test_contracts.sh` | every profile file validates; the guarantee text of §1.4 exists per profile; the manifest linter rejects two `updatedInput` hooks on one event; netpolicy files validate |
-| S1 | `tests/test_state.sh` | id derivation; marker schema 3 and upgrades from 1 and 2; `st/` and `rt/` separation; **socket path preflight aborts when over the limit**; runtime home immutability (a second launch with the same hash reuses it, a drifted file aborts); different profiles produce different hashes; `chmod 444` under enforced profiles; link rules; migration by hash |
+| S1 | `tests/test_state.sh` | id derivation; marker schema 3 and upgrades from 1 and 2; `st/` and `r/` separation; **socket path preflight aborts when over the limit**; runtime home immutability (a second launch with the same hash reuses it, a drifted file aborts); different profiles produce different hashes; `chmod 444` under enforced profiles; link rules; migration by hash |
 | S1 | `tests/test_locks.sh` | `--required` exits 3 without `flock` or on timeout; `--best-effort` warns and continues; every security call site uses `--required` |
 | S2 | `tests/test_adapters.sh` | dry-run argv and environment per vendor; **passthrough per vendor**, `--` for Claude and none for Codex; unknown flag exit 2; capabilities validate |
 | S2 | `tests/test_lifecycle.sh` | step order: profile before store verify, gateway before render, render before materialise, daemon reconcile before launch; the gateway port reaches the Codex provider region |
