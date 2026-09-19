@@ -79,6 +79,14 @@ CODEX_HOME="$runtime" python3 -I "$ROOT/hooks/handoff-inject.py" --vendor codex 
 EOF
 remainder="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["hookSpecificOutput"]["additionalContext"])' < "$IHAR_TEST_TMP/utf8.out")"
 assert_eq "codex split preserves UTF-8 after 2048 bytes" TAIL "$remainder"
+newline_id="$(python3 -m ihar.ids)"
+python3 - <<'PY' > "$state/handoff/pending/$newline_id.md"
+print("A" * 2047 + "\nTAIL", end="")
+PY
+IHAR_LAUNCH_ID="$newline_id"
+IHAR_FLAG_PROMPT=""
+ihar_handoff_prepare codex
+assert_eq "codex prefix preserves a boundary newline" $'\n\n\n' "${IHAR_FLAG_PROMPT:2047:3}"
 IHAR_LAUNCH_ID="claude-carrier"
 printf '%2500s' x > "$state/handoff/pending/claude-carrier.md"
 IHAR_FLAG_PROMPT=""
