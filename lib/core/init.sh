@@ -40,6 +40,8 @@ ihar_init() {
   : "${IHAR_PY:="$IHAR_STORE/venv/bin/python3"}"
   : "${IHAR_CLAUDE_BIN:="$IHAR_NVM/npm-global/bin/claude"}"
   : "${IHAR_CODEX_BIN:="$IHAR_STORE/bin/codex"}"
+  : "${IHAR_CLAUDE_ACP_BIN:="$IHAR_STORE/acp/bin/claude-agent-acp"}"
+  : "${IHAR_CODEX_ACP_BIN:="$IHAR_STORE/acp/bin/codex-acp"}"
   : "${IHAR_LOCKFILE:="$IHAR_ROOT/.ihar-lockfile.json"}"
 
   # The platform's usable sun_path: 108 bytes including the terminating NUL on
@@ -49,7 +51,8 @@ ihar_init() {
   : "${IHAR_SOCKET_PATH_MAX:=107}"
 
   export IHAR_ROOT IHAR_STORE IHAR_STATE_ROOT IHAR_NVM IHAR_PY \
-         IHAR_CLAUDE_BIN IHAR_CODEX_BIN IHAR_LOCKFILE IHAR_SOCKET_PATH_MAX
+         IHAR_CLAUDE_BIN IHAR_CODEX_BIN IHAR_CLAUDE_ACP_BIN IHAR_CODEX_ACP_BIN \
+         IHAR_LOCKFILE IHAR_SOCKET_PATH_MAX
 }
 
 # ihar_python <module> [args...] — run a package module through the store venv,

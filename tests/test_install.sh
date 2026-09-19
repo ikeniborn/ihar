@@ -23,6 +23,8 @@ source "$ROOT/lib/store/install.sh"
 
 export IHAR_CLAUDE_BIN="$IHAR_NVM/npm-global/bin/claude"
 export IHAR_CODEX_BIN="$IHAR_STORE/bin/codex"
+export IHAR_CLAUDE_ACP_BIN="$IHAR_STORE/acp/bin/claude-agent-acp"
+export IHAR_CODEX_ACP_BIN="$IHAR_STORE/acp/bin/codex-acp"
 
 # --- a stub release, and a stub fetcher that serves it --------------------------------
 
@@ -128,6 +130,49 @@ write_lock '"codex":{"version":"rust-v0.155.0","asset":"codex.tar.gz","sha256":"
 out="$(ihar_install_codex 2>&1)"
 assert_contains "a bumped version reinstalls" "$out" "rust-v0.155.0 installed"
 assert_eq "and restamps" "rust-v0.155.0" "$(cat "$IHAR_STORE/bin/.codex-version")"
+
+# --- ACP adapters use exactly the lockfile versions ---------------------------------------------
+
+cat > "$IHAR_TEST_TMP/npm" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+prefix=""
+spec="${!#}"
+while (( $# )); do
+  if [[ "$1" == --prefix ]]; then prefix="$2"; shift 2; else shift; fi
+done
+mkdir -p "$prefix/bin"
+case "$spec" in
+  @agentclientprotocol/claude-agent-acp@*) name=claude-agent-acp ;;
+  github:agentclientprotocol/codex-acp#*) name=codex-acp ;;
+  *) exit 9 ;;
+esac
+printf '#!/bin/sh\n' > "$prefix/bin/$name"
+chmod +x "$prefix/bin/$name"
+printf '%s\n' "$spec" >> "$IHAR_FAKE_NPM_RECORD"
+EOF
+chmod +x "$IHAR_TEST_TMP/npm"
+export IHAR_NPM_BIN="$IHAR_TEST_TMP/npm"
+export IHAR_FAKE_NPM_RECORD="$IHAR_TEST_TMP/npm-record"
+
+write_lock '"acp":{"claude-agent-acp":"0.79.0","codex-acp":"6ec22f3"}'
+ihar_install_acp >/dev/null 2>&1
+assert_exit "the Claude ACP adapter is installed" 0 test -x "$IHAR_CLAUDE_ACP_BIN"
+assert_exit "the Codex ACP adapter is installed" 0 test -x "$IHAR_CODEX_ACP_BIN"
+assert_contains "Claude ACP uses the exact pinned version" "$(cat "$IHAR_FAKE_NPM_RECORD")" \
+  "@agentclientprotocol/claude-agent-acp@0.79.0"
+assert_contains "Codex ACP uses the exact pinned revision" "$(cat "$IHAR_FAKE_NPM_RECORD")" \
+  "github:agentclientprotocol/codex-acp#6ec22f3"
+assert_eq "ACP versions are stamped" $'0.79.0\n6ec22f3' \
+  "$(cat "$IHAR_STORE/acp/.versions")"
+
+out="$(ihar_install_acp 2>&1)"
+assert_contains "unchanged ACP pins make install a no-op" "$out" "already installed"
+
+write_lock '"acp":{"claude-agent-acp":"0.80.0","codex-acp":"6ec22f3"}'
+ihar_install_acp >/dev/null 2>&1
+assert_contains "a bumped ACP version reinstalls" "$(cat "$IHAR_FAKE_NPM_RECORD")" \
+  "@agentclientprotocol/claude-agent-acp@0.80.0"
 
 # The Claude CLI follows the same rule, and it is the one that did not: assert the
 # stamp is what decides, without a network or an npm registry.

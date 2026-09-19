@@ -57,6 +57,7 @@ ihar_main() {
   case "$IHAR_COMMAND" in
     help)         ihar_usage ;;
     claude|codex) ihar_cmd_launch "$IHAR_COMMAND" ;;
+    acp)          ihar_cmd_acp ;;
     check)        ihar_cmd_check ;;
     install)      ihar_cmd_install ;;
     update)       ihar_cmd_update ;;

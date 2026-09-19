@@ -20,6 +20,7 @@ commands
                         canonical sessions across both vendors
   switch --to <vendor>  carry this session into the other vendor
   web <vendor>          start the vendor's native remote surface
+  acp <vendor>          start the experimental pinned ACP adapter
 
 global flags
   --profile <name>      standard, protected, isolated
@@ -39,12 +40,11 @@ launch flags
   --web                 start the agent's own remote surface
 
 install flags
+  --acp                 install lockfile-pinned experimental ACP adapters
   --microvm             import pinned Firecracker assets from IHAR_MICROVM_SOURCE_DIR
 
 everything after -- goes to the agent verbatim:
   ihar codex -- mcp list
 
-not yet delivered
-  acp
 TEXT
 }

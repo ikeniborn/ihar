@@ -129,3 +129,22 @@ ihar_store_verify_binaries() {
     :
   fi
 }
+
+# ihar_store_verify_acp <vendor> — version and installed-byte pin for ACP exec.
+ihar_store_verify_acp() {
+  local vendor="$1" key binary line pinned_version installed_version pinned_digest actual
+  case "$vendor" in
+    claude) key=claude-agent-acp; binary="$IHAR_CLAUDE_ACP_BIN"; line=1 ;;
+    codex) key=codex-acp; binary="$IHAR_CODEX_ACP_BIN"; line=2 ;;
+  esac
+  pinned_version="$(ihar_lockfile_get "acp.$key")"
+  [[ -n "$pinned_version" ]] || ihar_die 3 "the lockfile does not pin $key"
+  installed_version="$(sed -n "${line}p" "$IHAR_STORE/acp/.versions" 2>/dev/null || true)"
+  [[ "$installed_version" == "$pinned_version" ]] \
+    || ihar_die 3 "$key does not match the lockfile; run 'ihar install --acp'"
+  [[ -x "$binary" ]] || ihar_die 1 "the $vendor ACP adapter is not installed at $binary"
+  pinned_digest="$(awk -F '\t' -v key="$key" '$1 == key {print $2}' "$IHAR_STORE/acp/.digests" 2>/dev/null)"
+  actual="$(ihar_sha256 "$binary")"
+  [[ -n "$pinned_digest" && "$actual" == "$pinned_digest" ]] \
+    || ihar_die 3 "$key differs from the installed pin; run 'ihar install --acp'"
+}
