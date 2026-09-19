@@ -51,9 +51,69 @@ _ihar_install_all() {
   ihar_install_codex
   ihar_install_claude
   ihar_install_conformance
+  if [[ "${IHAR_FLAG_MICROVM:-false}" == true ]]; then ihar_install_microvm; fi
 
   ihar_lockfile_hash > "$IHAR_STORE/.last-lockfile-hash"
   ihar_info "install complete; run 'ihar check' to see what is in force"
+}
+
+# ihar_install_microvm — import the specialised guest built by iclaude's installer.
+#
+# The source is explicit because the compatible rootfs contains guest-init, sshd and
+# rsync; treating an arbitrary Linux ext4 image as compatible would make `install`
+# report success and every launch fail later. Digests remain owned by ihar's lockfile.
+ihar_install_microvm() {
+  local source="${IHAR_MICROVM_SOURCE_DIR:-}"
+  [[ -n "$source" ]] || ihar_die 1 "--microvm requires IHAR_MICROVM_SOURCE_DIR pointing at a compatible asset directory"
+  local name key src pinned actual version stage
+  local -a names=(firecracker vmlinux rootfs.ext4 client_key client_key.pub host_key.pub)
+  mkdir -p "$IHAR_STORE/bin" "$IHAR_STORE/microvm/versions"
+  for name in firecracker vmlinux rootfs.ext4; do
+    src="$source/$name"
+    [[ -f "$src" ]] || ihar_die 1 "microVM source is missing $src"
+    case "$name" in
+      firecracker) key=firecracker ;;
+      vmlinux) key=kernel ;;
+      rootfs.ext4) key=rootfs ;;
+    esac
+    pinned="$(ihar_lockfile_get "microvm.$key")"
+    [[ -n "$pinned" ]] || ihar_die 3 "the lockfile does not pin microvm.$key"
+    actual="$(ihar_sha256 "$src")"
+    [[ "$actual" == "$pinned" ]] \
+      || ihar_die 3 "$src does not match microvm.$key in the lockfile"
+  done
+  for name in client_key client_key.pub host_key.pub; do
+    [[ -f "$source/$name" ]] || ihar_die 1 "microVM source is missing $source/$name"
+  done
+  ssh-keygen -l -f "$source/host_key.pub" >/dev/null 2>&1 \
+    || ihar_die 3 "microVM source host_key.pub is not a valid SSH public key"
+  local derived_public declared_public
+  derived_public="$(ssh-keygen -y -f "$source/client_key" 2>/dev/null)" \
+    || ihar_die 3 "microVM source client_key is not a valid SSH private key"
+  declared_public="$(awk '{print $1, $2}' "$source/client_key.pub")"
+  [[ "$(awk '{print $1, $2}' <<< "$derived_public")" == "$declared_public" ]] \
+    || ihar_die 3 "microVM source client key pair does not match"
+
+  version="$(printf '%s\n' "$(ihar_lockfile_get microvm.firecracker)" \
+    "$(ihar_lockfile_get microvm.kernel)" "$(ihar_lockfile_get microvm.rootfs)" | sha256sum | cut -c1-16)"
+  stage="$(mktemp -d "$IHAR_STORE/microvm/.stage-XXXXXX")" \
+    || ihar_die 1 "cannot stage microVM assets"
+  for name in "${names[@]}"; do
+    cp "$source/$name" "$stage/$name" || { rm -rf "$stage"; ihar_die 1 "cannot stage $name"; }
+  done
+  chmod 755 "$stage/firecracker"; chmod 600 "$stage/client_key"
+  if [[ ! -d "$IHAR_STORE/microvm/versions/$version" ]]; then
+    mv "$stage" "$IHAR_STORE/microvm/versions/$version" || ihar_die 1 "cannot publish microVM assets"
+  else
+    rm -rf "$stage"
+  fi
+  ln -sfn "versions/$version" "$IHAR_STORE/microvm/.current-new"
+  mv -Tf "$IHAR_STORE/microvm/.current-new" "$IHAR_STORE/microvm/current" \
+    || ihar_die 1 "cannot activate microVM assets"
+  for name in firecracker vmlinux rootfs.ext4; do
+    ln -sfn "../microvm/current/$name" "$IHAR_STORE/bin/$name"
+  done
+  ihar_info "microVM assets installed from $source"
 }
 
 # --------------------------------------------------------------------------- #

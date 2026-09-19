@@ -1,7 +1,7 @@
 ---
 review:
-  intent_hash: eba3205f33fdbadb
-  last_run: 2026-09-18
+  intent_hash: acd6eb25f2d9d7b0
+  last_run: 2026-09-19
   phases:
     structure:   { status: passed }
     completeness:{ status: passed }
@@ -19,6 +19,16 @@ review:
       fix: "Reword the plan's Risk register and Phase gates sections to state that a fallback is proposed and the drop is decided by the user."
       verdict: fixed
       verdict_at: 2026-09-18
+workflow:
+  route: chain
+  continuation: execute
+result_check:
+  verdict: OK
+  source: intent
+  intent_hash: acd6eb25f2d9d7b0
+  last_run: 2026-09-19
+  reviewed: true
+  docs_checked: true
 ---
 # Intent: unified-harness-implementation
 

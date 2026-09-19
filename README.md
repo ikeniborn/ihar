@@ -29,7 +29,9 @@ where a guarantee degrades silently.
 
 ## Install
 
-Everything installs under your own user. No `sudo`, at any step.
+Everything installs under your own user. Installation never uses `sudo`. An `isolated`
+launch needs passwordless `sudo` for its short-lived TAP and per-launch firewall chains;
+the rules and interface are removed when the launch ends.
 
 ```bash
 git clone <this repository> ihar
@@ -40,6 +42,14 @@ cd ihar
 That builds the store, links `ihar` into `~/.local/bin`, creates the Python environment,
 downloads the components the lockfile pins — verifying each against its recorded digest —
 and runs the hook conformance suite the enforced profiles require.
+
+The specialised Firecracker guest comes from a compatible, locally built asset directory.
+Its `firecracker`, `vmlinux`, `rootfs.ext4`, `client_key`, `client_key.pub` and
+`host_key.pub` files are all validated before one pinned version is activated atomically:
+
+```bash
+IHAR_MICROVM_SOURCE_DIR=/path/to/assets ./ihar.sh install --microvm
+```
 
 If `~/.local/bin` is not on your `PATH`, the installer says so; add it:
 
