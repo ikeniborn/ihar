@@ -48,7 +48,11 @@ ihar_render_all() {
   # MCP region appends to, and the assembly puts bare keys before tables.
   ihar_render_config "$vendor" "$render"
   ihar_render_mcp "$vendor" "$render"
-  [[ "$vendor" == codex ]] && ihar_render_config_assemble "$render"
+  if [[ "$vendor" == codex ]]; then
+    ihar_render_config_assemble "$render"
+    # Without this the app-server daemon refuses to start at all (LLD 5.5).
+    ihar_render_standalone_link "$render"
+  fi
   ihar_render_policy "$vendor" "$render"
 }
 

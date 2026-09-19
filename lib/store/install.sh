@@ -290,9 +290,15 @@ ihar_cmd_update() {
 
 _ihar_update_all() {
   ihar_install_store
+  # A running daemon holds the binary about to be replaced, and it goes on serving
+  # clients from the old one until something restarts it — the version-skew class
+  # LLD 5.5 names. Stopped before the replacement, and only the ones that were
+  # running are put back afterwards.
+  ihar_codex_daemon_stop_all
   ihar_install_codex
   ihar_install_claude
   ihar_install_conformance
+  ihar_codex_daemon_start_pending
   ihar_lockfile_hash > "$IHAR_STORE/.last-lockfile-hash"
   ihar_info "update complete"
 }
