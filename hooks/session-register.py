@@ -15,11 +15,15 @@ import json
 import os
 import sys
 import time
+import uuid
+import fcntl
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "_shared"))
 
 import hookio      # noqa: E402
 import policy      # noqa: E402
+
+DISCOVERED_NAMESPACE = uuid.UUID("de7a9db8-3788-5e56-85cf-b839273cea2d")
 
 
 def _now() -> str:
@@ -85,15 +89,18 @@ def main():
         # A session ihar did not start, or a daemon serving a client it has no claim
         # for. A deterministic id keeps it stable across listings without pretending
         # it belongs to a launch.
-        import hashlib
-        import uuid
-        digest = hashlib.sha256(f"{vendor}:{session_id}".encode()).digest()
-        record["ihar_id"] = str(uuid.UUID(bytes=digest[:16], version=5))
+        record["ihar_id"] = str(uuid.uuid5(DISCOVERED_NAMESPACE, f"{vendor}:{session_id}"))
         record["profile"] = active.get("profile", "standard")
 
     try:
-        with open(os.path.join(state, "sessions.jsonl"), "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        target = os.path.join(state, "sessions.jsonl")
+        lock_path = os.path.join(state, ".ihar-sessions.lock")
+        os.makedirs(state, exist_ok=True)
+        with open(lock_path, "a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with open(target, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+            os.chmod(target, 0o600)
     except OSError:
         return 0
     return 0

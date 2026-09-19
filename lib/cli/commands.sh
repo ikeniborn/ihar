@@ -89,11 +89,12 @@ use --profile protected for an explicit one"
     ihar_codex_daemon_reconcile "$runtime" "$hash"
   fi
 
-  # 8b. session index: slice S9.
+  # 8b. Create the control-plane identity before either vendor starts. The hook
+  # claims it using its own payload session id, never the daemon's environment.
+  IHAR_LAUNCH_ID="$(ihar_uuid)"; export IHAR_LAUNCH_ID
 
   # 9. and 10. the adapter builds its argv and the environment it needs
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR
-  IHAR_LAUNCH_ID="$(ihar_uuid)"; export IHAR_LAUNCH_ID
   ihar_adapter "$vendor" launch "$runtime"
   ihar_env_map
   ihar_env_prepare "$vendor"
@@ -101,6 +102,11 @@ use --profile protected for an explicit one"
   if [[ "$IHAR_FLAG_DRY_RUN" == true ]]; then
     ihar_dry_run "$vendor" "$runtime"
     return 0
+  fi
+
+  ihar_session_claim "$vendor" "$hash"
+  if [[ "$vendor" == claude && -z "$IHAR_FLAG_RESUME" ]]; then
+    ihar_session_append_launch "$vendor" "$IHAR_LAUNCH_ID"
   fi
 
   local binary="${IHAR_ARGV[0]}"
