@@ -258,13 +258,13 @@ def read_frontmatter(path):
 # --------------------------------------------------------------------------- #
 
 
-def ledger_path():
-    home = policy._runtime_home()
+def ledger_path(event):
+    home = policy._runtime_home(event)
     return os.path.join(home, "state", "idd-sessions.json") if home else None
 
 
-def load_ledger():
-    path = ledger_path()
+def load_ledger(event):
+    path = ledger_path(event)
     if not path or not os.path.exists(path):
         return {}
     try:
@@ -285,11 +285,12 @@ def load_ledger():
     return kept
 
 
-def record_owner(path, session):
-    target = ledger_path()
+def record_owner(path, event):
+    target = ledger_path(event)
+    session = event.session_id
     if not target or not session:
         return
-    ledger = load_ledger()
+    ledger = load_ledger(event)
     ledger[os.path.abspath(path)] = {"session": session, "ts": int(time.time())}
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -322,12 +323,12 @@ def record_ownership(event):
     if event.tool in ("Write", "Edit"):
         for path in hookio.paths_of(event):
             if _is_artifact(path):
-                record_owner(path, event.session_id)
+                record_owner(path, event)
         return
     if skill_of(event) in CLAIM_SKILLS:
         plan = newest_plan()
         if plan:
-            record_owner(plan, event.session_id)
+            record_owner(plan, event)
 
 
 # --------------------------------------------------------------------------- #
@@ -380,12 +381,12 @@ def skill_of(event):
 # --------------------------------------------------------------------------- #
 
 
-def resolve_candidate(rule, session):
+def resolve_candidate(rule, event):
     matches = glob.glob(os.path.join(DOCS_ROOT, rule["dir"], rule["glob"]))
     if not matches:
         return None
-    ledger = load_ledger()
-    owned = [match for match in matches if owns(match, session, ledger)]
+    ledger = load_ledger(event)
+    owned = [match for match in matches if owns(match, event.session_id, ledger)]
     if not owned:
         return None
     return max(owned, key=os.path.getmtime)
@@ -539,7 +540,7 @@ def handle_write(event):
             # passed. The plan's own chain block names it; failing that, the newest
             # spec this session owns.
             spec = resolve_spec_from_chain(written_body(event, path)) \
-                or resolve_candidate(SPEC_RULE, event.session_id)
+                or resolve_candidate(SPEC_RULE, event)
             if spec is not None:
                 reason = gate_reason(spec, SPEC_RULE)
                 if reason is not None:
@@ -550,7 +551,7 @@ def handle_write(event):
             # Writing code is the plan-to-implementation transition. Only a plan
             # edited recently gates it: an old one is a finished piece of work, not
             # the thing this change is executing.
-            plan = resolve_candidate(PLAN_RULE, event.session_id)
+            plan = resolve_candidate(PLAN_RULE, event)
             if plan is None or not fresh(plan, IMPL_GATE_FRESH_SECONDS):
                 continue
             reason = gate_reason(plan, PLAN_RULE)
@@ -562,7 +563,7 @@ def handle_write(event):
 
 def handle_skill(event):
     for rule in GATE_MAP.get(skill_of(event)) or []:
-        candidate = resolve_candidate(rule, event.session_id)
+        candidate = resolve_candidate(rule, event)
         if candidate is None:
             continue
         reason = gate_reason(candidate, rule)

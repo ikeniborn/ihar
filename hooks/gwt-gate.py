@@ -54,13 +54,13 @@ def _tool_suffix(name):
     return name.rsplit("__", 1)[-1] if isinstance(name, str) else ""
 
 
-def _state_dir():
-    home = policy._runtime_home()
+def _state_dir(event):
+    home = policy._runtime_home(event)
     return os.path.join(home, "state") if home else None
 
 
-def _path(name):
-    directory = _state_dir()
+def _path(name, event):
+    directory = _state_dir(event)
     return os.path.join(directory, name) if directory else None
 
 
@@ -110,8 +110,8 @@ def _response_payload(event):
 # --------------------------------------------------------------------------- #
 
 
-def _read(name, prune):
-    path = _path(name)
+def _read(name, prune, event):
+    path = _path(name, event)
     if not path or not os.path.exists(path):
         return {}
     try:
@@ -122,8 +122,8 @@ def _read(name, prune):
     return prune(data) if isinstance(data, dict) else {}
 
 
-def _write(name, state):
-    path = _path(name)
+def _write(name, state, event):
+    path = _path(name, event)
     if not path:
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -166,12 +166,12 @@ def _prune_contexts(data):
     return clean
 
 
-def _load_status():
-    return _read("gwt-status.json", _prune_status)
+def _load_status(event):
+    return _read("gwt-status.json", _prune_status, event)
 
 
-def _load_contexts():
-    return _read("gwt-contexts.json", _prune_contexts)
+def _load_contexts(event):
+    return _read("gwt-contexts.json", _prune_contexts, event)
 
 
 class _locked:
@@ -182,8 +182,8 @@ class _locked:
     other's change and that change is simply gone.
     """
 
-    def __init__(self, name):
-        self.path = _path(name)
+    def __init__(self, name, event):
+        self.path = _path(name, event)
         self.stream = None
 
     def __enter__(self):
@@ -241,14 +241,14 @@ def record_status(event):
                     domain, mode = row.get("domain"), row.get("mode")
                     if isinstance(domain, str) and domain and mode in VALID_MODES:
                         domains[domain] = {"mode": mode, "timestamp": stamp}
-    with _locked("gwt-status.json") as held:
+    with _locked("gwt-status.json", event) as held:
         if not held:
             return
-        state = _load_status()
+        state = _load_status(event)
         state.pop(session, None)
         if domains:
             state[session] = domains
-        _write("gwt-status.json", state)
+        _write("gwt-status.json", state, event)
 
 
 def record_context(event):
@@ -259,12 +259,12 @@ def record_context(event):
     scenario_id = event.input.get("scenario_id")
     if not all(isinstance(value, str) and value for value in (session, domain, scenario_id)):
         return
-    with _locked("gwt-contexts.json") as held:
+    with _locked("gwt-contexts.json", event) as held:
         if not held:
             return
-        state = _load_contexts()
+        state = _load_contexts(event)
         state.setdefault(session, {})[_key(domain, scenario_id)] = int(time.time())
-        _write("gwt-contexts.json", state)
+        _write("gwt-contexts.json", state, event)
 
 
 def consume_context(event):
@@ -275,10 +275,10 @@ def consume_context(event):
     scenario_ids = _scenario_ids(event.input)
     if not session or not domain or not scenario_ids:
         return
-    with _locked("gwt-contexts.json") as held:
+    with _locked("gwt-contexts.json", event) as held:
         if not held:
             return
-        state = _load_contexts()
+        state = _load_contexts(event)
         entries = state.get(session, {})
         for scenario_id in scenario_ids:
             entries.pop(_key(domain, scenario_id), None)
@@ -286,7 +286,7 @@ def consume_context(event):
             state[session] = entries
         else:
             state.pop(session, None)
-        _write("gwt-contexts.json", state)
+        _write("gwt-contexts.json", state, event)
 
 
 # --------------------------------------------------------------------------- #
@@ -301,7 +301,7 @@ def check_context(event):
     domain = event.input.get("domain")
     session = event.session_id
 
-    entry = _load_status().get(session or "", {}).get(domain if isinstance(domain, str) else "")
+    entry = _load_status(event).get(session or "", {}).get(domain if isinstance(domain, str) else "")
     mode = entry.get("mode") if isinstance(entry, dict) else None
     if mode is None:
         hookio.deny(event, (
@@ -311,7 +311,7 @@ def check_context(event):
     if mode == "disabled":
         hookio.allow()
 
-    entries = _load_contexts().get(session, {}) if session else {}
+    entries = _load_contexts(event).get(session, {}) if session else {}
     if not any(key.startswith(f"{domain}\0") for key in entries):
         # No context at all for this domain: the scenarios may be new, and a create
         # path needs no prior read. Say so rather than refuse a legitimate first write.

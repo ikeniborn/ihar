@@ -26,7 +26,12 @@ def _runtime_home(event=None) -> str | None:
     and which therefore describes the session actually running, unlike anything ihar
     exports.
     """
-    for name in ("CODEX_HOME", "CLAUDE_CONFIG_DIR"):
+    vendor = getattr(event, "vendor", None)
+    names = {
+        "codex": ("CODEX_HOME",),
+        "claude": ("CLAUDE_CONFIG_DIR",),
+    }.get(vendor, ("CODEX_HOME", "CLAUDE_CONFIG_DIR"))
+    for name in names:
         value = os.environ.get(name)
         if value:
             return value

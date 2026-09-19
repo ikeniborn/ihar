@@ -17,8 +17,9 @@ GWT="$ROOT/hooks/gwt-gate.py"
 # configuration directory. Pointing it at the sandbox keeps a test run from writing
 # into a real one.
 HOME_DIR="$IHAR_TEST_TMP/runtime"
-mkdir -p "$HOME_DIR"
-export CLAUDE_CONFIG_DIR="$HOME_DIR"
+CODEX_HOME_DIR="$IHAR_TEST_TMP/codex-runtime"
+mkdir -p "$HOME_DIR" "$CODEX_HOME_DIR"
+export CLAUDE_CONFIG_DIR="$HOME_DIR" CODEX_HOME="$CODEX_HOME_DIR"
 
 PROJECT="$IHAR_TEST_TMP/proj"
 mkdir -p "$PROJECT/docs/superpowers/intents" \
@@ -234,6 +235,8 @@ assert_eq "an OK result lets it finish" "0" \
 
 intent "$INTENT" in_progress
 claim "$INTENT"
+mkdir -p "$CODEX_HOME_DIR/state"
+cp "$HOME_DIR/state/idd-sessions.json" "$CODEX_HOME_DIR/state/idd-sessions.json"
 codex_read="{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Read\",\"session_id\":\"$SESSION\",\"tool_input\":{\"file_path\":\"/home/u/skills/brainstorming/SKILL.md\"}}"
 assert_eq "a skill read as a file still gates" "2" "$(run "$CHAIN" codex "$codex_read")"
 
@@ -315,6 +318,8 @@ assert_contains "and asks for wiki_status" \
 
 assert_eq "a status response is recorded" "0" "$(run "$GWT" claude "$(status_response strict)" --post)"
 assert_exit "into the runtime home" 0 test -f "$HOME_DIR/state/gwt-status.json"
+assert_exit "and not into the other vendor's runtime home" 1 \
+  test -f "$CODEX_HOME_DIR/state/gwt-status.json"
 
 # A first write in a domain with no context at all may be a create, so it is advised
 # rather than refused.
