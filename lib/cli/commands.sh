@@ -46,10 +46,6 @@ ihar_cmd_launch() {
       # foreground rather than exec: an exec would leave the refcount held forever.
       trap ihar_gateway_release EXIT INT TERM
       ;;
-    transparent)
-      ihar_die 3 "profile '$IHAR_PROFILE' requires a transparent gateway, which slice S11 delivers
-use --profile protected for an explicit one"
-      ;;
   esac
 
   if [[ "$IHAR_PROFILE_SANDBOX" == "microvm" ]]; then
@@ -152,8 +148,7 @@ ihar_cmd_check() {
   printf 'profile      %s\n' "$IHAR_PROFILE"
   printf 'guarantee    %s\n' "$IHAR_PROFILE_GUARANTEE"
   printf 'hooks        %s\n' "$IHAR_PROFILE_HOOKS"
-  printf 'gateway      %s%s\n' "$IHAR_PROFILE_GATEWAY" \
-    "$([[ "$IHAR_PROFILE_GATEWAY" == transparent ]] && printf ' (unavailable until slice S11)')"
+  printf 'gateway      %s\n' "$IHAR_PROFILE_GATEWAY"
   printf 'masking      %s (floor %s, engine %s)\n' \
     "$IHAR_GATEWAY_MASKING_LEVEL" "$IHAR_PROFILE_MASKING_LEVEL" \
     "$(ihar_python ihar.mask.describe "$IHAR_GATEWAY_MASKING_LEVEL" 2>/dev/null || echo unknown)"

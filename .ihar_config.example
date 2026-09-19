@@ -10,7 +10,7 @@
 # Every line below is commented out and shows the default.
 
 # Which guarantees this project runs under. `ihar check` prints the text of each.
-# accepted: standard | protected | remote-protected | isolated
+# accepted: standard | protected | isolated
 # IHAR_PROFILE=standard
 
 # Which agent a bare `ihar` launches.
@@ -27,7 +27,7 @@
 # accepted: presidio | regex
 # IHAR_GATEWAY_ENGINE=presidio
 
-# Binaries, hooks, credentials and the CA. Must stay outside any directory an
+# Binaries, hooks and credentials. Must stay outside any directory an
 # agent can write, which is why it is not in the checkout.
 # accepted: an absolute path
 # IHAR_STORE=${XDG_DATA_HOME:-~/.local/share}/ihar

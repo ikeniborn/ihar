@@ -23,6 +23,8 @@ assert_contains "the project file sets it" "$(ihar check)" "profile      protect
 assert_contains "and the flag beats the file" "$(ihar --profile standard check)" "profile      standard"
 rm -f "$PROJECT/.ihar_config"
 assert_exit "an unknown profile is a usage error" 2 ihar --profile nonesuch check
+assert_exit "the failed transparent profile is unavailable" 2 \
+  ihar --profile remote-protected check
 
 # --- the masking floor may be tightened, never loosened ------------------------------
 #

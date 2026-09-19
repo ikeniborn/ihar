@@ -73,7 +73,7 @@ ihar_masking_resolve() {
   if [[ "$effective" != "off" && "${IHAR_PROFILE_GATEWAY:-off}" == "off" ]]; then
     ihar_die 2 "masking level is '$effective' but profile '$IHAR_PROFILE' has no model egress gateway
 handoff would be sanitised while model requests would not
-use --profile protected or remote-protected"
+use --profile protected"
   fi
 
   IHAR_GATEWAY_MASKING_LEVEL="$effective"

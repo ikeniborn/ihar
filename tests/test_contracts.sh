@@ -22,11 +22,13 @@ for file in "$ROOT"/manifests/netpolicy/*.json; do
     py 'import sys; from ihar import jsonio; jsonio.read("netpolicy", sys.argv[1])' "$file"
 done
 
-# --- the four profiles of LLD 12.1 are all present ------------------------------
+# --- only the profiles whose gates passed are shipped ----------------------------
 
-for name in standard protected remote-protected isolated; do
+for name in standard protected isolated; do
   assert_exit "profile $name is shipped" 0 test -f "$ROOT/manifests/profiles/$name.json"
 done
+assert_exit "the failed transparent spike drops remote-protected" 1 \
+  test -e "$ROOT/manifests/profiles/remote-protected.json"
 
 # --- guarantee text is data, non-empty, and names the profile's scope ------------
 
@@ -52,7 +54,7 @@ for path in sorted(glob.glob(root + "/manifests/profiles/*.json")):
     obj = json.load(open(path))
     policy = obj["netpolicy"]
     if policy and not os.path.exists(f"{root}/manifests/netpolicy/{policy}.json"):
-        print(f"{obj[\"name\"]} -> {policy}")
+        print(f"{obj['name']} -> {policy}")
 ' "$ROOT")"
 assert_eq "every named netpolicy exists" "" "$missing"
 
@@ -111,7 +113,7 @@ reject "a netpolicy name that escapes its directory is rejected" profile \
   "{**$base, 'netpolicy':'../../../tmp/open'}"
 
 accept "a valid minimal profile is accepted" profile "$base"
-accept "claude remote with a transparent gateway is accepted" profile \
+reject "transparent gateway profiles are no longer declarable" profile \
   "{**$base, 'remote':['claude'], 'gateway':'transparent', 'masking_level':'standard',
     'hooks':'enforced', 'acp':'refuse'}"
 

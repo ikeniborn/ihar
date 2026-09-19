@@ -107,7 +107,7 @@ _ihar_gateway_acquire_locked() {
 }
 
 # _ihar_gateway_healthy <port> — the probe the listener answers itself, never the
-# vendor. In transparent mode this is what proves the interception is in place.
+# vendor.
 _ihar_gateway_healthy() {
   ihar_python ihar.gateway.probe "$1" >/dev/null 2>&1
 }

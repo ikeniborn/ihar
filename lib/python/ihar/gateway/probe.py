@@ -1,9 +1,7 @@
 """Ask a gateway whether it is really ours (LLD 8.1, 8.5).
 
-Exit 0 only when the answer carries the marker header. In transparent mode this is
-the check that proves the interception is in place rather than the request having
-reached the vendor: the probe path is in the gateway's local class precisely so it is
-never forwarded.
+Exit 0 only when the answer carries the marker header. The probe path is in the
+gateway's local class precisely so it is never forwarded.
 
 Usage: python3 -m ihar.gateway.probe <port> [--url <url>]
 """
