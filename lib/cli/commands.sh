@@ -82,7 +82,14 @@ use --profile protected for an explicit one"
   #     merely rendered by us (LLD 6.5).
   ihar_verify_hook_trust "$vendor" "$runtime"
 
-  # 8. session index: slice S9.
+  # 8. a daemon serving this home must be the one this configuration asked for. Codex
+  #    hands every client the environment the daemon inherited at start, so a daemon
+  #    left over from another profile would serve this launch under that profile.
+  if [[ "$vendor" == codex ]]; then
+    ihar_codex_daemon_reconcile "$runtime" "$hash"
+  fi
+
+  # 8b. session index: slice S9.
 
   # 9. and 10. the adapter builds its argv and the environment it needs
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR
@@ -168,6 +175,7 @@ ihar_cmd_check() {
   done
 
   ihar_check_mcp
+  ihar_check_daemon
 
   if [[ "${IHAR_SUBCOMMAND:-}" == "--conformance" || "${IHAR_FLAG_CONFORMANCE:-false}" == true ]]; then
     ihar_cmd_conformance

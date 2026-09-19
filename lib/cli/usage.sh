@@ -14,6 +14,8 @@ commands
   install               install every pinned component under this user, no sudo
   update                re-install what the lockfile now pins, then re-prove the hooks
   homes list | clean    project state directories
+  daemon status | stop | restart
+                        the managed Codex app-server daemon
 
 global flags
   --profile <name>      standard, protected, remote-protected, isolated
@@ -36,6 +38,6 @@ everything after -- goes to the agent verbatim:
   ihar codex -- mcp list
 
 not yet delivered
-  sessions, switch, web, acp, daemon
+  sessions, switch, web, acp
 TEXT
 }

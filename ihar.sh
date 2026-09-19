@@ -30,6 +30,7 @@ source "$_IHAR_LIB/store/lockfile.sh"
 source "$_IHAR_LIB/store/install.sh"
 source "$_IHAR_LIB/render/hooks.sh"
 source "$_IHAR_LIB/render/config.sh"
+source "$_IHAR_LIB/codex/daemon.sh"
 source "$_IHAR_LIB/gateway/gateway.sh"
 source "$_IHAR_LIB/profile/profile.sh"
 source "$_IHAR_LIB/adapters/adapter.sh"
@@ -56,6 +57,7 @@ ihar_main() {
     check)        ihar_cmd_check ;;
     install)      ihar_cmd_install ;;
     update)       ihar_cmd_update ;;
+    daemon)       ihar_cmd_daemon ;;
     homes)        ihar_cmd_homes ;;
     *)            ihar_die 2 "unhandled command '$IHAR_COMMAND'" ;;
   esac

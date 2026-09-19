@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 5 (Codex hook trust corrected by measurement during slice S5) |
+| Status | revision 6 (the Codex daemon's standalone-install requirement and control-socket framing measured during slice S8) |
 | Date | 2026-09-18 |
 | Derived from | `docs/hld/unified-harness.md` revision 2 (commit `ec2df36`) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -348,6 +348,10 @@ Mode, approval, trust, provider, MCP and hooks live in the rendered `config.toml
 
 `list_sessions` (`ihar.sessions.codex`) has three transports: the daemon control socket when one is running; otherwise a `codex app-server` stdio child using the JSON-RPC client lifted from icodex `lib/profile/app_server.py` (incrementing ids, `initialize` then `initialized`, server-initiated requests declined with `-32601`); and finally `st/codex/state_5.sqlite` opened `?mode=ro` behind a `PRAGMA user_version` guard.
 
+**The control socket is a WebSocket endpoint carried over a Unix domain socket.** Revision 5 left the framing open (§20, "against stdio"); slice S8 measured it on 0.154.0 rather than guessing. A newline-delimited JSON-RPC request written straight to the socket gets no reply at all, for any framing tried — bare, newline-terminated or `Content-Length`. An RFC 6455 upgrade request is answered `HTTP/1.1 101 Switching Protocols`, and after it the messages are the same JSON objects the stdio transport exchanges. `ihar.codex.appserver` therefore shares one protocol layer between `AppServer` (a stdio child) and `DaemonClient` (the socket), and implements only the frames a JSON-RPC conversation uses: text, continuation, ping and close, with every client frame masked as the RFC requires.
+
+`codex app-server proxy` is not a way around that. Its help says it proxies stdio *bytes* to the control socket, and it behaves that way: piped a plain JSON-RPC request it stays alive and answers nothing. The framing belongs to the client either way, so ihar connects to the socket directly and saves the extra process.
+
 Request `thread/list {"cwd", "limit": 200, "sortKey": "updated_at", "sortDirection": "desc", "archived": false}`, paging on `nextCursor`. Mapping, verified against the 0.154 `Thread` definition:
 
 | `Thread` | Canonical | Conversion |
@@ -368,6 +372,10 @@ Request `thread/list {"cwd", "limit": 200, "sortKey": "updated_at", "sortDirecti
 The Codex app-server daemon is long-lived and shared. Its README states that clients use the environment inherited when the daemon started and that per-client environment isolation is not provided. Two consequences shape the design.
 
 **Identity.** Hooks running under the daemon may see another launch's environment, so `session-register.py` and every policy read derive from the hook payload's `session_id` and from the runtime configuration on disk. The mapping from `vendor_session_id` to `ihar_id` and profile lives in the control plane (§10.3), not in the daemon's environment.
+
+**The daemon will not start without a managed standalone install.** `codex app-server daemon start` refuses unless `$CODEX_HOME/packages/standalone/current/codex` exists — the layout the official Codex installer produces — and says so: `managed standalone Codex install not found at …`. ihar installs a release tarball into its own store instead, so as written this section could never have started a daemon at all. Measured on 0.154.0: a **symlink** at that path pointing at the store binary is accepted, and `daemon start` then reports it as `managedCodexPath`. `ihar_render_standalone_link` creates it during the render, not in the published home, because a published runtime home is never written to again (§4.2).
+
+**The daemon subcommands answer in JSON.** `daemon start`, `daemon version` and `daemon stop` each print one object on stdout carrying `status`, `backend`, `pid`, `socketPath`, `managedCodexPath`, `managedCodexVersion`, `cliVersion` and `appServerVersion`; `version` exits non-zero when nothing is running, which is an answer rather than a failure. Reconciliation reads the running version from there rather than inferring it from the binary on disk, because the daemon goes on running the binary it started from after that binary is replaced — which is the version-skew class this section exists to close.
 
 **Reconciliation.** `ihar.codex.daemon` keeps `$IHAR_STATE/daemons/codex.json`:
 
@@ -946,7 +954,6 @@ The review is right that the original slice order puts feature work before the c
 
 ## 20. Open implementation decisions
 
-- The `app-server-control` socket framing over a socket transport against stdio (§5.4). Resolve in S3 or S6 at first daemon start.
 - Claude `sandbox` settings key names for 2.1.274 (§9.1). Resolve in S5a.
 - Codex `auth.json` field names for auth-mode detection (§8.7). Resolve in S5a.
 - Whether Codex exposes a `Skill` tool name for the workflow matcher (§6.1). Resolve in S3 from the hook schema enum.
