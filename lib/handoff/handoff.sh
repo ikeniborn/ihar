@@ -57,7 +57,7 @@ ihar_handoff_prepare() {
   if [[ "$vendor" == claude ]]; then
     IHAR_FLAG_PROMPT="$(cat "$pending")"
   else
-    IHAR_FLAG_PROMPT="$(head -c 2048 "$pending")"$'\n\n'"The remaining handoff context will arrive through the SessionStart hook."
+    IHAR_FLAG_PROMPT="$(ihar_python ihar.handoff.carrier prefix "$pending")"$'\n\n'"The remaining handoff context will arrive through the SessionStart hook."
   fi
 }
 

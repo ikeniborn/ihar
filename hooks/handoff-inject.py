@@ -37,6 +37,13 @@ def _ihar_id(index_path: str, vendor: str, vendor_session_id: str):
     return None
 
 
+def _remainder(data: bytes, limit: int = 2048) -> str:
+    boundary = min(limit, len(data))
+    while boundary and (data[boundary:boundary + 1] and data[boundary] & 0xC0 == 0x80):
+        boundary -= 1
+    return data[boundary:].decode("utf-8")
+
+
 def main():
     try:
         event = hookio.read_event()
@@ -57,8 +64,8 @@ def main():
         if not identity:
             return 0
         pending = os.path.join(pending_dir, identity + ".md")
-        with open(pending, encoding="utf-8") as stream:
-            text = stream.read()[2048:]
+        with open(pending, "rb") as stream:
+            text = _remainder(stream.read())
         os.unlink(pending)
         if not text:
             return 0

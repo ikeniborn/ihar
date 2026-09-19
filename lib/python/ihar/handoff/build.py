@@ -139,7 +139,7 @@ def build_package(source: dict, target_vendor: str, cwd: str | Path, state: str 
     check("handoff", package)
     markdown = render_markdown(package).encode()
     directory = state / "handoff"
-    _atomic(directory / f"{source['ihar_id']}.json", _encoded(package) + b"\n")
+    _atomic(directory / f"{source['ihar_id']}.json", _encoded(package))
     _atomic(directory / f"{source['ihar_id']}.md", markdown)
     _atomic(directory / "pending" / f"{token}.md", markdown)
     return package

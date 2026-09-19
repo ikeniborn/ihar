@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from ihar.handoff.build import build_package
@@ -88,7 +89,9 @@ printf '{{"message":"fork summary"}}\\n'
         fake.chmod(0o755)
         ephemeral = state / "ephemeral.jsonl"
         os.environ["EPHEMERAL"] = str(ephemeral)
+        started = time.monotonic()
         assert distill_codex(str(fake), str(root), "source", ephemeral, 5) == "fork summary"
+        assert time.monotonic() - started < 1
         assert fork_id in ephemeral.read_text(encoding="utf-8")
 
     print("PASS handoff builder")

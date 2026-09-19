@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/tests/helpers.sh"
 ihar_sandbox
 export PYTHONPATH="$ROOT/lib/python"
+ihar_python() { if [[ "$1" == -c ]]; then python3 "$@"; else python3 -m "$@"; fi; }
 
 project="$IHAR_TEST_TMP/project"
 mkdir -p "$project"
@@ -63,6 +64,21 @@ CODEX_HOME="$runtime" python3 -I "$ROOT/hooks/handoff-inject.py" --vendor codex 
 EOF
 remainder="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["hookSpecificOutput"]["additionalContext"])' < "$IHAR_TEST_TMP/carrier.out")"
 assert_eq "codex hook carries only the remainder" TAIL "$remainder"
+utf8_id="$(python3 -m ihar.ids)"
+python3 - <<'PY' > "$state/handoff/pending/$utf8_id.md"
+print("я" * 1024 + "TAIL", end="")
+PY
+python3 -m ihar.sessions.index append "$state/sessions.jsonl" <<EOF
+{"schema":1,"ihar_id":"$utf8_id","vendor":"codex","vendor_session_id":"codex-utf8","profile":"standard","source":"hook"}
+EOF
+IHAR_LAUNCH_ID="$utf8_id"
+IHAR_FLAG_PROMPT=""
+ihar_handoff_prepare codex
+CODEX_HOME="$runtime" python3 -I "$ROOT/hooks/handoff-inject.py" --vendor codex <<'EOF' > "$IHAR_TEST_TMP/utf8.out"
+{"hook_event_name":"SessionStart","session_id":"codex-utf8","tool_input":{}}
+EOF
+remainder="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["hookSpecificOutput"]["additionalContext"])' < "$IHAR_TEST_TMP/utf8.out")"
+assert_eq "codex split preserves UTF-8 after 2048 bytes" TAIL "$remainder"
 IHAR_LAUNCH_ID="claude-carrier"
 printf '%2500s' x > "$state/handoff/pending/claude-carrier.md"
 IHAR_FLAG_PROMPT=""
@@ -70,7 +86,7 @@ ihar_handoff_prepare claude
 assert_eq "claude carries the whole package in its initial prompt" "2500" "${#IHAR_FLAG_PROMPT}"
 IHAR_VENDOR=claude
 ihar_handoff_consume_claude
-assert_exit "claude consumes its initial-prompt package" 1 test -f "$state/handoff/pending/carrier-test.md"
+assert_exit "claude consumes its initial-prompt package" 1 test -f "$state/handoff/pending/claude-carrier.md"
 
 source_id="$(python3 -m ihar.ids)"
 expected_target="$(python3 -m ihar.ids)"
@@ -78,7 +94,6 @@ python3 -m ihar.sessions.index append "$state/sessions.jsonl" <<EOF
 {"schema":1,"ihar_id":"$source_id","vendor":"claude","vendor_session_id":"source-vendor","project":"project","cwd":"$project","git_branch":null,"title":null,"model":null,"profile":"standard","started_at":"2026-09-19T12:00:00Z","updated_at":"2026-09-19T12:00:00Z","parent_ihar_id":null,"handoff_from":null,"handoff_to":null,"tags":[],"source":"launch"}
 EOF
 ihar_state_setup() { IHAR_STATE="$state"; export IHAR_STATE; }
-ihar_python() { if [[ "$1" == -c ]]; then python3 "$@"; else python3 -m "$@"; fi; }
 ihar_uuid() { printf '%s\n' "$expected_target"; }
 ihar_adapter() { printf '%s\n' '{"open_items":[],"decisions":[],"decisions_heuristic":[],"recent_messages":[]}'; }
 ihar_cmd_launch() { launched_vendor="$1"; }

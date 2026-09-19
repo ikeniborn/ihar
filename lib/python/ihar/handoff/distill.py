@@ -46,6 +46,7 @@ def codex(binary: str, home: str, session: str, ephemeral: Path, timeout: int) -
             for key, _ in ready:
                 line = key.fileobj.readline()
                 if not line:
+                    selector.unregister(key.fileobj)
                     continue
                 try: event = json.loads(line)
                 except ValueError: continue
@@ -56,6 +57,8 @@ def codex(binary: str, home: str, session: str, ephemeral: Path, timeout: int) -
                     fork_id = str(candidate); _ephemeral(ephemeral, fork_id, fork_id)
                 text = event.get("text") or event.get("message")
                 if isinstance(text, str) and text: messages.append(text)
+            if not selector.get_map() and process.poll() is not None:
+                break
         if process.poll() is None: process.kill()
         process.wait()
     finally:
