@@ -2,8 +2,7 @@
 
 Explicit mode terminates no TLS, negotiates no ALPN, and serves no client that was
 not pointed at it by this harness, so the stdlib server is adequate here and keeps
-the default protected path free of a heavy dependency. Transparent mode is a
-different problem and slice S11 gives it mitmproxy.
+the protected path free of a heavy dependency.
 
 Failure class: fail-closed per request. An unknown route, an unparseable body, a
 compressed body, an oversized body, a payload the masker cannot promise anything

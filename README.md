@@ -22,7 +22,6 @@ A profile is a set of guarantees, and `ihar check` prints the text of the one in
 |---|---|
 | `standard` | Hooks advise. No network control. The vendor's own defaults, plus a single configuration. |
 | `protected` | Hooks are enforced. Model traffic goes through a local gateway that masks secrets and refuses what it cannot mask. MCP servers are limited to a registry allowlist. |
-| `remote-protected` | As `protected`, for a remote surface. |
 | `isolated` | As `protected`, inside a microVM. |
 
 A profile that enforces something and cannot prove it aborts the launch. There is no mode

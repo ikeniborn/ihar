@@ -96,13 +96,12 @@ Defects the architecture review caught. Reintroducing one is a defect regardless
 
 - **Never render `bypass_hook_trust`** — it is global, so any repository's `.codex/hooks.json` becomes trusted. Use `hooks.managed_dir` and `managed_hooks_only` under enforced profiles; verify through `hooks/list`.
 - **Never write into an existing runtime home** — a live launch reads it, so mutation changes policy under a running process. A config change produces a new `rt/<config-hash>/`; drift in an existing one is exit 3.
-- **Never place the store inside the checkout** or any agent-writable path — it holds hook scripts, credentials and the CA key, so write access is code execution as the user.
+- **Never place the store inside the checkout** or any agent-writable path — it holds hook scripts and credentials, so write access is code execution as the user.
 - **Never relay an unrecognised gateway route** — an unparsed body cannot be masked, so relaying leaks it. Refuse unknown route, unknown content block, non-text payload, unparseable or compressed body. With masking off, relay is allowed.
 - **Never mask with no gateway** — nothing in the path can mask, so the guarantee is silently unmet. Masking above `off` under a gateway-less profile is exit 2, not a silent gateway promotion.
 - **Never scan nothing** — an unscanned string is an exfiltration path. Inspect every string in a model request: structural keys with the secrets ruleset, the rest at full level.
 - **Never derive launch identity from the environment inside a Codex hook** — the daemon may carry another launch's environment, applying the wrong policy. Use the payload `session_id` and the runtime home's policy file.
 - **Never use a shared handoff file** — concurrent packages overwrite each other and one launch reads another's context. Each package gets its own token under `handoff/pending/`.
-- **Never intercept host-wide** — it captures traffic from processes outside the launch. No `/etc/hosts` outside a namespace, no negative cgroup match; match the launch's own control group positively.
 - **Never add a second hook returning `updatedInput`** for one event and tool set — Codex runs matching hooks concurrently, so the winning rewrite is a race. The manifest linter rejects it.
 - **Never fail open a lock guarding a security asset** — proceeding without it puts two writers on the protected asset. Use `ihar_with_lock --required` for store mutation, CA generation, runtime materialisation, gateway refcounting, daemon reconciliation, install and update.
 - **Never claim `hooks: enforced` without a passing conformance record** for the installed vendor version — rendering a hook is not evidence the vendor fired it.
@@ -146,7 +145,7 @@ A profile that has not passed its gate is absent from `manifests/profiles/` — 
 | G1 | state and runtime homes | nothing; every later phase writes into that layout |
 | G2 | hooks, trust, conformance | any profile with `hooks: enforced` |
 | G3 | explicit gateway | `protected` |
-| G4 | transparent spike | `remote-protected`, or it is dropped |
+| G4 | transparent spike | no-go: `remote-protected` dropped by user decision in S11 |
 | G5 | microVM and guest network | `isolated` |
 
 Never implement a later phase's enforcement to unblock an earlier one. **If a gate cannot be met, stop and report the evidence.** Dropping a profile is the user's decision, not yours, because it removes a capability they may be relying on; weakening one to pass its gate is never an option, because the profile's name is the guarantee.

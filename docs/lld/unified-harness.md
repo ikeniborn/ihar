@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 7 (the workflow gates and Codex daemon contract corrected by measurement during slices S17 and S8) |
+| Status | revision 8 (`remote-protected` dropped after the S11 transparent-gateway no-go) |
 | Date | 2026-09-18 |
 | Derived from | `docs/hld/unified-harness.md` revision 2 (commit `ec2df36`) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -46,7 +46,7 @@ Anything else set through `.ihar_config` is exported de-prefixed exactly like ic
 
 **`IHAR_LAUNCH_ID` is not an identity mechanism for hooks.** A Codex hook may run under a long-lived daemon that inherited another launch's environment (§5.5), so hooks derive identity from the payload `session_id` and read policy from the runtime config on disk, never from these variables. They are exported for the statusline and for diagnostics only.
 
-Vendor-facing variables are set by adapters alone: `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_EXECUTABLE`, `ANTHROPIC_BASE_URL`, `NODE_EXTRA_CA_CERTS` for Claude; `CODEX_HOME`, `CODEX_PATH`, `SSL_CERT_FILE` for Codex.
+Vendor-facing variables are set by adapters alone: `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_EXECUTABLE`, `ANTHROPIC_BASE_URL` for Claude; `CODEX_HOME`, `CODEX_PATH` for Codex.
 
 ### 1.4 Threat model and the scope of R4
 
@@ -56,12 +56,11 @@ HLD R4 asks that "no PII leaves the machine in a model request" in a strict mode
 |---------|-----------|
 | `standard` | none. Masking is off and no egress is controlled. |
 | `protected` | **model egress**: no unmasked supported content reaches a model provider, and unsupported content is refused rather than sent. MCP servers are restricted to a registry allowlist. Other tool network egress is not controlled, and `ihar check` says so. |
-| `remote-protected` | as `protected`, with interception scoped to the agent's own control group so the rest of the host is untouched. |
 | `isolated` | **machine egress**: deny by default at the guest boundary; only the gateway, allowlisted MCP endpoints and profile-listed hosts are reachable. This is the only profile in which a data-loss claim covers arbitrary tool traffic. |
 
 Three egress channels exist and each has its own control: the model request (§8), MCP servers (§7.3), and arbitrary tool network use (§9.2). A guarantee that names only the first is stated as covering only the first.
 
-Trust boundaries: the store (§2.3) holds hook scripts, manifests, profiles, pinned binaries, vendor credentials and the transparent-mode CA key; it is **outside every directory an agent can write**, which is why it no longer lives in the project checkout. The project workspace is agent-writable. The runtime home (§2.4) is agent-readable and, under enforced profiles, agent-read-only.
+Trust boundaries: the store (§2.3) holds hook scripts, manifests, profiles, pinned binaries and vendor credentials; it is **outside every directory an agent can write**, which is why it no longer lives in the project checkout. The project workspace is agent-writable. The runtime home (§2.4) is agent-readable and, under enforced profiles, agent-read-only.
 
 ## 2. Layout
 
@@ -96,12 +95,11 @@ Revision 3 of this document specified a readable id, `<sanitized-basename>-<sha2
 |-------|---------|-------|
 | `bin/codex`, `bin/codex-code-mode-host`, `bin/.codex-version` | pinned static Codex (icodex `lib/binary/install.sh:184-259`) | `ihar install` |
 | `bin/uv`, `bin/rg`, `bin/tree`, `bin/firecracker`, `bin/vmlinux`, `bin/rootfs.ext4` | tools and microVM assets | `ihar install` |
-| `venv/` | `requests`, `presidio-analyzer`, `presidio-anonymizer`, optional spaCy models, optional `claude-agent-sdk`, `mitmproxy` when transparent mode is installed | `ihar install` |
+| `venv/` | `requests`, `presidio-analyzer`, `presidio-anonymizer`, optional spaCy models, optional `claude-agent-sdk` | `ihar install` |
 | `skills/`, `hooks/`, `manifests/` | copies of the tracked trees, sha256-pinned | `ihar install` |
 | `auth/claude/.credentials.json`, `auth/codex/auth.json` | shared vendor logins | vendors |
 | `plugins/claude/`, `plugins/codex/` | plugin caches | vendors |
 | `verification/<vendor>-<version>.json` | live hook conformance records (§6.6) | `ihar install`, `ihar update` |
-| `gateway/ca/` | `ihar-ca.key` (600), `ihar-ca.crt`, `bundle.pem`, `leaves/` | transparent mode |
 | `acp/` | pinned ACP adapters | `ihar install --acp` |
 | `.ihar-store.lock`, `.last-lockfile-hash` | store lock and drift marker | store |
 
@@ -158,7 +156,7 @@ lib/
   profile/    profile.sh enforce.sh
   render/     hooks.sh mcp.sh config.sh
   adapters/   adapter.sh claude.sh codex.sh daemon.sh
-  gateway/    gateway.sh explicit.sh transparent.sh cgroup.sh
+  gateway/    gateway.sh
   sandbox/    sandbox.sh netpolicy.sh microvm.sh
   sessions/   index.sh
   handoff/    handoff.sh
@@ -334,7 +332,7 @@ claude --session-id <uuid> [-n <title>] [--model <m>] [--effort <e>]
 
 `inject_context` prints the package as the initial prompt argument (§11.5).
 
-`start_remote` prints `--remote-control [name]` when the gateway mode is `off` or `transparent`, and exits 1 under an explicit gateway naming the profile.
+`start_remote` prints `--remote-control [name]` when the gateway mode is `off`, and exits 1 under an explicit gateway naming the profile.
 
 ### 5.4 CodexAdapter
 
@@ -398,7 +396,7 @@ The Codex app-server daemon is long-lived and shared. Its README states that cli
   {"id": "security-pretool", "event": "PreToolUse",
    "tools": ["shell", "file-read", "file-write", "mcp:*"],
    "script": "security-pretool.py", "args": [], "timeout": 10,
-   "vendors": ["claude", "codex"], "profiles": ["*"], "required_in": ["protected", "remote-protected", "isolated"]},
+   "vendors": ["claude", "codex"], "profiles": ["*"], "required_in": ["protected", "isolated"]},
   {"id": "chain-gate-pre", "event": "PreToolUse", "tools": ["skill", "file-read", "file-write", "shell"],
    "script": "chain-gate.py", "args": [], "timeout": 10, "vendors": ["claude", "codex"], "profiles": ["*"]},
   {"id": "chain-gate-post", "event": "PostToolUse", "tools": ["file-write"],
@@ -562,7 +560,7 @@ A registered MCP server sends whatever the agent hands it, to wherever it points
 2. **Input policy.** `security-pretool.py` masks every `mcp__*` tool input at the effective masking level before the call is made. An input carrying a content type the masking policy cannot handle is denied, mirroring §8.4.
 3. **Network.** Under `isolated`, a server's declared `egress` entries are the only destinations opened for it; an undeclared destination is dropped by the guest policy (§9.2). Under `protected` this is not enforced and `ihar check` states that plainly.
 
-## 8. Model egress gateway (slices S5a, S5b)
+## 8. Model egress gateway (slice S5a; S5b no-go)
 
 ### 8.1 Instance identity and lifecycle
 
@@ -579,16 +577,11 @@ state       = $IHAR_STATE_ROOT/gw/<gateway_key>/{lock,pid,port,consumers/,mode}
 | `ihar_gateway_release <key>` | remove this consumer; the last consumer of that key stops its supervisor |
 | `ihar_gateway_status` | per key: mode, port, masking level, consumers, metrics, refusal counters |
 
-Under transparent mode the interception is scoped to one control group (§8.3), so different launches may run different instances simultaneously without interfering.
-
 ### 8.2 Two implementations, chosen by mode
 
 The review is right that `http.server` is not a foundation for a security proxy; the Python documentation says it implements only basic security checks and is not recommended for production. But the two modes ask for different things, and one answer is wrong for both:
 
-- **Explicit mode** is a plain-HTTP reverse proxy bound to loopback. There is no TLS to terminate, no ALPN to negotiate, no client that was not told to come here. `ihar.gateway.explicit` keeps a stdlib `ThreadingHTTPServer` hardened with the limits of §8.6, which keeps the default protected path free of a heavy dependency.
-- **Transparent mode** must terminate TLS for hosts it does not own, select certificates by SNI, negotiate ALPN, tunnel WebSocket upgrades and survive HTTP/2 clients. Writing that is a network project, not a feature. `ihar.gateway.mitm_addon` runs inside **mitmproxy** (pinned in the lockfile, installed only with `ihar install --transparent`), which owns connection lifecycle, TLS, HTTP/1.1, HTTP/2 and WebSocket, while ihar owns route classification, schema validation, masking, policy, metrics and the fail-closed decisions.
-
-Both implementations import the same `ihar.gateway.routes`, `ihar.mask.*` and `ihar.gateway.limits`, so the security behaviour is one implementation with two transports, and the conformance tests of §16 run against both.
+The shipped implementation is a plain-HTTP reverse proxy bound to loopback. There is no TLS to terminate, no ALPN to negotiate, no client that was not told to come here. `ihar.gateway.explicit` keeps a stdlib `ThreadingHTTPServer` hardened with the limits of §8.6, which keeps the protected path dependency-free.
 
 ### 8.3 Routing, default refuse
 
@@ -598,12 +591,11 @@ model     POST /v1/messages, /v1/messages/count_tokens, /v1/messages/batches*  �
           POST /backend-api/codex/responses                                    → ChatGPT
 transit   auth, login and OAuth callbacks, token refresh, /v1/models, version and update
           checks, telemetry, any Upgrade: websocket request including the ChatGPT relay,
-          and in transparent mode every request whose Host is not a model host
 local     GET /api/ihar-probe (header x-ihar-gateway: 1), /api/health, /api/meta, /api/metrics
 unknown   everything else
 ```
 
-An unknown route is **refused** with 502 and a log line naming method, host and path whenever the effective masking level is not `off`; with masking off it is relayed as transit. This is what HLD §10 requires: a new vendor endpoint must fail loudly rather than become a silent hole. `/api/ihar-probe` is in the local class precisely so the transparent health check of §8.5 is answered by the listener and never reaches the vendor.
+An unknown route is **refused** with 502 and a log line naming method, host and path whenever the effective masking level is not `off`; with masking off it is relayed as transit. This is what HLD §10 requires: a new vendor endpoint must fail loudly rather than become a silent hole. `/api/ihar-probe` is answered by the listener and never reaches the vendor.
 
 ### 8.4 Masking contract
 
@@ -618,23 +610,11 @@ Revision 2 said both that `system` is masked and that `system` content is preser
 
 Engine (`ihar.mask.engine`): Presidio with spaCy when available, the iclaude regex engine as fallback, `IHAR_GATEWAY_ENGINE=regex` to force it, levels `off | secrets | standard`. The same module sanitises handoff packages (§11.2), so one implementation carries the claim. This also closes the icodex defect where `ICODEX_PII_ENGINE=nlp` is accepted while `server.py` never imports Presidio.
 
-### 8.5 Transparent mode, scoped to the agent
+### 8.5 Transparent mode spike: no-go
 
-Host-global interception is not acceptable: writing `api.anthropic.com` into `/etc/hosts` captures every process on the machine, including browsers and other users' tools, none of which trust the ihar CA. Negative matching on "everything that is not the gateway" has the same reach. Interception is therefore **positively scoped to the launch's own control group**:
+S11 measured cgroup v2 and positive `iptables -m cgroup --path` support on the target kernel. nftables on the same host exposes only numeric cgroup ids. The redirect still requires root or `CAP_NET_ADMIN`: unprivileged nat-table access exits 4 with permission denied, while `route_localnet` is disabled. The approved design defined no root-owned helper, polkit policy or sudo contract. Adding one would create a new privileged security boundary rather than implement this design.
 
-```text
-ihar launch
-  └─ cgroup v2  ihar.slice/<launch-id>          the vendor process and its children
-        └─ OUTPUT rule: -m cgroup --path ihar.slice/<launch-id> -d <model ip> --dport 443
-                        -j DNAT --to 127.0.0.1:<tls port>
-     cgroup v2  ihar.slice/gw-<gateway-key>     the gateway, never matched by the rule
-```
-
-`iptables` supports positive cgroup-v2 path matching for socket traffic, and nftables has the equivalent primitive; `lib/gateway/cgroup.sh` prefers nftables when present. `net.ipv4.conf.all.route_localnet=1` is required for an OUTPUT DNAT to a loopback address and is checked in the preflight. Every rule carries the comment `ihar-gw:<launch-id>` so `ihar_gateway_redirect_off` and the startup sweep can remove exactly what they created. `/etc/hosts` is used only inside a private mount namespace or the microVM guest, where its reach is the guest.
-
-Trust: `NODE_EXTRA_CA_CERTS` for Claude (Node), `SSL_CERT_FILE` pointing at the concatenated bundle for Codex (Rust reqwest reads one file). Health: `ihar_enforce_start` requests `https://api.anthropic.com/api/ihar-probe` through the bundle from inside the scoped cgroup and requires the marker header; anything else is exit 3. Cleanup runs from the launch trap and again at the next `ihar check`.
-
-S5b's manual protocol records Claude Remote Control bridge registration behind the listener (issue #71781), the ChatGPT relay WebSocket, the `codex login` flow, and certificate-pinning behaviour.
+Gate G4 therefore failed. The user chose the plan's fail-closed outcome: `remote-protected` is dropped, `transparent` is removed from the profile schema, and no CA, mitmproxy addon, cgroup rule manager or dormant fallback ships. `protected` remains unchanged on the explicit gateway. Claude Remote Control with masking is not offered.
 
 ### 8.6 Limits and logging
 
@@ -648,7 +628,6 @@ The logging contract is a fixed invariant with its own test. Never logged: `Auth
 |------|--------|-------|
 | `off` | nothing | nothing |
 | `explicit` | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` | `model_provider = "ihar"` plus `[model_providers.ihar] base_url = "http://127.0.0.1:<port>/<prefix>" wire_api = "responses" requires_openai_auth = true`, where `<prefix>` is `backend-api/codex` under ChatGPT auth and `v1` under an API key |
-| `transparent` | `NODE_EXTRA_CA_CERTS`, scoped redirect | `SSL_CERT_FILE`, scoped redirect |
 
 `ihar_codex_auth_mode` reads `$IHAR_STORE/auth/codex/auth.json` and returns `chatgpt`, `apikey` or `none`; the field names are a VERIFY item for S5a and the file is only ever read.
 
@@ -665,7 +644,7 @@ The logging contract is a fixed invariant with its own test. Never logged: `Auth
 
 `vendor-default` exists because HLD §8 calls the sandbox optional for `standard`, and rendering a region there would write `danger-full-access` and, following icodex's default triple, drop `default_permissions` — which icodex itself warns "disables managed permissions" (`lib/config/sandbox.sh:112-114`). Writing nothing is what "optional" means. A rendered region always carries a `default_permissions`.
 
-Under enforced profiles the sandbox additionally denies the store, the state root and the runtime home for writes, and denies `auth/` and `gateway/ca/` entirely. That closes the time-of-check window the sha256 pin alone leaves: verifying a hook at launch does not stop an agent from rewriting it before the next hook run. `security-pretool.py` refuses the same paths as a second layer, and unlike revision 2 it has **no exclusion for store hook paths**.
+Under enforced profiles the sandbox additionally denies the store, the state root and the runtime home for writes, and denies `auth/` entirely. That closes the time-of-check window the sha256 pin alone leaves: verifying a hook at launch does not stop an agent from rewriting it before the next hook run. `security-pretool.py` refuses the same paths as a second layer, and unlike revision 2 it has **no exclusion for store hook paths**.
 
 The icodex presets `ro | safe | full-ask | full-auto` map to `read-only | vendor | vendor-default | vendor-default` plus `--approval never`; `--approval` changes only `approval_policy`.
 
@@ -678,7 +657,7 @@ The icodex presets `ro | safe | full-ask | full-auto` map to `read-only | vendor
  "allow": [{"kind": "gateway"}, {"kind": "mcp-declared"}, {"host": "registry.npmjs.org", "port": 443}]}
 ```
 
-Only `isolated` sets `default: "deny"`, and it is enforced at the guest boundary, where a deny-by-default rule is both meaningful and cheap: the guest's only route out is the host, so the policy is a host-side filter on the tap interface plus the DNAT to the gateway. `protected` and `remote-protected` declare `default: "allow"` and the profile's guarantee text says so, because enforcing a per-process network policy on a host shared with the user's own tools is a promise ihar cannot keep. This is the difference between the two R4 scopes in §1.4, made concrete.
+Only `isolated` sets `default: "deny"`, and it is enforced at the guest boundary, where a deny-by-default rule is both meaningful and cheap: the guest's only route out is the host, so the policy is a host-side filter on the tap interface plus the DNAT to the gateway. `protected` declares `default: "allow"` and the profile's guarantee text says so, because enforcing a per-process network policy on a host shared with the user's own tools is a promise ihar cannot keep. This is the difference between the two R4 scopes in §1.4, made concrete.
 
 MicroVM changes over iclaude: the image carries both binaries, mounts `st/` for vendor state and the policy bundle read-only, keeps the workspace separately writable, exports both `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, and DNATs model traffic to the gateway.
 
@@ -780,8 +759,7 @@ The payload has exactly one carrier. Revision 2 put the same text in both the in
 |---------|-------|---------|---------------|---------|---------|--------|-----------|-----|
 | `standard` | best-effort | off | off | vendor-default | vendor default | claude, codex | false | allow |
 | `protected` | enforced | explicit | standard | vendor | allow, MCP allowlisted | codex | true | refuse |
-| `remote-protected` | enforced | transparent, cgroup-scoped | standard | vendor | allow, MCP allowlisted | claude, codex | true | refuse |
-| `isolated` | enforced | explicit or transparent inside the guest | standard | microvm | deny by default | per the file | true | refuse |
+| `isolated` | enforced | explicit inside the guest | standard | microvm | deny by default | per the file | true | refuse |
 
 ### 12.2 Resolution
 
@@ -796,7 +774,7 @@ Masking without a gateway is also exit 2:
 ```text
 effective masking level is <x> but this profile has no model egress gateway;
 handoff would be sanitised while model requests would not.
-use --profile protected or remote-protected
+use --profile protected
 ```
 
 Revision 2 allowed `ihar claude --mask-level standard` under `standard`, which sanitised handoff packages and left every model request untouched while the statusline reported masking as active. Silently promoting the gateway instead would change the security topology behind the user's back, so the error is explicit.
@@ -809,7 +787,7 @@ In order, each fail-closed: hook integrity and, for Codex, trust state through `
 
 ## 13. Web and ACP (slices S9, S11)
 
-**Claude web**: the profile must list `claude` in `remote` and use gateway `off` or `transparent`; then `--remote-control [name]`. **Codex web**: `codex app-server daemon start` under the runtime `CODEX_HOME`, `daemon enable-remote-control`, `remote-control pair` printing the code, then the TUI attached over the control socket, with the daemon recorded per §5.5. `codex features` reports `remote_control` as `removed` in 0.154.0 because the capability became these subcommands. **Codex LAN**: `codex app-server --listen ws://<addr>` with the websocket auth flags, not the daemon subcommand, which accepts only `-c`, `--enable` and `--disable`.
+**Claude web**: the profile must list `claude` in `remote` and use gateway `off`; then `--remote-control [name]`. No shipped profile combines Claude Remote Control with masking after the S5b no-go. **Codex web**: `codex app-server daemon start` under the runtime `CODEX_HOME`, `daemon enable-remote-control`, `remote-control pair` printing the code, then the TUI attached over the control socket, with the daemon recorded per §5.5. `codex features` reports `remote_control` as `removed` in 0.154.0 because the capability became these subcommands. **Codex LAN**: `codex app-server --listen ws://<addr>` with the websocket auth flags, not the daemon subcommand, which accepts only `-c`, `--enable` and `--disable`.
 
 **ACP**: `ihar acp <vendor>` execs the pinned adapter with the runtime environment. Every `hooks: enforced` profile refuses it, which is HLD §6.9's rule; under `standard` it runs and `ihar check` states that settings hooks may not fire (claude-agent-acp #144) and that codex-acp overrides sandbox and approval policy (#310, #477). ACP sessions are learned through the vendor listing path, since `session-register.py` may not run.
 
@@ -822,7 +800,6 @@ In order, each fail-closed: hook integrity and, for Codex, trust state through `
  "claude": {"version": "2.1.274", "binarySha256": "…"},
  "codex": {"version": "rust-v0.154.0", "asset": "…", "sha256": "…"},
  "uv": {"version": "…"}, "python": {"requirementsSha256": "…"},
- "mitmproxy": {"version": "…"},
  "hooks": {"hooks/security-pretool.py": "…", "hooks/_shared/hookio.py": "…"},
  "managedHooks": {"managed-hooks/codex/security-pretool.json": "…"},
  "acp": {"claude-agent-acp": "0.79.0", "codex-acp": "6ec22f3"},
@@ -839,7 +816,7 @@ Lockfile drift prompts or warns (iclaude `check_lockfile_changes`). A binary has
 
 ### 14.3 Commands
 
-`ihar install [--acp] [--microvm] [--transparent] [--migrate-store]` installs the Node tree and `claude`, the Codex tarball with icodex's tamper guard (`lib/binary/install.sh:184-259`), `uv` and the venv, shims, hooks, managed hooks and manifests into the store with pins, then runs the conformance suite. There is no `--from-lockfile`: the lockfile is the only source of the versions installed, so the flag would name the sole behaviour. Install and update are one operation — each component compares its pinned version with the one stamped beside it, so bumping the lockfile is what upgrades and an unchanged lockfile makes the run a no-op. `ihar update [--claude] [--codex] [--all]` stops managed daemons (§5.5), replaces binaries, re-pins, re-runs conformance, and restarts the daemons that were running; the icodex skip rule applies when the tag, the pin and the stamp already agree. `ihar check [--diff] [--conformance]` prints §12.4 and re-runs the suite on request. Store writes take `ihar_with_lock --required` on `$IHAR_STORE/.ihar-store.lock`.
+`ihar install [--acp] [--microvm] [--migrate-store]` installs the Node tree and `claude`, the Codex tarball with icodex's tamper guard (`lib/binary/install.sh:184-259`), `uv` and the venv, shims, hooks, managed hooks and manifests into the store with pins, then runs the conformance suite. There is no `--from-lockfile`: the lockfile is the only source of the versions installed, so the flag would name the sole behaviour. Install and update are one operation — each component compares its pinned version with the one stamped beside it, so bumping the lockfile is what upgrades and an unchanged lockfile makes the run a no-op. `ihar update [--claude] [--codex] [--all]` stops managed daemons (§5.5), replaces binaries, re-pins, re-runs conformance, and restarts the daemons that were running; the icodex skip rule applies when the tag, the pin and the stamp already agree. `ihar check [--diff] [--conformance]` prints §12.4 and re-runs the suite on request. Store writes take `ihar_with_lock --required` on `$IHAR_STORE/.ihar-store.lock`.
 
 ## 15. Data contracts
 
@@ -883,7 +860,7 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | S5a | `tests/test_gateway_log.py` | a planted secret in a request body never appears in the log; the allowed field list is exactly §8.6 |
 | S5a | `tests/test_profiles.sh` | resolution precedence; **masking tighten-only**; **masking without a gateway is exit 2**; enforcement table per profile from `ihar check --json`; the guarantee text printed matches the profile |
 | S5a | `tests/test_sandbox_render.sh` | `vendor-default` writes nothing; `vendor` writes the full triple plus the `.git` grant; `read-only` writes `read-only`; `default_permissions` never omitted; `--approval` changes only the approval policy; enforced profiles deny store and state writes |
-| S5b | `tests/test_transparent.sh` plus a manual protocol | the redirect rule matches the launch cgroup positively and not the host; the gateway's own traffic is not intercepted; `route_localnet` preflight; sweep by comment tag removes exactly what was added; no `/etc/hosts` write outside a namespace; the mitmproxy addon and the stdlib server produce identical route and mask decisions on the same fixtures |
+| S5b | `tests/test_contracts.sh`, `tests/test_profiles.sh` plus the recorded measurement | transparent mode is absent from the schema and `remote-protected` is absent from manifests after the privileged-boundary no-go |
 | S7 | `tests/test_sessions.sh`, `tests/test_sessions_readers.py` | jsonl reader (title precedence, mangling, version guard, cache); app-server client over socket and stdio; sqlite fallback; **epoch seconds to ISO-8601**, and `Thread.source` and `modelProvider` never reaching the record; merge and supersede; deterministic ids for vendor-only sessions; **ephemeral ids excluded**; UUIDv7 ordering; partial hook records validate; **a hook with a stale `IHAR_LAUNCH_ID` still registers against the right session** |
 | S8 | `tests/test_handoff.sh`, `tests/test_handoff_build.py` | under 8 kB **on a repository with 500 changed files** with the truncation flags set; deterministic fields with the distiller off; heuristic decisions kept separate and absent for a Russian transcript; `masked: true` only after the engine ran; exit 3 without an engine; **two concurrent switches consume their own pending files**; forks recorded as ephemeral before running; one carrier per target |
 | S9 | manual protocol | Claude remote-control argv per gateway mode; the Codex daemon under the runtime home visible to `codex agents`; pairing code; LAN form uses `app-server --listen` |
@@ -918,7 +895,6 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | gateway | unknown route, masking on | fail-closed per request | 502 |
 | gateway | unknown content block or non-text payload, enforced profile | fail-closed per request | 502 |
 | gateway | body unparseable / compressed / over limits | fail-closed per request | 400 / 415 / 413 |
-| gateway | transparent probe returns no marker | fail-closed | 3 |
 | sandbox | microVM boot or network policy fails | fail-closed | 3 |
 | index | append fails | fail-soft | 0 |
 | handoff | distiller timeout | fail-soft | 0 |
@@ -938,7 +914,7 @@ The review is right that the original slice order puts feature work before the c
 | S3 | Hook manifest, renderer, `hookio`, merged security hook, Codex managed-hook trust, live conformance suite | `tests/test_hooks.sh`, `tests/test_hook_trust.sh`, `tests/test_conformance.py` |
 | S4 | MCP registry, renderer, input policy | `tests/test_mcp.sh` |
 | S5a | Profiles `standard` and `protected`; explicit gateway on the hardened stdlib server; masking contract; limits and logging; sandbox rendering | `tests/test_gateway_explicit.sh`, `tests/test_gateway_routes.py`, `tests/test_gateway_log.py`, `tests/test_profiles.sh`, `tests/test_sandbox_render.sh` |
-| S5b | `remote-protected`: cgroup-scoped interception, CA, mitmproxy addon, Remote Control and relay spike | `tests/test_transparent.sh` plus the manual protocol; go or no-go for the profile |
+| S5b | transparent gateway spike; no-go because the approved design has no privileged redirect boundary; drop `remote-protected` | `tests/test_contracts.sh`, `tests/test_profiles.sh`, recorded host measurement |
 | S6 | Codex daemon lifecycle management | `tests/test_daemon.sh` |
 | S7 | Session index, both readers, `ihar sessions` | `tests/test_sessions.sh`, `tests/test_sessions_readers.py` |
 | S8 | Handoff: export, package, distiller, sanitisation, per-launch injection | `tests/test_handoff.sh`, `tests/test_handoff_build.py` |
@@ -947,7 +923,7 @@ The review is right that the original slice order puts feature work before the c
 | S11 | ACP launcher mode, experimental | `tests/test_acp.sh` |
 | — | concurrency suite, run from S1 onward and extended by each slice | `tests/test_concurrency.sh` |
 
-`protected` no longer depends on the transparent spike: S5a delivers it on the explicit gateway, and S5b is a separate experiment that only `remote-protected` needs.
+`protected` does not depend on the failed transparent spike: S5a delivers it on the explicit gateway.
 
 ## 19. Corrections to the HLD
 
@@ -967,7 +943,6 @@ The review is right that the original slice order puts feature work before the c
 
 - Claude `sandbox` settings key names for 2.1.274 (§9.1). Resolve in S5a.
 - Codex `auth.json` field names for auth-mode detection (§8.7). Resolve in S5a.
-- Whether `-m cgroup --path` is available on the target kernels or a mark-based variant is needed (§8.5). Resolve in S5b.
 - Whether `--append-system-prompt-file` works in 2.1.274 despite being absent from `--help` (§11.5). Resolve in S8.
 - Claude's documented behaviour when a hook exceeds its timeout, recorded rather than assumed by the conformance suite (§6.6).
 
@@ -978,13 +953,13 @@ The review is right that the original slice order puts feature work before the c
 | Finding | Disposition |
 |---------|-------------|
 | P0.1 global hook trust bypass | accepted. Revision 3 proposed the managed-hook directory; S5 measured it and found it unreachable from a project configuration, so §6.4 uses per-hook `trusted_hash` verified through `hooks/list`. `bypass_hook_trust` is gone, and it turned out not to confer trust in the first place |
-| P0.2 transparent interception scope | accepted. Positive cgroup matching, no host `/etc/hosts`, `route_localnet` preflight, tagged cleanup (§8.5) |
+| P0.2 transparent interception scope | measured in S11. Positive cgroup-path matching exists, but installing the rule needs an undefined privileged boundary; G4 failed and the profile was dropped (§8.5) |
 | P0.3 gateway keyed by mode | accepted. Instance key over the full configuration (§8.1) |
 | P0.4 masking without a gateway | accepted. Exit 2 with an explicit message, no silent promotion (§12.3) |
 | P0.5 R4 overclaimed | accepted. Variant B for enforced profiles: every string inspected, structural keys scanned for secrets, unknown blocks and non-text payloads refused (§8.4), with the scope stated per profile (§1.4) |
 | P0.6 mutable shared home | accepted. Project state split from immutable profile-scoped runtime homes (§2.4, §4.2) |
 | P0.7 daemon environment | accepted. Payload-derived identity, policy from disk, launch claims, daemon reconciliation (§5.5, §10.3) |
-| P0.8 `ThreadingHTTPServer` | accepted with a split. Explicit mode is a loopback plain-HTTP proxy where the hardened stdlib server is adequate and keeps the default protected path dependency-free; transparent mode runs the ihar addon inside mitmproxy. Both share route, mask and limit code, and the tests assert identical decisions (§8.2) |
+| P0.8 `ThreadingHTTPServer` | accepted for explicit mode, the only shipped host gateway. The proposed mitmproxy transport was discarded with `remote-protected` after G4 failed (§8.2, §8.5) |
 | P0.9 live conformance | accepted. Suite, stored record, enforced-profile refusal (§6.6) |
 | P1.1 concurrent security hooks | accepted. One `security-pretool.py`, enforced by a manifest linter (§6.1) |
 | P1.2 lock modes | accepted (§4.3) |

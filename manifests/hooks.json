@@ -5,7 +5,7 @@
       "event": "PreToolUse",
       "id": "security-pretool",
       "profiles": ["*"],
-      "required_in": ["protected", "remote-protected", "isolated"],
+      "required_in": ["protected", "isolated"],
       "rewrites_input": true,
       "script": "security-pretool.py",
       "timeout": 10,

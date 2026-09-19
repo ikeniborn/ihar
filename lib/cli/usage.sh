@@ -21,7 +21,7 @@ commands
   switch --to <vendor>  carry this session into the other vendor
 
 global flags
-  --profile <name>      standard, protected, remote-protected, isolated
+  --profile <name>      standard, protected, isolated
   --dry-run             print the resolved command and environment, launch nothing
   --json                machine-readable output where a command offers it
   --assume-yes          do not ask before removing anything

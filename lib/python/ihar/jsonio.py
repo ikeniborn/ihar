@@ -299,7 +299,7 @@ KINDS: dict[str, dict[str, Any]] = {
             "name": {"type": str, "pattern": _SLUG},
             "guarantee": {"type": str, "min_len": 1},
             "hooks": {"type": str, "enum": ("enforced", "best-effort")},
-            "gateway": {"type": str, "enum": ("off", "explicit", "transparent")},
+            "gateway": {"type": str, "enum": ("off", "explicit")},
             "masking_level": {"type": str, "enum": ("off", "secrets", "standard")},
             "sandbox": {"type": str, "enum": ("vendor-default", "read-only", "vendor", "microvm")},
             # Resolved as manifests/netpolicy/<name>.json, so it is a slug, not a path.
@@ -605,6 +605,8 @@ KINDS: dict[str, dict[str, Any]] = {
             },
             "uv": {"type": dict, "fields": {"version": {"type": str, "min_len": 1}}},
             "python": {"type": dict, "fields": {"requirementsSha256": {"type": str, "pattern": _SHA256}}},
+            # Accepted only for schema-1 upgrade compatibility. S11 no longer
+            # installs or consumes mitmproxy, but update must read old lockfiles.
             "mitmproxy": {"type": dict, "fields": {"version": {"type": str, "min_len": 1}}},
             "hooks": {"type": dict, "values": {"type": str, "pattern": _SHA256}},
             "managedHooks": {"type": dict, "values": {"type": str, "pattern": _SHA256}},

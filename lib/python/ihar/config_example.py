@@ -12,7 +12,7 @@ import sys
 
 # (key, default, accepted, why it exists)
 KEYS = [
-    ("IHAR_PROFILE", "standard", "standard | protected | remote-protected | isolated",
+    ("IHAR_PROFILE", "standard", "standard | protected | isolated",
      "Which guarantees this project runs under. `ihar check` prints the text of each."),
     ("IHAR_DEFAULT_AGENT", "claude", "claude | codex",
      "Which agent a bare `ihar` launches."),
@@ -23,7 +23,7 @@ KEYS = [
      "`presidio` falls back to regexes when it is not installed, and `ihar check`\n"
      "# reports which one actually ran."),
     ("IHAR_STORE", "${XDG_DATA_HOME:-~/.local/share}/ihar", "an absolute path",
-     "Binaries, hooks, credentials and the CA. Must stay outside any directory an\n"
+     "Binaries, hooks and credentials. Must stay outside any directory an\n"
      "# agent can write, which is why it is not in the checkout."),
     ("IHAR_STATE_ROOT", "${XDG_STATE_HOME:-~/.local/state}/ihar", "an absolute path",
      "Project state and runtime homes. Kept short because a Codex daemon socket\n"

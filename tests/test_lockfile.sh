@@ -37,6 +37,14 @@ write_lock "{\"schema\":1,\"installedAt\":\"2026-09-18T10:00:00Z\",
 assert_eq "a pinned value is read" "2.1.274" "$(ihar_lockfile_get claude.version)"
 assert_eq "an absent path reads empty" "" "$(ihar_lockfile_get codex.version)"
 
+# Schema 1 shipped an optional transparent-gateway pin. S11 drops that feature, but
+# update must still be able to read an installed lockfile before replacing it.
+write_lock '{"schema":1,"installedAt":"2026-09-18T10:00:00Z","mitmproxy":{"version":"12.1.1"}}'
+assert_exit "a legacy mitmproxy pin remains readable for migration" 0 \
+  bash -c "$LOAD
+           IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
+           ihar_lockfile_get mitmproxy.version >/dev/null"
+
 # An invalid lockfile must not read as an empty one: a caller would take the silence
 # for "nothing is pinned" and skip every check. Reading one aborts fail-closed.
 write_lock '{"schema":1,"installedAt":"not-a-timestamp"}'

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | reviewed draft, revision 2 (architecture review incorporated) |
+| Status | reviewed draft, revision 3 (`remote-protected` dropped after the transparent-gateway no-go) |
 | Date | 2026-09-18 |
 | Verified against | Claude Code 2.1.274, Codex CLI 0.154.0, claude-agent-acp 0.79.0, codex-acp @ 6ec22f3, Toad 0.6.20, ACP schema v1.22.0 |
 | Based on | research page `ihar/concept/unified-harness-options` (options A–D) |
@@ -77,12 +77,12 @@ One wrapper, native TUIs, native web surfaces, harness-neutral index and handoff
 What the second pass changed:
 
 - Confirmed: one model egress gateway can front both agents on subscription auth (Codex `base_url` override is auth-mode independent).
-- Corrected: the gateway in explicit mode disables Claude Remote Control. Masking plus Remote Control on Claude therefore needs a transparent gateway mode (DNS or DNAT to a TLS-terminating proxy trusted through `NODE_EXTRA_CA_CERTS`, base URL untouched). The microVM path already uses DNAT to the host proxy, so the mechanism exists; the open risk is Remote Control bridge registration through a proxy (issue #71781). Transparent mode is one security profile, not a precondition of `ihar` (§8).
+- Corrected: the gateway in explicit mode disables Claude Remote Control. The proposed transparent alternative required an undefined privileged redirect boundary and was dropped after the S5b/S11 spike (§8). Claude Remote Control with masking is therefore not offered.
 - Corrected: a single hook manifest works, but the renderer must emit vendor-specific matchers and the scripts need a ten-line normalisation shim (tool name, input field names, strict output keys). This is smaller than the drift the two script copies already carry.
 - Corrected: `claude import` cannot be relied on; Codex `/import` can seed `AGENTS.md`/`config.toml` from a Claude project but not under the daemon. Handoff stays a first-prompt or SessionStart injection.
 - Confirmed: Codex session listing must go through app-server `thread/list` (no CLI JSON). Reading `state_5.sqlite` directly is a fallback only.
 
-Verdict: viable, lowest policy risk, all requirements met; R7 with masking on Claude depends on the transparent gateway spike and is scoped to one profile.
+Verdict: viable for the shipped profiles. R7 with masking on Claude Remote Control was the isolated exception and was explicitly dropped after the transparent spike failed.
 
 ## 5. Option B re-evaluated: ACP front end
 
@@ -190,12 +190,9 @@ Hook manifest entries carry a logical tool set (`shell`, `file-write`, `file-rea
 
 ### 6.5 Model egress gateway
 
-One Python proxy process per user (refcounted, as today) that handles model inference traffic only: `/v1/messages` → `api.anthropic.com`, and `/backend-api/codex/responses` or `/v1/responses` → the Codex upstream selected by auth mode. Auth, update, login, and the Codex remote-control WebSocket relay are never proxied; in transparent mode they pass through the listener unmodified. Masking engines and levels are unchanged (Presidio with regex fallback, `off|secrets|standard`).
+One Python proxy process per user (refcounted, as today) handles model inference traffic only: `/v1/messages` → `api.anthropic.com`, and `/backend-api/codex/responses` or `/v1/responses` → the Codex upstream selected by auth mode. Auth, update, login and remote-control traffic are never proxied. Masking engines and levels are unchanged (Presidio with regex fallback, `off|secrets|standard`).
 
-Two attachment modes, selected by the security profile (§8):
-
-- Explicit: `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` for Claude; for Codex `-c model_providers.ihar.base_url=… -c model_provider=ihar` with `requires_openai_auth = true` so ChatGPT OAuth keeps working (key present in the 0.154 binary; the interaction with `chatgpt_base_url` workspace routing is verified in S4). Costs Claude Remote Control; Codex remote control is unaffected.
-- Transparent: hosts or DNAT redirect of `api.anthropic.com` and `chatgpt.com` to a TLS-terminating listener with a local CA trusted through `NODE_EXTRA_CA_CERTS` (Claude, Node) and `SSL_CERT_FILE` (Codex, Rust reqwest). Base URLs untouched, so Remote Control passes its host check. The listener masks only the model paths and passes every other request, including the login flow and the `chatgpt.com/backend-api/wham` WebSocket, through unmodified. Same mechanism the microVM already uses at the guest boundary. Spike required: Remote Control bridge behaviour behind a transparent proxy (#71781) and WebSocket passthrough.
+One attachment mode ships: `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` for Claude; for Codex `-c model_providers.ihar.base_url=… -c model_provider=ihar` with `requires_openai_auth = true` so ChatGPT OAuth keeps working. It costs Claude Remote Control; Codex remote control is unaffected. The transparent alternative was rejected by the measured S5b/S11 spike because installing its scoped redirect requires a privileged component this design does not define.
 
 Langfuse capture and the CCR router chain remain optional add-ons on the Anthropic route only.
 
@@ -245,7 +242,7 @@ The same export feeds the wiki task ledger and an acdc-style git cross-check; ex
 
 Terminal and web on the same session (R7) use the vendor's own bridge, because those are the only paths that keep subscription auth and the native transcript:
 
-- Claude: `ihar claude --web` starts the session with `--remote-control [name]` through adapter `start_remote()`; requires OAuth login and a profile whose gateway mode is transparent or off.
+- Claude: `ihar claude --web` starts the session with `--remote-control [name]` through adapter `start_remote()`; requires OAuth login and a profile whose gateway mode is off. Masked Claude Remote Control is not offered.
 - Codex: `ihar codex --web` ensures `codex app-server daemon` with remote control enabled under the project `CODEX_HOME`, pairs through `codex remote-control pair`, and starts the TUI attached to the daemon; `codex --remote ws://` remains for LAN access with token auth. Works in every gateway mode.
 - Optional third-party hubs (Happy, Omnara, claude-code-ui) wrap the native binaries and can be pointed at `ihar claude` or `ihar codex` as the command; they are not part of the core.
 - ACP web: `toad serve` bound to loopback behind an SSH tunnel, only in ACP launcher mode.
@@ -286,21 +283,20 @@ Layers, each independent:
 | 1 Configuration | vendor binaries and versions, config, MCP servers, environment, project homes | lockfile pins (binary and hook sha256), managed regions, sanitised env, registry allowlist |
 | 2 Hooks | commands, files, tool input, secrets, destructive actions | manifest rendered per vendor, `block-secrets`, `redact-secrets` with `updatedInput`, confirmation hooks |
 | 3 Sandbox | filesystem, processes, network, OS boundary | vendor sandbox (seatbelt, landlock, `ICODEX_MODE` presets) as inner layer, Firecracker microVM as outer layer |
-| 4 Model egress | PII, secrets, outbound model payload | gateway in explicit or transparent mode, fail-closed |
+| 4 Model egress | PII, secrets, outbound model payload | explicit gateway, fail-closed |
 | 5 Handoff sanitisation | data crossing Claude ⇄ Codex | PII policy over the package, mode 600 inside the home, never in the repository |
 
 Auth boundary: Claude OAuth is used only by the `claude` binary or the Agent SDK inside `claude-agent-acp`; `ihar` never calls a model API itself. Codex auth stays in `auth.json` under the vendor process. Web: Claude Remote Control and the Codex hosted relay are vendor-authenticated; `toad serve` and `codex --remote ws://` are bound to loopback or require token auth.
 
 ## 8. Security profiles
 
-A profile selects which enforcement points are mandatory. Transparent interception is one profile, not a precondition of `ihar`; the main technology risk (transparent TLS versus Claude Remote Control) is confined to `remote-protected`.
+A profile selects which enforcement points are mandatory. The transparent-interception experiment failed because the approved design had no privileged redirect boundary; the user chose to drop `remote-protected` rather than weaken it or add a root-owned component.
 
 | Profile | Hooks | Gateway | Sandbox | Remote surfaces |
 |---------|-------|---------|---------|-----------------|
 | `standard` | on | off | vendor sandbox optional | native, both vendors |
 | `protected` | on | explicit | vendor sandbox on | Codex native; Claude Remote Control unavailable |
-| `remote-protected` | on | transparent | vendor sandbox on | native, both vendors (after spike S5) |
-| `isolated` | on | explicit or transparent inside the guest | microVM plus vendor sandbox | per profile setting |
+| `isolated` | on | explicit inside the guest | microVM plus vendor sandbox | per profile setting |
 
 Profile is chosen per launch (`--profile`), defaulted per project in `.ihar_config`, and recorded in the session index. A profile whose mandatory enforcement point cannot start aborts the launch. `ihar check` prints the effective profile and which points are active.
 
@@ -313,14 +309,14 @@ Contracts owned by `ihar`; vendors never read them.
 - MCP registry entry: `{name, transport: stdio|http, command?, args?, url?, env_names?, headers?, scope: user|project, profiles}`.
 - Session index record as in §6.6.
 - Handoff package: `handoff.md` plus `handoff.json` with `source_vendor, source_session_id, target_vendor, created_at, git: {branch, head, dirty, diff_stat}, files_touched[], open_items[], decisions[], summary?, masked: true`.
-- Profile definition: `{name, hooks: on, gateway: off|explicit|transparent, sandbox: none|vendor|microvm, remote: allowed vendors}`.
+- Profile definition: `{name, hooks: on, gateway: off|explicit, sandbox: none|vendor|microvm, remote: allowed vendors}`.
 
 ## 10. Failure modes and limits
 
 Named in advance, including the ones caused by using the design correctly.
 
 - A switch is a package, not a resume. Details outside the deterministic core and the optional summary are lost; the transcript stays in the source vendor's store and can be resumed there.
-- Transparent gateway mode depends on a local CA and host redirection; a vendor pinning certificates or bypassing system trust breaks masking loudly (launch aborted), and Remote Control behind a proxy is unverified until the spike passes. Profiles keep this risk out of `standard` and `protected`.
+- Claude Remote Control cannot be combined with the masking guarantee. The transparent spike required an undefined root/CAP_NET_ADMIN boundary, so the corresponding profile was dropped.
 - Vendor session formats change without notice; adapters read official APIs first and treat file readers as best effort with a version guard.
 - Hook parity covers the shared event subset only; Claude-only events and hook types do not run under Codex, and no hook is guaranteed under ACP mode today.
 - The gateway cannot mask what it cannot parse: a new vendor wire format or a compressed request body passes fail-closed (request refused), never fail-open.
@@ -339,7 +335,7 @@ Ordered by risk and dependency; each slice has its own verification command in t
 | S3 | Hook manifest, `HookRenderer`, `hookio.py` shim, scripts reunified | `tests/test_hooks.sh`: rendered blocks equal golden files; scripts pass fixtures in both vendor stdin shapes |
 | S4 | MCP registry and `McpRenderer` with profile allowlist | `tests/test_mcp.sh`: both renders load in `claude mcp list` and `codex mcp list` |
 | S5 | Security profiles `standard` and `protected`; model egress gateway in explicit mode for both vendors including Codex OAuth | `tests/test_gateway.sh`: masked bodies on both routes, launch abort on unhealthy gateway, profile switch |
-| S6 | Transparent gateway spike, Remote Control and WebSocket passthrough | manual protocol recorded on the task page; go or no-go for `remote-protected` |
+| S5b / implementation S11 | Transparent gateway spike | no-go recorded on the task page; `remote-protected` removed |
 | S7 | Session index, `list_sessions` in both adapters, `ihar sessions` | `tests/test_sessions.sh`: index merges SDK, `thread/list` and fallbacks; no content stored |
 | S8 | Handoff: `export_context`, deterministic package, optional distiller, sanitisation, `inject_context` | `tests/test_handoff.sh`: package under size bound, deterministic fields present without the distiller, masked, injected on both vendors |
 | S9 | Web flags over native remote surfaces (`start_remote`) | manual protocol; Codex daemon under project home verified with `codex agents` |
@@ -350,7 +346,6 @@ Workflow route for implementation: chain (new module, public contracts in §9, s
 
 ## 12. Open questions
 
-- Does Claude Remote Control register its bridge correctly behind a transparent TLS proxy after 2.1.196? Blocking for `remote-protected` on Claude (S6).
 - Will Anthropic keep Agent SDK use on subscriptions? Decides whether ACP mode can ever leave experimental status.
 - Which distiller runs by default when the source agent is alive: forked-session summary (faithful, costs tokens) or local extractor (free, coarser)? Proposed: forked session, with the local extractor as fallback; the deterministic core is present either way.
 - Keep `icodex` run-mode presets as ihar flags, or fold them into the profile's sandbox setting with a rendering table? Proposed: profile-owned `sandbox: none|vendor|microvm` rendered per vendor, presets kept only as `ConfigRenderer` detail.

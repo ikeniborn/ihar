@@ -145,8 +145,8 @@ ihar_env_prepare() {
   local -a allowed=("${_IHAR_ENV_BASE[@]}" "${_IHAR_NATIVE_LIST[@]}")
   # Vendor-facing names the adapter set for this launch.
   case "$vendor" in
-    claude) allowed+=(CLAUDE_CONFIG_DIR CLAUDE_CODE_EXECUTABLE ANTHROPIC_BASE_URL NODE_EXTRA_CA_CERTS) ;;
-    codex)  allowed+=(CODEX_HOME CODEX_PATH SSL_CERT_FILE) ;;
+    claude) allowed+=(CLAUDE_CONFIG_DIR CLAUDE_CODE_EXECUTABLE ANTHROPIC_BASE_URL) ;;
+    codex)  allowed+=(CODEX_HOME CODEX_PATH) ;;
   esac
   read -r -a keep <<< "${IHAR_PROFILE_ENV_PASSTHROUGH:-}"
   allowed+=("${keep[@]}")

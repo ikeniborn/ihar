@@ -24,8 +24,8 @@ ihar_init() {
 
   : "${IHAR_ROOT:="$(ihar_resolve_script_dir "$entry")"}"
 
-  # The store holds hook scripts, vendor credentials and the transparent-mode CA
-  # key. It lives outside the checkout so that an agent running under a
+  # The store holds hook scripts and vendor credentials. It lives outside the
+  # checkout so that an agent running under a
   # workspace-write sandbox cannot rewrite its own enforcement (LLD 2.1).
   : "${IHAR_STORE:="${XDG_DATA_HOME:-$HOME/.local/share}/ihar"}"
 
@@ -34,7 +34,7 @@ ihar_init() {
   : "${IHAR_STATE_ROOT:="${XDG_STATE_HOME:-$HOME/.local/state}/ihar"}"
 
   # The Node tree is a sibling of the store, never a child: an install rebuilds it
-  # wholesale, and that must not happen inside the directory holding the CA key.
+  # wholesale without disturbing the other trusted store contents.
   : "${IHAR_NVM:="$(dirname "$IHAR_STORE")/ihar-nvm"}"
 
   : "${IHAR_PY:="$IHAR_STORE/venv/bin/python3"}"
