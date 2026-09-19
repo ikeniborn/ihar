@@ -50,6 +50,9 @@ _adapter_codex_argv() {
   if [[ -n "$IHAR_FLAG_EFFORT" ]]; then
     IHAR_ARGV+=(-c "model_reasoning_effort=\"$IHAR_FLAG_EFFORT\"")
   fi
+  if [[ "$IHAR_FLAG_WEB" == true ]]; then
+    IHAR_ARGV+=(--remote "unix://$IHAR_RUNTIME/app-server-control/app-server-control.sock")
+  fi
 
   # Mode, approval, trust, provider, MCP and hooks are not -c overrides: they live in
   # the rendered config.toml so that `codex mcp list`, `codex resume` and the daemon
@@ -68,6 +71,12 @@ adapter_codex_launch() {
   local runtime="$1"
   adapter_codex_env "$runtime"
   _adapter_codex_argv
+}
+
+adapter_codex_start_remote() {
+  local runtime="$1" hash="$2"
+  [[ "$IHAR_FLAG_DRY_RUN" == true ]] && return 0
+  ihar_codex_remote_start "$runtime" "$hash"
 }
 
 adapter_codex_switch_model() {

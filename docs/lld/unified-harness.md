@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 8 (`remote-protected` dropped after the S11 transparent-gateway no-go) |
+| Status | revision 9 (S9 native web surfaces implemented and measured) |
 | Date | 2026-09-18 |
 | Derived from | `docs/hld/unified-harness.md` revision 2 (commit `ec2df36`) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -789,6 +789,15 @@ In order, each fail-closed: hook integrity and, for Codex, trust state through `
 
 **Claude web**: the profile must list `claude` in `remote` and use gateway `off`; then `--remote-control [name]`. No shipped profile combines Claude Remote Control with masking after the S5b no-go. **Codex web**: `codex app-server daemon start` under the runtime `CODEX_HOME`, `daemon enable-remote-control`, `remote-control pair` printing the code, then the TUI attached over the control socket, with the daemon recorded per §5.5. `codex features` reports `remote_control` as `removed` in 0.154.0 because the capability became these subcommands. **Codex LAN**: `codex app-server --listen ws://<addr>` with the websocket auth flags, not the daemon subcommand, which accepts only `-c`, `--enable` and `--disable`.
 
+Slice S9/S12 measured these spellings from the pinned 0.154.0 help. Both `ihar web
+<vendor>` and `<vendor> --web` enter the ordinary launch lifecycle. Profile gating
+happens immediately after resolution, before store or gateway work. Claude adds the
+native flag before its prompt and passthrough separator. Codex starts and records the
+managed daemon when absent, enables Remote Control, prints the vendor pairing code,
+marks the daemon record `remote_control: true`, and execs the TUI with `--remote
+unix://<runtime>/app-server-control/app-server-control.sock`. Dry-run renders this
+final argv but performs none of the daemon or pairing side effects.
+
 **ACP**: `ihar acp <vendor>` execs the pinned adapter with the runtime environment. Every `hooks: enforced` profile refuses it, which is HLD §6.9's rule; under `standard` it runs and `ihar check` states that settings hooks may not fire (claude-agent-acp #144) and that codex-acp overrides sandbox and approval policy (#310, #477). ACP sessions are learned through the vendor listing path, since `session-register.py` may not run.
 
 ## 14. Install, update, verify
@@ -918,7 +927,7 @@ The review is right that the original slice order puts feature work before the c
 | S6 | Codex daemon lifecycle management | `tests/test_daemon.sh` |
 | S7 | Session index, both readers, `ihar sessions` | `tests/test_sessions.sh`, `tests/test_sessions_readers.py` |
 | S8 | Handoff: export, package, distiller, sanitisation, per-launch injection | `tests/test_handoff.sh`, `tests/test_handoff_build.py` |
-| S9 | Web flags over native remote surfaces | manual protocol |
+| S9 | Web flags over native remote surfaces | `tests/test_web.sh`; manual protocol in `docs/manual/web-surfaces.md` |
 | S10 | `isolated`: microVM with both binaries, read-only policy bundle, deny-by-default network | `tests/test_microvm.sh` |
 | S11 | ACP launcher mode, experimental | `tests/test_acp.sh` |
 | — | concurrency suite, run from S1 onward and extended by each slice | `tests/test_concurrency.sh` |

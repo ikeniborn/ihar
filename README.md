@@ -58,6 +58,8 @@ ihar --dry-run --profile protected codex
 ihar sessions list
 ihar sessions resume <ihar-id>
 ihar switch --to codex
+ihar web claude
+ihar --profile protected codex --web
 ```
 
 Everything after `--` reaches the agent untouched:
@@ -76,6 +78,12 @@ or update the local display title with `sessions name <ihar-id> <title>`.
 current session, links both canonical session records, and launches the other vendor.
 Claude carries the package in its initial prompt; Codex consumes the remainder once
 through its SessionStart hook.
+
+`ihar web claude|codex` and the equivalent launch `--web` flag use each vendor's
+native remote bridge. Claude Remote Control is available only in profiles that list
+Claude under `remote`; Codex starts its managed app-server daemon, prints a pairing
+code, and attaches the TUI to that daemon. For an authenticated LAN listener, pass
+Codex's own `app-server --listen` and `--ws-auth` arguments after `--`.
 
 ## Configure
 
