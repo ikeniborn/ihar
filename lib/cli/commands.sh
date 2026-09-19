@@ -91,7 +91,7 @@ use --profile protected for an explicit one"
 
   # 8b. Create the control-plane identity before either vendor starts. The hook
   # claims it using its own payload session id, never the daemon's environment.
-  IHAR_LAUNCH_ID="$(ihar_uuid)"; export IHAR_LAUNCH_ID
+  IHAR_LAUNCH_ID="${IHAR_RESUME_IHAR_ID:-$(ihar_uuid)}"; export IHAR_LAUNCH_ID
 
   # 9. and 10. the adapter builds its argv and the environment it needs
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR

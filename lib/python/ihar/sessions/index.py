@@ -90,9 +90,10 @@ def merge(path: str | Path, claude_rows: list[dict], codex_rows: list[dict], eph
     return sorted(rows, key=lambda row: row.get("updated_at") or "", reverse=True)
 
 
-def write_claim(vendor: str, profile: str, runtime_hash: str, directory: str | Path) -> Path:
+def write_claim(vendor: str, profile: str, runtime_hash: str, directory: str | Path,
+                ihar_id: str | None = None) -> Path:
     target_dir = Path(directory); target_dir.mkdir(parents=True, exist_ok=True)
-    claim_id = str(uuid7())
+    claim_id = ihar_id or str(uuid7())
     record = {"schema": 1, "ihar_id": claim_id, "vendor": vendor, "profile": profile,
               "runtime_hash": runtime_hash, "counter": time.time_ns(),
               "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
@@ -107,13 +108,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     add = sub.add_parser("append"); add.add_argument("path")
+    launch = sub.add_parser("launch"); launch.add_argument("path"); launch.add_argument("ihar_id")
+    launch.add_argument("vendor"); launch.add_argument("vendor_session_id")
+    launch.add_argument("project"); launch.add_argument("cwd"); launch.add_argument("profile")
     show = sub.add_parser("list"); show.add_argument("path"); show.add_argument("--ephemeral")
-    claim = sub.add_parser("claim"); claim.add_argument("vendor"); claim.add_argument("profile"); claim.add_argument("runtime_hash"); claim.add_argument("directory")
+    claim = sub.add_parser("claim"); claim.add_argument("vendor"); claim.add_argument("profile"); claim.add_argument("runtime_hash"); claim.add_argument("directory"); claim.add_argument("--ihar-id")
     resolve = sub.add_parser("resolve"); resolve.add_argument("path"); resolve.add_argument("ihar_id")
     name = sub.add_parser("name"); name.add_argument("path"); name.add_argument("ihar_id"); name.add_argument("title")
     args = parser.parse_args(argv)
     if args.command == "append":
         append(args.path, json.load(sys.stdin)); return 0
+    if args.command == "launch":
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        append(args.path, {"schema": 1, "ihar_id": args.ihar_id, "vendor": args.vendor,
+                           "vendor_session_id": args.vendor_session_id, "project": args.project,
+                           "cwd": args.cwd, "git_branch": None, "title": None, "model": None,
+                           "profile": args.profile, "started_at": now, "updated_at": now,
+                           "parent_ihar_id": None, "handoff_from": None, "handoff_to": None,
+                           "tags": [], "source": "launch"})
+        return 0
     if args.command == "list":
         rows = [row for key, row in fold(args.path).items() if key not in ephemeral_ids(args.ephemeral)]
         print(json.dumps(sorted(rows, key=lambda row: row.get("updated_at") or "", reverse=True), sort_keys=True)); return 0
@@ -121,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
         row = fold(args.path).get(args.ihar_id)
         if not row or not row.get("vendor_session_id"):
             return 1
-        print(f"{row['vendor']}\t{row['vendor_session_id']}"); return 0
+        print(f"{row['vendor']}\t{row['vendor_session_id']}\t{row['profile']}"); return 0
     if args.command == "name":
         row = fold(args.path).get(args.ihar_id)
         if not row:
@@ -129,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         append(args.path, {"schema": 1, "ihar_id": args.ihar_id, "vendor": row["vendor"],
                            "source": "launch", "title": args.title})
         return 0
-    print(write_claim(args.vendor, args.profile, args.runtime_hash, args.directory)); return 0
+    print(write_claim(args.vendor, args.profile, args.runtime_hash, args.directory, args.ihar_id)); return 0
 
 
 if __name__ == "__main__":

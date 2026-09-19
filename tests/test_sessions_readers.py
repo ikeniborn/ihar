@@ -29,6 +29,10 @@ def main():
         assert folded[first["ihar_id"]]["title"] == "kept"
         assert folded[first["ihar_id"]]["model"] is None
 
+        claim_id = str(index.uuid7())
+        claim = index.write_claim("claude", "standard", "deadbeef", root / "launches", claim_id)
+        assert json.loads(claim.read_text(encoding="utf-8"))["ihar_id"] == claim_id
+
         project = root / "claude" / "projects" / "-work-ihar"
         project.mkdir(parents=True)
         transcript = project / "c-1.jsonl"
