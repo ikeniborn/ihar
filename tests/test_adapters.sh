@@ -154,11 +154,6 @@ assert_contains "but it does inherit its own vendor variables" "$child_env" "COD
 # The usage text advertises them. Ignoring one silently would make the harness report
 # success while doing the opposite of what was asked.
 
-for flag in "--web"; do
-  # shellcheck disable=SC2086
-  assert_exit "$flag is refused rather than ignored" 2 ihar codex $flag
-done
-assert_contains "and the refusal names the slice" "$(ihar codex --web)" "slice S12 delivers it"
 assert_exit "--fork without --resume is a usage error" 2 ihar codex --fork
 
 # --approval and --mask-level were on that list until slice S7 delivered them. The

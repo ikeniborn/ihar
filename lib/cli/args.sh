@@ -27,11 +27,8 @@ IHAR_FLAG_TO=""
 IHAR_SUBCOMMAND=""
 IHAR_ARGS=()
 
-# Flags the parser accepts but no slice has delivered yet. Advertised in the usage
-# text, so silently ignoring one would make the harness report success while doing
-# the opposite of what was asked — `--mask-level secrets` running with masking off.
-# Refused with the slice that will deliver them, the same rule the gateway guard uses.
-_IHAR_UNDELIVERED_SLICE=( "--web:S12" )
+# Flags the parser accepts but no slice has delivered yet. Empty after S12.
+_IHAR_UNDELIVERED_SLICE=()
 
 ihar_guard_undelivered() {
   local entry flag slice value
@@ -52,7 +49,7 @@ running now would report success while doing nothing"
 
 # Commands this build implements. A command a later slice adds is not listed, so
 # asking for it is an error naming the slice rather than a silent no-op.
-_IHAR_COMMANDS=(claude codex check homes install update daemon sessions switch)
+_IHAR_COMMANDS=(claude codex check homes install update daemon sessions switch web)
 
 _ihar_is_command() {
   local candidate="$1" known
@@ -102,7 +99,8 @@ ihar_args_parse() {
       --) shift; IHAR_PASSTHROUGH=("$@"); return 0 ;;
     esac
 
-    if [[ "$IHAR_COMMAND" == claude || "$IHAR_COMMAND" == codex ]]; then
+    if [[ "$IHAR_COMMAND" == claude || "$IHAR_COMMAND" == codex ||
+          ( "$IHAR_COMMAND" == web && -n "$IHAR_SUBCOMMAND" ) ]]; then
       case "$1" in
         --resume)      _ihar_needs_value "$1" "${2:-}"; IHAR_FLAG_RESUME="$2"; shift 2; continue ;;
         --resume=*)    IHAR_FLAG_RESUME="${1#*=}"; shift; continue ;;

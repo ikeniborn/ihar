@@ -21,6 +21,12 @@ ihar_cmd_launch() {
 
   # 2. profile, before anything reads its severity
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
+  if [[ "$IHAR_FLAG_WEB" == true ]]; then
+    case " ${IHAR_PROFILE_REMOTE:-} " in
+      *" $vendor "*) ;;
+      *) ihar_die 2 "profile '$IHAR_PROFILE' does not allow ${vendor^} web" ;;
+    esac
+  fi
 
   # 3. store integrity, at the severity the profile asks for
   ihar_store_verify
@@ -94,6 +100,14 @@ ihar_cmd_launch() {
   # 9. and 10. the adapter builds its argv and the environment it needs
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR
   ihar_adapter "$vendor" launch "$runtime"
+  local binary="${IHAR_ARGV[0]}"
+  if [[ "$IHAR_FLAG_DRY_RUN" != true && ! -x "$binary" ]]; then
+    ihar_die 1 "the $vendor binary is not installed at $binary
+run 'ihar install'"
+  fi
+  if [[ "$IHAR_FLAG_WEB" == true ]]; then
+    ihar_adapter "$vendor" start_remote "$runtime" "$hash"
+  fi
   ihar_env_map
   ihar_env_prepare "$vendor"
 
@@ -106,10 +120,6 @@ ihar_cmd_launch() {
   if [[ "$vendor" == claude && -z "$IHAR_FLAG_RESUME" ]]; then
     ihar_session_append_launch "$vendor" "$IHAR_LAUNCH_ID"
   fi
-  local binary="${IHAR_ARGV[0]}"
-  [[ -x "$binary" ]] || ihar_die 1 "the $vendor binary is not installed at $binary
-run 'ihar install'"
-
   ihar_handoff_consume_claude
 
   ihar_env_apply
@@ -117,6 +127,17 @@ run 'ihar install'"
     exec env -i "${IHAR_ENV[@]}" "${IHAR_ARGV[@]}"
   fi
   exec "${IHAR_ARGV[@]}"
+}
+
+# ihar_cmd_web <vendor> — command spelling for the same launch path as --web.
+ihar_cmd_web() {
+  local vendor="${IHAR_SUBCOMMAND:-}"
+  [[ "$vendor" == claude || "$vendor" == codex ]] \
+    || ihar_die 2 "ihar web: expected claude or codex, got '${vendor:-nothing}'"
+  (( ${#IHAR_ARGS[@]} == 0 )) \
+    || ihar_die 2 "ihar web accepts one vendor and no other positional arguments"
+  IHAR_FLAG_WEB=true
+  ihar_cmd_launch "$vendor"
 }
 
 # ihar_vendor_version <vendor> — the pinned version, from the lockfile. Part of the

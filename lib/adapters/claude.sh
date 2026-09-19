@@ -60,6 +60,10 @@ _adapter_claude_argv() {
   if [[ -n "$IHAR_FLAG_NAME" ]];   then IHAR_ARGV+=(-n "$IHAR_FLAG_NAME"); fi
   if [[ -n "$IHAR_FLAG_MODEL" ]];  then IHAR_ARGV+=(--model "$IHAR_FLAG_MODEL"); fi
   if [[ -n "$IHAR_FLAG_EFFORT" ]]; then IHAR_ARGV+=(--effort "$IHAR_FLAG_EFFORT"); fi
+  if [[ "$IHAR_FLAG_WEB" == true ]]; then
+    IHAR_ARGV+=(--remote-control)
+    if [[ -n "$IHAR_FLAG_NAME" ]]; then IHAR_ARGV+=("$IHAR_FLAG_NAME"); fi
+  fi
   if [[ -n "${IHAR_HANDOFF_PENDING:-}" && "${IHAR_PROFILE_HANDOFF_SYSTEM_PROMPT:-false}" == true ]]; then
     IHAR_ARGV+=(--append-system-prompt "Continue from the ihar handoff in the initial prompt; preserve its constraints and verify its open items.")
   fi
@@ -84,6 +88,11 @@ adapter_claude_launch() {
   local runtime="$1"
   adapter_claude_env "$runtime"
   _adapter_claude_argv "$runtime"
+}
+
+# Policy and argv are handled before this operation; Claude needs no local bridge.
+adapter_claude_start_remote() {
+  return 0
 }
 
 adapter_claude_switch_model() {

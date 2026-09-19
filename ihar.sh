@@ -62,6 +62,7 @@ ihar_main() {
     daemon)       ihar_cmd_daemon ;;
     sessions)     ihar_cmd_sessions ;;
     switch)       ihar_cmd_switch ;;
+    web)          ihar_cmd_web ;;
     homes)        ihar_cmd_homes ;;
     *)            ihar_die 2 "unhandled command '$IHAR_COMMAND'" ;;
   esac

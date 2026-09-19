@@ -19,6 +19,7 @@ commands
   sessions list | resume <id> | name <id> <title>
                         canonical sessions across both vendors
   switch --to <vendor>  carry this session into the other vendor
+  web <vendor>          start the vendor's native remote surface
 
 global flags
   --profile <name>      standard, protected, isolated
@@ -41,6 +42,6 @@ everything after -- goes to the agent verbatim:
   ihar codex -- mcp list
 
 not yet delivered
-  web, acp
+  acp
 TEXT
 }

@@ -143,6 +143,16 @@ def clear_record(state: str) -> None:
         pass
 
 
+def mark_remote(state: str) -> dict:
+    """Mark an existing managed daemon record as Remote Control enabled."""
+    record = read_record(state)
+    if record is None:
+        raise ValueError("no managed daemon record")
+    record["remote_control"] = True
+    jsonio.write("daemon-record", record_path(state), record)
+    return record
+
+
 def alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -310,7 +320,8 @@ def start_pending(binary: str, state_root: str) -> list[dict]:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ihar.codex.daemon")
     parser.add_argument("action", choices=("status", "start", "stop", "restart",
-                                           "reconcile", "stop-all", "start-pending"))
+                                           "reconcile", "stop-all", "start-pending",
+                                           "mark-remote"))
     parser.add_argument("--binary", required=True)
     parser.add_argument("--home")
     parser.add_argument("--state")
@@ -328,6 +339,16 @@ def main(argv: list[str]) -> int:
 
     if not args.home or not args.state:
         parser.error(f"{args.action} needs --home and --state")
+
+    if args.action == "mark-remote":
+        try:
+            answer = mark_remote(args.state)
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 3
+        json.dump(answer, sys.stdout)
+        sys.stdout.write("\n")
+        return 0
 
     if args.action == "status":
         answer = status(args.binary, args.home)

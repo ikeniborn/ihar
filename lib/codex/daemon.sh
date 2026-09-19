@@ -111,6 +111,33 @@ ihar_codex_daemon_start_pending() {
   [[ "$out" == "[]" ]] || ihar_info "restarted the managed Codex daemons"
 }
 
+# ihar_codex_remote_start <runtime> <config-hash> — prepare the native hosted bridge.
+ihar_codex_remote_start() {
+  ihar_with_lock --required "$IHAR_STATE/.ihar-daemon.lock" 60 \
+    _ihar_codex_remote_start "$1" "$2"
+}
+
+_ihar_codex_remote_start() {
+  local runtime="$1" hash="$2" out
+  if [[ -S "$runtime/app-server-control/app-server-control.sock" ]]; then
+    out="$(ihar_python ihar.codex.daemon reconcile --binary "$IHAR_CODEX_BIN" \
+      --home "$runtime" --state "$IHAR_STATE" --config-hash "$hash" 2>&1)" \
+      || ihar_die 3 "cannot reconcile the Codex Remote Control daemon: ${out:-no output}"
+  else
+    out="$(ihar_python ihar.codex.daemon start --binary "$IHAR_CODEX_BIN" \
+      --home "$runtime" --state "$IHAR_STATE" --config-hash "$hash" 2>&1)" \
+      || ihar_die 3 "cannot start the Codex app-server daemon: ${out:-no output}"
+  fi
+
+  CODEX_HOME="$runtime" "$IHAR_CODEX_BIN" app-server daemon enable-remote-control \
+    >/dev/null || ihar_die 3 "cannot enable Codex Remote Control"
+  CODEX_HOME="$runtime" "$IHAR_CODEX_BIN" remote-control pair \
+    || ihar_die 3 "cannot create a Codex Remote Control pairing code"
+  ihar_python ihar.codex.daemon mark-remote --binary "$IHAR_CODEX_BIN" \
+    --home "$runtime" --state "$IHAR_STATE" --config-hash "$hash" >/dev/null \
+    || ihar_die 3 "cannot record the Codex Remote Control daemon"
+}
+
 # ihar_check_daemon — one line for `ihar check`, truthful when there is no daemon.
 #
 # Reported even when absent, because "no daemon" and "a daemon nobody examined" are
