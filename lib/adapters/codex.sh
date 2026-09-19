@@ -82,3 +82,8 @@ adapter_codex_archive() {
   CODEX_HOME="$runtime" "$IHAR_CODEX_BIN" archive "$session" >/dev/null 2>&1 \
     || ihar_warn "could not archive Codex session $session"
 }
+
+adapter_codex_export_context() {
+  local session="$1"
+  ihar_python ihar.handoff.export codex "$IHAR_STATE/st/codex" "$session"
+}

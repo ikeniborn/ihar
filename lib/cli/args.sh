@@ -23,6 +23,7 @@ IHAR_FLAG_MASK_LEVEL=""
 IHAR_FLAG_WEB=false
 IHAR_FLAG_PROMPT=""
 IHAR_FLAG_CONFORMANCE=false
+IHAR_FLAG_TO=""
 IHAR_SUBCOMMAND=""
 IHAR_ARGS=()
 
@@ -51,7 +52,7 @@ running now would report success while doing nothing"
 
 # Commands this build implements. A command a later slice adds is not listed, so
 # asking for it is an error naming the slice rather than a silent no-op.
-_IHAR_COMMANDS=(claude codex check homes install update daemon sessions)
+_IHAR_COMMANDS=(claude codex check homes install update daemon sessions switch)
 
 _ihar_is_command() {
   local candidate="$1" known
@@ -112,6 +113,13 @@ ihar_args_parse() {
         --approval)    _ihar_needs_value "$1" "${2:-}"; IHAR_FLAG_APPROVAL="$2"; shift 2; continue ;;
         --mask-level)  _ihar_needs_value "$1" "${2:-}"; IHAR_FLAG_MASK_LEVEL="$2"; shift 2; continue ;;
         --web)         IHAR_FLAG_WEB=true; shift; continue ;;
+      esac
+    fi
+
+    if [[ "$IHAR_COMMAND" == switch ]]; then
+      case "$1" in
+        --to) _ihar_needs_value "$1" "${2:-}"; IHAR_FLAG_TO="$2"; shift 2; continue ;;
+        --to=*) IHAR_FLAG_TO="${1#*=}"; shift; continue ;;
       esac
     fi
 

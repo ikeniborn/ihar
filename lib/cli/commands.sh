@@ -91,7 +91,9 @@ use --profile protected for an explicit one"
 
   # 8b. Create the control-plane identity before either vendor starts. The hook
   # claims it using its own payload session id, never the daemon's environment.
-  IHAR_LAUNCH_ID="${IHAR_RESUME_IHAR_ID:-$(ihar_uuid)}"; export IHAR_LAUNCH_ID
+  IHAR_LAUNCH_ID="${IHAR_HANDOFF_TARGET_ID:-${IHAR_RESUME_IHAR_ID:-$(ihar_uuid)}}"; export IHAR_LAUNCH_ID
+
+  ihar_handoff_prepare "$vendor"
 
   # 9. and 10. the adapter builds its argv and the environment it needs
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR
@@ -108,10 +110,11 @@ use --profile protected for an explicit one"
   if [[ "$vendor" == claude && -z "$IHAR_FLAG_RESUME" ]]; then
     ihar_session_append_launch "$vendor" "$IHAR_LAUNCH_ID"
   fi
-
   local binary="${IHAR_ARGV[0]}"
   [[ -x "$binary" ]] || ihar_die 1 "the $vendor binary is not installed at $binary
 run 'ihar install'"
+
+  ihar_handoff_consume_claude
 
   ihar_env_apply
   if (( ${#IHAR_ENV[@]} )); then
@@ -143,6 +146,8 @@ ihar_dry_run() {
 
 # ihar_cmd_check — what is in force right now (LLD 12.4). Grows with every slice.
 ihar_cmd_check() {
+  ihar_state_setup "$IHAR_PROJECT_ROOT" >/dev/null
+  ihar_handoff_sweep
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
   printf 'profile      %s\n' "$IHAR_PROFILE"
   printf 'guarantee    %s\n' "$IHAR_PROFILE_GUARANTEE"

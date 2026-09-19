@@ -18,6 +18,7 @@ commands
                         the managed Codex app-server daemon
   sessions list | resume <id> | name <id> <title>
                         canonical sessions across both vendors
+  switch --to <vendor>  carry this session into the other vendor
 
 global flags
   --profile <name>      standard, protected, remote-protected, isolated
@@ -40,6 +41,6 @@ everything after -- goes to the agent verbatim:
   ihar codex -- mcp list
 
 not yet delivered
-  switch, web, acp
+  web, acp
 TEXT
 }

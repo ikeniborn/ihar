@@ -68,6 +68,16 @@
       "timeout": 5,
       "tools": ["any"],
       "vendors": ["claude", "codex"]
+    },
+    {
+      "args": [],
+      "event": "SessionStart",
+      "id": "handoff-inject",
+      "profiles": ["*"],
+      "script": "handoff-inject.py",
+      "timeout": 5,
+      "tools": ["any"],
+      "vendors": ["codex"]
     }
   ],
   "schema": 1
