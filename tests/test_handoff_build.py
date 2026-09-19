@@ -48,6 +48,7 @@ def main():
 
         encoded = json.dumps(first, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
         assert len(encoded) <= 8192
+        assert len((state / "handoff" / "pending" / "target-one.md").read_bytes()) <= 8192
         assert first["bytes"] == len(encoded)
         assert first["git"]["files_changed"] == 500
         assert first["files_touched_truncated"] is True

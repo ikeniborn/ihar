@@ -26,7 +26,10 @@ for row in "$one codex-one first-package" "$two codex-two second-package"; do
   python3 -m ihar.sessions.index append "$state/sessions.jsonl" <<EOF
 {"schema":1,"ihar_id":"$ihar_id","vendor":"codex","vendor_session_id":"$vendor_id","profile":"standard","source":"hook"}
 EOF
-  printf '%s\n' "$payload" > "$state/handoff/pending/$ihar_id.md"
+  python3 - "$payload" <<'PY' > "$state/handoff/pending/$ihar_id.md"
+import sys
+print("x" * 2048 + sys.argv[1], end="")
+PY
 done
 
 CODEX_HOME="$runtime" python3 -I "$ROOT/hooks/handoff-inject.py" --vendor codex <<'EOF' > "$IHAR_TEST_TMP/one.out"
@@ -43,12 +46,25 @@ assert_exit "second pending package is consumed" 1 test -f "$state/handoff/pendi
 
 source "$ROOT/lib/handoff/handoff.sh"
 IHAR_STATE="$state"
-IHAR_LAUNCH_ID="carrier-test"
-printf '%2500s' x > "$state/handoff/pending/carrier-test.md"
+carrier_id="$(python3 -m ihar.ids)"
+IHAR_LAUNCH_ID="$carrier_id"
+python3 - <<'PY' > "$state/handoff/pending/$carrier_id.md"
+print("A" * 2048 + "TAIL", end="")
+PY
+python3 -m ihar.sessions.index append "$state/sessions.jsonl" <<EOF
+{"schema":1,"ihar_id":"$carrier_id","vendor":"codex","vendor_session_id":"codex-carrier","profile":"standard","source":"hook"}
+EOF
 IHAR_FLAG_PROMPT=""
 ihar_handoff_prepare codex
 assert_contains "codex initial prompt points to hook continuation" "$IHAR_FLAG_PROMPT" "remaining handoff context"
-assert_exit "codex leaves package for SessionStart" 0 test -f "$state/handoff/pending/carrier-test.md"
+assert_exit "codex leaves package for SessionStart" 0 test -f "$state/handoff/pending/$carrier_id.md"
+CODEX_HOME="$runtime" python3 -I "$ROOT/hooks/handoff-inject.py" --vendor codex <<'EOF' > "$IHAR_TEST_TMP/carrier.out"
+{"hook_event_name":"SessionStart","session_id":"codex-carrier","tool_input":{}}
+EOF
+remainder="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["hookSpecificOutput"]["additionalContext"])' < "$IHAR_TEST_TMP/carrier.out")"
+assert_eq "codex hook carries only the remainder" TAIL "$remainder"
+IHAR_LAUNCH_ID="claude-carrier"
+printf '%2500s' x > "$state/handoff/pending/claude-carrier.md"
 IHAR_FLAG_PROMPT=""
 ihar_handoff_prepare claude
 assert_eq "claude carries the whole package in its initial prompt" "2500" "${#IHAR_FLAG_PROMPT}"
@@ -66,6 +82,7 @@ ihar_python() { if [[ "$1" == -c ]]; then python3 "$@"; else python3 -m "$@"; fi
 ihar_uuid() { printf '%s\n' "$expected_target"; }
 ihar_adapter() { printf '%s\n' '{"open_items":[],"decisions":[],"decisions_heuristic":[],"recent_messages":[]}'; }
 ihar_cmd_launch() { launched_vendor="$1"; }
+ihar_profile_resolve() { resolved_profile="$1"; IHAR_GATEWAY_MASKING_LEVEL=off; }
 IHAR_PROJECT_ROOT="$project"
 IHAR_LAUNCH_ID="$source_id"
 IHAR_FLAG_TO=codex
@@ -74,8 +91,10 @@ IHAR_ARGS=()
 IHAR_DISTILLER=off
 IHAR_GATEWAY_MASKING_LEVEL=off
 launched_vendor=""
+resolved_profile=""
 ihar_cmd_switch
 assert_eq "switch dispatches the target vendor" codex "$launched_vendor"
+assert_eq "switch resolves the source profile before packaging" standard "$resolved_profile"
 assert_exit "switch writes a target-specific pending package" 0 test -f "$state/handoff/pending/$expected_target.md"
 linked="$(python3 -m ihar.sessions.index show "$state/sessions.jsonl" "$source_id")"
 assert_contains "switch links source to target" "$linked" "\"handoff_to\": \"$expected_target\""

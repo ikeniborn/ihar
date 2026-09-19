@@ -60,7 +60,7 @@ def _set_size(package: dict) -> bytes:
 def _bound(package: dict) -> None:
     package["files_touched_truncated"] = len(package["files_touched"]) > 50
     package["files_touched"] = package["files_touched"][:50]
-    while len(_set_size(package)) > MAX_BYTES:
+    while max(len(_set_size(package)), len(render_markdown(package).encode())) > MAX_BYTES:
         if package["recent_messages"]:
             package["recent_messages"].pop(0)
         elif package.get("summary"):

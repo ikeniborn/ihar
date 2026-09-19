@@ -14,6 +14,7 @@ ihar_cmd_switch() {
   local source_vendor source_session source_profile target_id context payload summary=""
   read -r source_vendor source_session source_profile < <(
     printf '%s' "$source" | ihar_python -c 'import json,sys; r=json.load(sys.stdin); print(r["vendor"],r["vendor_session_id"],r["profile"])')
+  ihar_profile_resolve "$source_profile"
   [[ "$source_vendor" != "$IHAR_FLAG_TO" ]] \
     || ihar_die 2 "source already uses $IHAR_FLAG_TO; use that vendor's model switch instead"
   target_id="$(ihar_uuid)"

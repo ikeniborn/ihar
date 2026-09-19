@@ -39,10 +39,14 @@ def codex(binary: str, home: str, session: str, ephemeral: Path, timeout: int) -
     selector = selectors.DefaultSelector(); selector.register(process.stdout, selectors.EVENT_READ)
     deadline = time.monotonic() + timeout; fork_id = None; messages = []
     try:
-        while process.poll() is None and time.monotonic() < deadline:
-            for key, _ in selector.select(0.2):
+        while time.monotonic() < deadline:
+            ready = selector.select(0.2)
+            if not ready and process.poll() is not None:
+                break
+            for key, _ in ready:
                 line = key.fileobj.readline()
-                if not line: continue
+                if not line:
+                    continue
                 try: event = json.loads(line)
                 except ValueError: continue
                 candidate = event.get("thread_id") or event.get("threadId")

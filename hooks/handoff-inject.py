@@ -58,8 +58,10 @@ def main():
             return 0
         pending = os.path.join(pending_dir, identity + ".md")
         with open(pending, encoding="utf-8") as stream:
-            text = stream.read()
+            text = stream.read()[2048:]
         os.unlink(pending)
+        if not text:
+            return 0
         hookio.context(event, text)
     except (OSError, KeyError, hookio.HookIOError):
         return 0

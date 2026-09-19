@@ -110,11 +110,11 @@ use --profile protected for an explicit one"
   if [[ "$vendor" == claude && -z "$IHAR_FLAG_RESUME" ]]; then
     ihar_session_append_launch "$vendor" "$IHAR_LAUNCH_ID"
   fi
-  ihar_handoff_consume_claude
-
   local binary="${IHAR_ARGV[0]}"
   [[ -x "$binary" ]] || ihar_die 1 "the $vendor binary is not installed at $binary
 run 'ihar install'"
+
+  ihar_handoff_consume_claude
 
   ihar_env_apply
   if (( ${#IHAR_ENV[@]} )); then
