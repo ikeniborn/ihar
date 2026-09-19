@@ -25,6 +25,7 @@ IHAR_FLAG_PROMPT=""
 IHAR_FLAG_CONFORMANCE=false
 IHAR_FLAG_TO=""
 IHAR_FLAG_MICROVM=false
+IHAR_FLAG_ACP=false
 IHAR_SUBCOMMAND=""
 IHAR_ARGS=()
 
@@ -50,7 +51,7 @@ running now would report success while doing nothing"
 
 # Commands this build implements. A command a later slice adds is not listed, so
 # asking for it is an error naming the slice rather than a silent no-op.
-_IHAR_COMMANDS=(claude codex check homes install update daemon sessions switch web)
+_IHAR_COMMANDS=(claude codex acp check homes install update daemon sessions switch web)
 
 _ihar_is_command() {
   local candidate="$1" known
@@ -140,6 +141,11 @@ try: ihar $1 $IHAR_COMMAND ..."
         [[ "$IHAR_COMMAND" == install ]] \
           || ihar_die 2 "--microvm belongs to 'ihar install'"
         IHAR_FLAG_MICROVM=true; shift; continue
+        ;;
+      --acp)
+        [[ "$IHAR_COMMAND" == install ]] \
+          || ihar_die 2 "--acp belongs to 'ihar install'"
+        IHAR_FLAG_ACP=true; shift; continue
         ;;
       -*)
         ihar_die 2 "unknown flag '$1' for '$IHAR_COMMAND'

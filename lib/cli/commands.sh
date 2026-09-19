@@ -21,6 +21,11 @@ ihar_cmd_launch() {
 
   # 2. profile, before anything reads its severity
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
+  if [[ "${IHAR_ACP_MODE:-false}" == true && "${IHAR_PROFILE_ACP:-refuse}" != allow ]]; then
+    ihar_die 2 "profile '$IHAR_PROFILE' refuses experimental ACP mode
+claude-agent-acp #144: settings hooks may not fire
+codex-acp #310/#477: sandbox and approval policy are overridden"
+  fi
   if [[ "$IHAR_FLAG_WEB" == true ]]; then
     case " ${IHAR_PROFILE_REMOTE:-} " in
       *" $vendor "*) ;;
@@ -115,21 +120,36 @@ ihar_cmd_launch() {
   # 8. a daemon serving this home must be the one this configuration asked for. Codex
   #    hands every client the environment the daemon inherited at start, so a daemon
   #    left over from another profile would serve this launch under that profile.
-  if [[ "$vendor" == codex && "$IHAR_PROFILE_SANDBOX" != microvm ]]; then
+  if [[ "$vendor" == codex && "$IHAR_PROFILE_SANDBOX" != microvm && "${IHAR_ACP_MODE:-false}" != true ]]; then
     ihar_codex_daemon_reconcile "$runtime" "$hash"
   fi
 
   # 8b. Create the control-plane identity before either vendor starts. The hook
   # claims it using its own payload session id, never the daemon's environment.
-  IHAR_LAUNCH_ID="${IHAR_HANDOFF_TARGET_ID:-${IHAR_RESUME_IHAR_ID:-$(ihar_uuid)}}"; export IHAR_LAUNCH_ID
-
-  ihar_handoff_prepare "$vendor"
+  if [[ "${IHAR_ACP_MODE:-false}" != true ]]; then
+    IHAR_LAUNCH_ID="${IHAR_HANDOFF_TARGET_ID:-${IHAR_RESUME_IHAR_ID:-$(ihar_uuid)}}"; export IHAR_LAUNCH_ID
+    ihar_handoff_prepare "$vendor"
+  fi
 
   # 9. and 10. the adapter builds its argv and the environment it needs
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR
-  ihar_adapter "$vendor" launch "$runtime"
+  if [[ "${IHAR_ACP_MODE:-false}" == true ]]; then
+    ihar_adapter "$vendor" env "$runtime"
+    case "$vendor" in
+      claude) IHAR_ARGV=("$IHAR_CLAUDE_ACP_BIN") ;;
+      codex)  IHAR_ARGV=("$IHAR_CODEX_ACP_BIN") ;;
+    esac
+  else
+    ihar_adapter "$vendor" launch "$runtime"
+  fi
   local binary="${IHAR_ARGV[0]}"
+  if [[ "${IHAR_ACP_MODE:-false}" == true && "$IHAR_FLAG_DRY_RUN" != true ]]; then
+    ihar_store_verify_acp "$vendor"
+  fi
   if [[ "$IHAR_FLAG_DRY_RUN" != true && ! -x "$binary" ]]; then
+    if [[ "${IHAR_ACP_MODE:-false}" == true ]]; then
+      ihar_die 1 "the $vendor ACP adapter is not installed at $binary"
+    fi
     ihar_die 1 "the $vendor binary is not installed at $binary
 run 'ihar install'"
   fi
@@ -142,6 +162,14 @@ run 'ihar install'"
   if [[ "$IHAR_FLAG_DRY_RUN" == true ]]; then
     ihar_dry_run "$vendor" "$runtime"
     return 0
+  fi
+
+  if [[ "${IHAR_ACP_MODE:-false}" == true ]]; then
+    ihar_env_apply
+    if (( ${#IHAR_ENV[@]} )); then
+      exec env -i "${IHAR_ENV[@]}" "${IHAR_ARGV[@]}"
+    fi
+    exec "${IHAR_ARGV[@]}"
   fi
 
   ihar_session_claim "$vendor" "$hash"
@@ -160,6 +188,17 @@ run 'ihar install'"
     exec env -i "${IHAR_ENV[@]}" "${IHAR_ARGV[@]}"
   fi
   exec "${IHAR_ARGV[@]}"
+}
+
+# ihar_cmd_acp <vendor> — experimental presentation layer over a standard runtime.
+ihar_cmd_acp() {
+  local vendor="${IHAR_SUBCOMMAND:-}"
+  [[ "$vendor" == claude || "$vendor" == codex ]] \
+    || ihar_die 2 "ihar acp: expected claude or codex, got '${vendor:-nothing}'"
+  (( ${#IHAR_ARGS[@]} == 0 && ${#IHAR_PASSTHROUGH[@]} == 0 )) \
+    || ihar_die 2 "ihar acp accepts one vendor and no other positional arguments"
+  IHAR_ACP_MODE=true
+  ihar_cmd_launch "$vendor"
 }
 
 # ihar_cmd_web <vendor> — command spelling for the same launch path as --web.
@@ -211,6 +250,8 @@ ihar_cmd_check() {
   printf 'store        %s\n' "$IHAR_STORE"
   printf 'state root   %s\n' "$IHAR_STATE_ROOT"
   printf 'lockfile     %s\n' "$([[ -f "$IHAR_LOCKFILE" ]] && echo present || echo absent)"
+  printf 'acp          claude-agent-acp #144: settings hooks may not fire\n'
+  printf 'acp          codex-acp #310/#477: sandbox and approval policy are overridden\n'
 
   local vendor binary version record
   for vendor in claude codex; do

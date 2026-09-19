@@ -16,6 +16,7 @@
 IHAR_NODE_DIST_URL="${IHAR_NODE_DIST_URL:-https://nodejs.org/dist}"
 IHAR_CODEX_RELEASE_URL="${IHAR_CODEX_RELEASE_URL:-https://github.com/openai/codex/releases/download}"
 IHAR_NPM_PACKAGE="${IHAR_NPM_PACKAGE:-@anthropic-ai/claude-code}"
+IHAR_NPM_BIN="${IHAR_NPM_BIN:-$IHAR_NVM/bin/npm}"
 
 # ihar_download <url> <target> — one seam for every fetch.
 ihar_download() {
@@ -51,10 +52,54 @@ _ihar_install_all() {
   ihar_install_codex
   ihar_install_claude
   ihar_install_conformance
+  if [[ "${IHAR_FLAG_ACP:-false}" == true ]]; then ihar_install_acp; fi
   if [[ "${IHAR_FLAG_MICROVM:-false}" == true ]]; then ihar_install_microvm; fi
 
   ihar_lockfile_hash > "$IHAR_STORE/.last-lockfile-hash"
   ihar_info "install complete; run 'ihar check' to see what is in force"
+}
+
+# ihar_install_acp — install both exact lockfile pins into one staged npm prefix.
+ihar_install_acp() {
+  local claude_pin codex_pin versions stage
+  claude_pin="$(ihar_lockfile_get acp.claude-agent-acp)"
+  codex_pin="$(ihar_lockfile_get acp.codex-acp)"
+  [[ -n "$claude_pin" && -n "$codex_pin" ]] \
+    || ihar_die 3 "--acp requires both ACP adapters in the lockfile"
+
+  versions="$IHAR_STORE/acp/.versions"
+  if [[ -x "$IHAR_CLAUDE_ACP_BIN" && -x "$IHAR_CODEX_ACP_BIN" && -f "$versions" &&
+        "$(sed -n '1p' "$versions")" == "$claude_pin" &&
+        "$(sed -n '2p' "$versions")" == "$codex_pin" ]] &&
+        ihar_store_verify_acp claude >/dev/null 2>&1 &&
+        ihar_store_verify_acp codex >/dev/null 2>&1; then
+    ihar_info "ACP adapters already installed"
+    return 0
+  fi
+
+  command -v "$IHAR_NPM_BIN" >/dev/null 2>&1 \
+    || ihar_die 1 "npm is required to install ACP adapters"
+  mkdir -p "$IHAR_STORE"
+  stage="$(mktemp -d "$IHAR_STORE/.acp-stage-XXXXXX")" \
+    || ihar_die 1 "cannot stage ACP adapters"
+  PATH="$IHAR_NVM/bin:$PATH" "$IHAR_NPM_BIN" install --silent --prefix "$stage" -g \
+    "@agentclientprotocol/claude-agent-acp@$claude_pin" \
+    || { rm -rf "$stage"; ihar_die 1 "cannot install claude-agent-acp $claude_pin"; }
+  PATH="$IHAR_NVM/bin:$PATH" "$IHAR_NPM_BIN" install --silent --prefix "$stage" -g \
+    "github:agentclientprotocol/codex-acp#$codex_pin" \
+    || { rm -rf "$stage"; ihar_die 1 "cannot install codex-acp $codex_pin"; }
+  [[ -x "$stage/bin/claude-agent-acp" && -x "$stage/bin/codex-acp" ]] \
+    || { rm -rf "$stage"; ihar_die 1 "the ACP packages did not install their adapter commands"; }
+  printf '%s\n%s\n' "$claude_pin" "$codex_pin" > "$stage/.versions"
+  printf 'claude-agent-acp\t%s\ncodex-acp\t%s\n' \
+    "$(ihar_sha256 "$stage/bin/claude-agent-acp")" \
+    "$(ihar_sha256 "$stage/bin/codex-acp")" > "$stage/.digests"
+  rm -rf "$IHAR_STORE/acp.previous"
+  if [[ -d "$IHAR_STORE/acp" ]]; then mv "$IHAR_STORE/acp" "$IHAR_STORE/acp.previous"; fi
+  mv "$stage" "$IHAR_STORE/acp" \
+    || ihar_die 1 "cannot activate ACP adapters"
+  rm -rf "$IHAR_STORE/acp.previous"
+  ihar_info "ACP adapters installed"
 }
 
 # ihar_install_microvm — import the specialised guest built by iclaude's installer.
