@@ -25,8 +25,11 @@ _ihar_render_claude_config() {
     vendor|microvm) sandbox_json='{"enabled": true, "filesystem": "workspace-write"}' ;;
   esac
 
-  [[ "${IHAR_GATEWAY_MODE:-off}" == "explicit" ]] \
-    && base_url="http://127.0.0.1:${IHAR_GATEWAY_ACTIVE_PORT}"
+  if [[ "${IHAR_GATEWAY_MODE:-off}" == "explicit" ]]; then
+    local gateway_host=127.0.0.1
+    [[ "$IHAR_PROFILE_SANDBOX" == microvm ]] && gateway_host="${IHAR_MICROVM_HOST_IP:-172.31.0.1}"
+    base_url="http://${gateway_host}:${IHAR_GATEWAY_ACTIVE_PORT}"
+  fi
 
   ihar_python ihar.render.claude_settings \
     "$render/settings.json" "$sandbox_json" "$base_url" \
@@ -82,8 +85,9 @@ _ihar_render_codex_config() {
   fi
 
   if [[ "${IHAR_GATEWAY_MODE:-off}" == "explicit" ]]; then
-    local prefix
+    local prefix gateway_host=127.0.0.1
     prefix="$(ihar_codex_auth_prefix)"
+    [[ "$IHAR_PROFILE_SANDBOX" == microvm ]] && gateway_host="${IHAR_MICROVM_HOST_IP:-172.31.0.1}"
     # The selector is a bare key and the provider itself is a table, so the two go to
     # different fragments even though they are one decision.
     {
@@ -95,7 +99,7 @@ _ihar_render_codex_config() {
       printf '# ihar:provider-table:start\n'
       printf '[model_providers.ihar]\n'
       printf 'name = "ihar gateway"\n'
-      printf 'base_url = "http://127.0.0.1:%s/%s"\n' "$IHAR_GATEWAY_ACTIVE_PORT" "$prefix"
+      printf 'base_url = "http://%s:%s/%s"\n' "$gateway_host" "$IHAR_GATEWAY_ACTIVE_PORT" "$prefix"
       printf 'wire_api = "responses"\n'
       # Keeps ChatGPT OAuth working through a custom base URL; without it Codex
       # would demand an API key and a subscription user could not launch at all.

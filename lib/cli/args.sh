@@ -24,6 +24,7 @@ IHAR_FLAG_WEB=false
 IHAR_FLAG_PROMPT=""
 IHAR_FLAG_CONFORMANCE=false
 IHAR_FLAG_TO=""
+IHAR_FLAG_MICROVM=false
 IHAR_SUBCOMMAND=""
 IHAR_ARGS=()
 
@@ -134,6 +135,11 @@ try: ihar $1 $IHAR_COMMAND ..."
         [[ "$IHAR_COMMAND" == check ]] \
           || ihar_die 2 "--conformance belongs to 'ihar check'"
         IHAR_FLAG_CONFORMANCE=true; shift; continue
+        ;;
+      --microvm)
+        [[ "$IHAR_COMMAND" == install ]] \
+          || ihar_die 2 "--microvm belongs to 'ihar install'"
+        IHAR_FLAG_MICROVM=true; shift; continue
         ;;
       -*)
         ihar_die 2 "unknown flag '$1' for '$IHAR_COMMAND'

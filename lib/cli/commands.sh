@@ -29,6 +29,7 @@ ihar_cmd_launch() {
   fi
 
   # 3. store integrity, at the severity the profile asks for
+  IHAR_VENDOR="$vendor"; export IHAR_VENDOR
   ihar_store_verify
 
   # 4. project state. Called directly rather than in a command substitution: the
@@ -38,6 +39,12 @@ ihar_cmd_launch() {
   root="$IHAR_PROJECT_ROOT"
   ihar_state_setup "$root" >/dev/null
   state="$IHAR_STATE"
+
+  if [[ "$IHAR_PROFILE_SANDBOX" == microvm ]]; then
+    ihar_launch_state_enter isolated
+  else
+    ihar_launch_state_enter native
+  fi
 
   # 4b. seed vendor state from a legacy wrapper home, once
   ihar_migrate_vendor "$vendor" "$state" "$root" >/dev/null || true
@@ -55,7 +62,8 @@ ihar_cmd_launch() {
   esac
 
   if [[ "$IHAR_PROFILE_SANDBOX" == "microvm" ]]; then
-    ihar_die 3 "profile '$IHAR_PROFILE' requires a microVM, which slice S13 delivers"
+    ihar_microvm_reserve_slot
+    trap 'ihar_microvm_release_slot; ihar_gateway_release' EXIT INT TERM
   fi
 
   # 6. render. The hook block and the effective policy are produced here; the MCP
@@ -80,6 +88,26 @@ ihar_cmd_launch() {
   ihar_runtime_materialise "$vendor" "$hash" "$render" "$mode" >/dev/null
   runtime="$IHAR_RUNTIME"
 
+  if [[ "$IHAR_PROFILE_SANDBOX" == microvm ]]; then
+    local other_vendor=claude other_render other_hash other_runtime
+    [[ "$vendor" == claude ]] && other_vendor=codex
+    other_render="$(mktemp -d "${TMPDIR:-/tmp}/ihar-render-other-XXXXXX")"
+    ihar_render_all "$other_vendor" "$other_render"
+    other_hash="$(ihar_config_hash \
+      "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
+      "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
+      "$hooks_digest" "$registry_digest" "$(ihar_vendor_version "$other_vendor")")"
+    ihar_runtime_materialise "$other_vendor" "$other_hash" "$other_render" "$mode" >/dev/null
+    other_runtime="$IHAR_RUNTIME"
+    ihar_verify_hook_trust "$other_vendor" "$other_runtime"
+    IHAR_VENDOR="$other_vendor"; export IHAR_VENDOR
+    ihar_store_verify_conformance true
+    IHAR_VENDOR="$vendor"; export IHAR_VENDOR
+    IHAR_OTHER_RUNTIME="$other_runtime"; export IHAR_OTHER_RUNTIME
+    IHAR_RUNTIME="$runtime"; export IHAR_RUNTIME
+    rm -rf "$other_render"
+  fi
+
   # 7b. the hooks the profile depends on must be trusted by the vendor itself, not
   #     merely rendered by us (LLD 6.5).
   ihar_verify_hook_trust "$vendor" "$runtime"
@@ -87,7 +115,7 @@ ihar_cmd_launch() {
   # 8. a daemon serving this home must be the one this configuration asked for. Codex
   #    hands every client the environment the daemon inherited at start, so a daemon
   #    left over from another profile would serve this launch under that profile.
-  if [[ "$vendor" == codex ]]; then
+  if [[ "$vendor" == codex && "$IHAR_PROFILE_SANDBOX" != microvm ]]; then
     ihar_codex_daemon_reconcile "$runtime" "$hash"
   fi
 
@@ -121,6 +149,11 @@ run 'ihar install'"
     ihar_session_append_launch "$vendor" "$IHAR_LAUNCH_ID"
   fi
   ihar_handoff_consume_claude
+
+  if [[ "$IHAR_PROFILE_SANDBOX" == "microvm" ]]; then
+    ihar_microvm_launch "$vendor" "$runtime"
+    return $?
+  fi
 
   ihar_env_apply
   if (( ${#IHAR_ENV[@]} )); then
@@ -173,8 +206,7 @@ ihar_cmd_check() {
   printf 'masking      %s (floor %s, engine %s)\n' \
     "$IHAR_GATEWAY_MASKING_LEVEL" "$IHAR_PROFILE_MASKING_LEVEL" \
     "$(ihar_python ihar.mask.describe "$IHAR_GATEWAY_MASKING_LEVEL" 2>/dev/null || echo unknown)"
-  printf 'sandbox      %s%s\n' "$IHAR_PROFILE_SANDBOX" \
-    "$([[ "$IHAR_PROFILE_SANDBOX" == microvm ]] && printf ' (unavailable until slice S13)')"
+  printf 'sandbox      %s\n' "$IHAR_PROFILE_SANDBOX"
   ihar_gateway_status
   printf 'store        %s\n' "$IHAR_STORE"
   printf 'state root   %s\n' "$IHAR_STATE_ROOT"

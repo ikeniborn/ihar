@@ -38,6 +38,9 @@ launch flags
   --mask-level <l>      off, secrets, standard; may only tighten the profile's floor
   --web                 start the agent's own remote surface
 
+install flags
+  --microvm             import pinned Firecracker assets from IHAR_MICROVM_SOURCE_DIR
+
 everything after -- goes to the agent verbatim:
   ihar codex -- mcp list
 
