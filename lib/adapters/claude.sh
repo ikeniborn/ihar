@@ -60,6 +60,9 @@ _adapter_claude_argv() {
   if [[ -n "$IHAR_FLAG_NAME" ]];   then IHAR_ARGV+=(-n "$IHAR_FLAG_NAME"); fi
   if [[ -n "$IHAR_FLAG_MODEL" ]];  then IHAR_ARGV+=(--model "$IHAR_FLAG_MODEL"); fi
   if [[ -n "$IHAR_FLAG_EFFORT" ]]; then IHAR_ARGV+=(--effort "$IHAR_FLAG_EFFORT"); fi
+  if [[ -n "${IHAR_HANDOFF_PENDING:-}" && "${IHAR_PROFILE_HANDOFF_SYSTEM_PROMPT:-false}" == true ]]; then
+    IHAR_ARGV+=(--append-system-prompt "Continue from the ihar handoff in the initial prompt; preserve its constraints and verify its open items.")
+  fi
 
   # Rendered by slice S6. Passing a path that does not exist would make the vendor
   # fail on a file the harness promised, so the flag appears only with the file.
@@ -88,4 +91,9 @@ adapter_claude_switch_model() {
   printf -- '--model %s' "$model"
   if [[ -n "$effort" ]]; then printf -- ' --effort %s' "$effort"; fi
   printf '\n'
+}
+
+adapter_claude_export_context() {
+  local session="$1"
+  ihar_python ihar.handoff.export claude "$IHAR_STATE/st/claude" "$session"
 }

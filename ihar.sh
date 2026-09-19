@@ -32,6 +32,7 @@ source "$_IHAR_LIB/render/hooks.sh"
 source "$_IHAR_LIB/render/config.sh"
 source "$_IHAR_LIB/codex/daemon.sh"
 source "$_IHAR_LIB/sessions/sessions.sh"
+source "$_IHAR_LIB/handoff/handoff.sh"
 source "$_IHAR_LIB/gateway/gateway.sh"
 source "$_IHAR_LIB/profile/profile.sh"
 source "$_IHAR_LIB/adapters/adapter.sh"
@@ -60,6 +61,7 @@ ihar_main() {
     update)       ihar_cmd_update ;;
     daemon)       ihar_cmd_daemon ;;
     sessions)     ihar_cmd_sessions ;;
+    switch)       ihar_cmd_switch ;;
     homes)        ihar_cmd_homes ;;
     *)            ihar_die 2 "unhandled command '$IHAR_COMMAND'" ;;
   esac

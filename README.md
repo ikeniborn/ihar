@@ -58,6 +58,7 @@ ihar check
 ihar --dry-run --profile protected codex
 ihar sessions list
 ihar sessions resume <ihar-id>
+ihar switch --to codex
 ```
 
 Everything after `--` reaches the agent untouched:
@@ -71,6 +72,11 @@ ihar codex -- mcp list
 `ihar sessions list` merges metadata from both vendor stores into one project index.
 The index owns no transcript content. Use its stable `ihar-id` with `sessions resume`,
 or update the local display title with `sessions name <ihar-id> <title>`.
+
+`ihar switch --to claude|codex` builds a masked, bounded handoff package from the
+current session, links both canonical session records, and launches the other vendor.
+Claude carries the package in its initial prompt; Codex consumes the remainder once
+through its SessionStart hook.
 
 ## Configure
 

@@ -42,7 +42,7 @@ ihar_cmd_sessions() {
       IFS=$'\t' read -r vendor vendor_id profile <<< "$resolved"
       IHAR_FLAG_RESUME="$vendor_id"
       IHAR_FLAG_PROFILE="$profile"
-      IHAR_RESUME_IHAR_ID="${IHAR_ARGS[0]}"; export IHAR_RESUME_IHAR_ID
+      IHAR_RESUME_IHAR_ID="${IHAR_ARGS[0]}"
       ihar_cmd_launch "$vendor"
       ;;
     name)

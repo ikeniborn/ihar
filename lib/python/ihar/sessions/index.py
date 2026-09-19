@@ -114,6 +114,10 @@ def main(argv: list[str] | None = None) -> int:
     show = sub.add_parser("list"); show.add_argument("path"); show.add_argument("--ephemeral")
     claim = sub.add_parser("claim"); claim.add_argument("vendor"); claim.add_argument("profile"); claim.add_argument("runtime_hash"); claim.add_argument("directory"); claim.add_argument("--ihar-id")
     resolve = sub.add_parser("resolve"); resolve.add_argument("path"); resolve.add_argument("ihar_id")
+    inspect = sub.add_parser("show"); inspect.add_argument("path"); inspect.add_argument("ihar_id")
+    handoff = sub.add_parser("handoff"); handoff.add_argument("path"); handoff.add_argument("source_id")
+    handoff.add_argument("target_id"); handoff.add_argument("target_vendor"); handoff.add_argument("profile")
+    handoff.add_argument("project"); handoff.add_argument("cwd")
     name = sub.add_parser("name"); name.add_argument("path"); name.add_argument("ihar_id"); name.add_argument("title")
     args = parser.parse_args(argv)
     if args.command == "append":
@@ -135,6 +139,24 @@ def main(argv: list[str] | None = None) -> int:
         if not row or not row.get("vendor_session_id"):
             return 1
         print(f"{row['vendor']}\t{row['vendor_session_id']}\t{row['profile']}"); return 0
+    if args.command == "show":
+        row = fold(args.path).get(args.ihar_id)
+        if not row:
+            return 1
+        print(json.dumps(row, sort_keys=True)); return 0
+    if args.command == "handoff":
+        source = fold(args.path).get(args.source_id)
+        if not source:
+            return 1
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        append(args.path, {"schema": 1, "ihar_id": args.source_id, "vendor": source["vendor"],
+                           "source": "launch", "handoff_to": args.target_id})
+        append(args.path, {"schema": 1, "ihar_id": args.target_id, "vendor": args.target_vendor,
+                           "vendor_session_id": None, "project": args.project, "cwd": args.cwd,
+                           "git_branch": None, "title": None, "model": None, "profile": args.profile,
+                           "started_at": now, "updated_at": now, "parent_ihar_id": args.source_id,
+                           "handoff_from": args.source_id, "handoff_to": None, "tags": [], "source": "launch"})
+        return 0
     if args.command == "name":
         row = fold(args.path).get(args.ihar_id)
         if not row:
