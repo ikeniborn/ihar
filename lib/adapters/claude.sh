@@ -52,7 +52,7 @@ _adapter_claude_argv() {
   else
     # ihar generates the session id so the index knows it before the vendor starts;
     # Codex has no equivalent, which is why its id is learned from a hook instead.
-    IHAR_ARGV+=(--session-id "$(ihar_uuid)")
+    IHAR_ARGV+=(--session-id "${IHAR_LAUNCH_ID:-$(ihar_uuid)}")
   fi
 
   # Written as `if` blocks rather than `[[ … ]] && …`: the launcher runs under

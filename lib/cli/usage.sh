@@ -16,6 +16,8 @@ commands
   homes list | clean    project state directories
   daemon status | stop | restart
                         the managed Codex app-server daemon
+  sessions list | resume <id> | name <id> <title>
+                        canonical sessions across both vendors
 
 global flags
   --profile <name>      standard, protected, remote-protected, isolated
@@ -38,6 +40,6 @@ everything after -- goes to the agent verbatim:
   ihar codex -- mcp list
 
 not yet delivered
-  sessions, switch, web, acp
+  switch, web, acp
 TEXT
 }

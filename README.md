@@ -56,6 +56,8 @@ ihar codex
 ihar --profile protected codex
 ihar check
 ihar --dry-run --profile protected codex
+ihar sessions list
+ihar sessions resume <ihar-id>
 ```
 
 Everything after `--` reaches the agent untouched:
@@ -65,6 +67,10 @@ ihar codex -- mcp list
 ```
 
 `ihar --help` lists every command and flag.
+
+`ihar sessions list` merges metadata from both vendor stores into one project index.
+The index owns no transcript content. Use its stable `ihar-id` with `sessions resume`,
+or update the local display title with `sessions name <ihar-id> <title>`.
 
 ## Configure
 
