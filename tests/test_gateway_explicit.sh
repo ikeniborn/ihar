@@ -50,12 +50,17 @@ fi
 export IHAR_GATEWAY_ANTHROPIC_UPSTREAM="http://127.0.0.1:$UPSTREAM_PORT"
 export IHAR_GATEWAY_OPENAI_UPSTREAM="http://127.0.0.1:$UPSTREAM_PORT"
 
-python3 -m ihar.gateway.explicit --port 0 --port-file "$IHAR_TEST_TMP/gw-port" \
-  --log-dir "$IHAR_TEST_TMP/logs" --level standard --engine regex --enforced \
+live_key=abcdef012345
+live_dir="$IHAR_STATE_ROOT/gw/$live_key"
+mkdir -p "$live_dir/consumers"
+python3 -m ihar.gateway.explicit --port 0 --port-file "$live_dir/port" \
+  --log-dir "$live_dir/logs" --level standard --engine regex --enforced \
   >/dev/null 2>"$IHAR_TEST_TMP/gw-stderr" &
 GW_PID=$!
-for _ in $(seq 60); do [[ -s "$IHAR_TEST_TMP/gw-port" ]] && break; sleep 0.1; done
-PORT="$(cat "$IHAR_TEST_TMP/gw-port" 2>/dev/null || echo)"
+printf '%s\n' "$GW_PID" > "$live_dir/pid"
+printf '%s\n' "$$" > "$live_dir/consumers/$$.pid"
+for _ in $(seq 60); do [[ -s "$live_dir/port" ]] && break; sleep 0.1; done
+PORT="$(cat "$live_dir/port" 2>/dev/null || echo)"
 cleanup() { kill "$GW_PID" "$UPSTREAM_PID" 2>/dev/null; }
 trap cleanup EXIT
 
@@ -113,7 +118,7 @@ assert_exit "the request still reached the upstream" 0 test -f "$IHAR_TEST_TMP/u
 
 # --- the log carries no payload -------------------------------------------------------------
 
-logged="$(cat "$IHAR_TEST_TMP"/logs/*.log 2>/dev/null || echo)"
+logged="$(cat "$live_dir"/logs/*.log 2>/dev/null || echo)"
 assert_exit "something was logged" 1 test -z "$logged"
 assert_eq "no secret appears in the log" "0" "$(grep -c "$SECRET" <<<"$logged")"
 assert_eq "no bearer token appears in the log" "0" "$(grep -c 'secret-token-value' <<<"$logged")"
@@ -125,30 +130,42 @@ assert_contains "and the route class does" "$logged" '"path_class"'
 metrics="$(curl -sS "http://127.0.0.1:$PORT/api/metrics" 2>/dev/null)"
 assert_contains "refusals are counted" "$metrics" '"refused"'
 assert_contains "and maskings are counted" "$metrics" '"masked"'
+assert_eq "known requests produce exact authoritative counters" "True" \
+  "$(METRICS_JSON="$metrics" python3 -c 'import json,os; m=json.loads(os.environ["METRICS_JSON"]); print({k:m[k] for k in ("masked","refused","relayed")}=={"masked":2,"refused":4,"relayed":0})')"
 
 # --- structured status ----------------------------------------------------------------------
 
 source "$ROOT/lib/core/logging.sh"
 source "$ROOT/lib/core/init.sh"
 source "$ROOT/lib/gateway/gateway.sh"
-live_key=abcdef012345
-live_dir="$IHAR_STATE_ROOT/gw/$live_key"
 stale_key=012345abcdef
 stale_dir="$IHAR_STATE_ROOT/gw/$stale_key"
-mkdir -p "$live_dir/consumers" "$stale_dir/consumers"
-printf '%s\n' "$GW_PID" > "$live_dir/pid"
-printf '%s\n' "$PORT" > "$live_dir/port"
-printf '%s\n' "$$" > "$live_dir/consumers/$$.pid"
+mkdir -p "$stale_dir/consumers"
 printf '%s\n' 999999 > "$stale_dir/pid"
 
-log_before="$(find "$IHAR_TEST_TMP/logs" -type f -print0 | sort -z | xargs -0 sha256sum)"
+gateway_fingerprint() {
+  { find "$IHAR_STATE_ROOT/gw" -printf '%P\t%y\t%m\t%l\n' | LC_ALL=C sort
+    find "$IHAR_STATE_ROOT/gw" -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum; } \
+    | sha256sum | cut -d' ' -f1
+}
+
+state_before="$(gateway_fingerprint)"
 status="$(ihar_gateway_status)"
-log_after="$(find "$IHAR_TEST_TMP/logs" -type f -print0 | sort -z | xargs -0 sha256sum)"
-assert_eq "gateway status is read-only" "$log_before" "$log_after"
+state_after="$(gateway_fingerprint)"
+assert_eq "gateway status leaves the complete state tree unchanged" "$state_before" "$state_after"
 assert_eq "live gateway status carries typed identity health and metrics" "True" \
   "$(python3 -c 'import json,sys; rows={x["key"]:x for x in json.load(sys.stdin)}; x=rows["abcdef012345"]; m=x["metrics"]; print(x["mode"]=="explicit" and x["port"]>0 and x["pid"]>0 and x["consumers"]==1 and x["healthy"] is True and m["state"]=="available" and all(isinstance(m[k],int) for k in ("masked","refused","relayed","uptime_seconds")))' <<<"$status")"
+assert_eq "structured counters equal the authoritative metrics endpoint" "True" \
+  "$(METRICS_JSON="$metrics" STATUS_JSON="$status" python3 -c 'import json,os; expected=json.loads(os.environ["METRICS_JSON"]); rows={x["key"]:x for x in json.loads(os.environ["STATUS_JSON"])}; actual=rows["abcdef012345"]["metrics"]; print(all(actual[k]==expected[k] for k in ("masked","refused","relayed")))')"
 assert_eq "stale gateway status uses explicit unavailable values" "True" \
   "$(python3 -c 'import json,sys; rows={x["key"]:x for x in json.load(sys.stdin)}; x=rows["012345abcdef"]; m=x["metrics"]; print(x["port"] is None and x["pid"]==999999 and x["healthy"] is False and m=={"state":"unavailable","masked":None,"refused":None,"relayed":None,"uptime_seconds":None})' <<<"$status")"
+
+state_before="$(gateway_fingerprint)"
+: > "$stale_dir/injected"
+state_after="$(gateway_fingerprint)"
+assert_exit "gateway fingerprint rejects an injected state file" 1 \
+  test "$state_before" = "$state_after"
+rm -f "$stale_dir/injected"
 
 # --- a requested port is a preference, never a requirement -------------------------------------
 #
