@@ -54,7 +54,7 @@ ihar_state_clean_orphans() {
   printf '%s\n' "$removed"
 }
 
-# ihar_state_clean_runtimes <days> — drop runtime homes unused for longer than the
+# ihar_state_clean_runtimes <days> <state> — drop runtime homes unused for longer than the
 # given age. Project state under st/ is never touched: a runtime home rebuilds from
 # its configuration, a transcript does not.
 ihar_state_clean_runtimes() {

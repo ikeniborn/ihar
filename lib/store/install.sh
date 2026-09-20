@@ -47,6 +47,9 @@ ihar_cmd_install() {
 }
 
 _ihar_install_all() {
+  if [[ "${IHAR_FLAG_MIGRATE_STORE:-false}" == true ]]; then
+    _ihar_store_migrate_locked || return $?
+  fi
   ihar_install_command || return $?
   ihar_install_example_config || return $?
   ihar_install_transaction install || return $?

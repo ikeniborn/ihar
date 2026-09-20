@@ -79,6 +79,19 @@ assert_contains "the store defaults outside the checkout" "$roots" "/tmp/home/.l
 assert_contains "state defaults to the XDG state directory" "$roots" "/tmp/home/.local/state/ihar"
 assert_contains "the node tree is a sibling of the store" "$roots" "/tmp/home/.local/share/ihar-nvm"
 
+# Global JSON is a declared output capability, not a flag commands may ignore.
+mkdir -p "$IHAR_TEST_TMP/json-project"
+assert_exit "check supports JSON" 0 \
+  bash -c "cd '$IHAR_TEST_TMP/json-project'; IHAR_STORE='$IHAR_STORE' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' '$ROOT/ihar.sh' --json check"
+assert_exit "launch rejects JSON" 2 \
+  bash -c "cd '$IHAR_TEST_TMP'; IHAR_STORE='$IHAR_STORE' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' '$ROOT/ihar.sh' --json codex --dry-run"
+assert_exit "install rejects JSON" 2 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/cli/args.sh'; ihar_args_parse --json install; ihar_guard_undelivered"
+assert_exit "install alone accepts migrate-store" 0 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/cli/args.sh'; ihar_args_parse install --migrate-store; test \"\$IHAR_FLAG_MIGRATE_STORE\" = true"
+assert_exit "check rejects migrate-store" 2 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/cli/args.sh'; ihar_args_parse check --migrate-store"
+
 store_in_checkout="$(in_shell "unset IHAR_STORE
                                HOME=/tmp/home XDG_DATA_HOME= ihar_init '$ROOT/ihar.sh'
                                case \"\$IHAR_STORE\" in \"\$IHAR_ROOT\"*) echo inside;; *) echo outside;; esac")"

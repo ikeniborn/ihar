@@ -26,6 +26,25 @@ assert_exit "an unknown profile is a usage error" 2 ihar --profile nonesuch chec
 assert_exit "the failed transparent profile is unavailable" 2 \
   ihar --profile remote-protected check
 
+json_check="$(ihar --json check)"
+assert_eq "JSON check validates as a closed result" "standard" \
+  "$(PYTHONPATH="$ROOT/lib/python" python3 -c 'import json,sys; from ihar import jsonio; print(jsonio.check("check-result", json.load(sys.stdin))["profile"]["name"])' <<<"$json_check")"
+assert_contains "text and JSON check share the profile" "$(ihar check)" \
+  "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["profile"]["name"])' <<<"$json_check")"
+
+# Diff renders in temporary directories only. A runtime difference names vendor and
+# relative path while the persistent store/state/runtime bytes stay unchanged.
+CHECK_STATE="$IHAR_STATE_ROOT/$(printf '%s' "$PROJECT" | sha256sum | cut -c1-8)"
+mkdir -p "$CHECK_STATE/r/deadbeef/claude" "$CHECK_STATE/r/deadbeef/codex"
+printf 'different\n' > "$CHECK_STATE/r/deadbeef/claude/settings.json"
+printf 'different\n' > "$CHECK_STATE/r/deadbeef/codex/config.toml"
+check_fingerprint() { find "$IHAR_STORE" "$IHAR_STATE_ROOT" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1; }
+before_check="$(check_fingerprint)"
+diff_out="$(ihar check --diff)"
+assert_contains "diff names Claude relative path" "$diff_out" "claude settings.json"
+assert_contains "diff names Codex relative path" "$diff_out" "codex config.toml"
+assert_eq "diff leaves persistent files unchanged" "$before_check" "$(check_fingerprint)"
+
 # --- the masking floor may be tightened, never loosened ------------------------------
 #
 # A project file that could set `off` under `protected` would turn a mandatory

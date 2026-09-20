@@ -53,6 +53,20 @@ STATE_MANIFEST = {
     ],
 }
 
+CHECK_RESULT = {
+    "schema": 1,
+    "profile": {"name": "protected", "guarantee": "masked model egress"},
+    "masking": {"level": "standard", "floor": "standard", "engine": "regex", "dropped_env": ["TOKEN"]},
+    "gateway": {"mode": "explicit", "network_policy": "protected", "instances": ["abc port 1234"]},
+    "vendors": {
+        "claude": {"receipt": "valid", "hooks": "enforced", "conformance": "proven", "capabilities": ["fork", "remote-control"]},
+        "codex": {"receipt": "missing", "hooks": "enforced", "conformance": "unproven", "capabilities": ["archive", "fork"]},
+    },
+    "assets": [{"requirement": "optional", "presence": "missing", "source": "commands", "target": "commands"}],
+    "mcp": {"strict": True, "notes": {"claude": ["missing TOKEN"], "codex": []}},
+    "known_gaps": ["claude-agent-acp #144"],
+}
+
 
 def rejects(kind, doc, needle=None, **kwargs):
     try:
@@ -276,6 +290,27 @@ def test_state_manifest_rejects_duplicate_vendor_path_keys():
     entry = STATE_MANIFEST["entries"][0]
     duplicate = {**entry, "kind": "file"}
     rejects("state-manifest", {**STATE_MANIFEST, "entries": [entry, duplicate]}, "duplicate")
+
+
+def test_check_result_is_closed_and_covers_both_vendors():
+    jsonio.check("check-result", CHECK_RESULT)
+    rejects("check-result", {**CHECK_RESULT, "extra": True}, "unknown key")
+    missing_codex = {**CHECK_RESULT, "vendors": {"claude": CHECK_RESULT["vendors"]["claude"]}}
+    rejects("check-result", missing_codex, "codex")
+
+
+def test_check_result_text_and_json_render_the_same_facts():
+    from ihar import check_result
+
+    rendered = check_result.render_text(CHECK_RESULT)
+    encoded = check_result.render_json(CHECK_RESULT)
+    jsonio.check("check-result", json.loads(encoded))
+    for value in (
+        "protected", "masked model egress", "standard", "explicit", "valid", "missing",
+        "commands", "enforced", "missing TOKEN", "claude-agent-acp #144",
+    ):
+        assert value in rendered, value
+        assert value in encoded, value
 
 
 if __name__ == "__main__":

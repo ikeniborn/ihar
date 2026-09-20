@@ -23,6 +23,8 @@ IHAR_FLAG_MASK_LEVEL=""
 IHAR_FLAG_WEB=false
 IHAR_FLAG_PROMPT=""
 IHAR_FLAG_CONFORMANCE=false
+IHAR_FLAG_DIFF=false
+IHAR_FLAG_MIGRATE_STORE=false
 IHAR_FLAG_TO=""
 IHAR_FLAG_MICROVM=false
 IHAR_FLAG_ACP=false
@@ -46,6 +48,13 @@ running now would report success while doing nothing"
 
   if [[ "$IHAR_FLAG_FORK" == true && -z "$IHAR_FLAG_RESUME" ]]; then
     ihar_die 2 "--fork needs --resume: there is nothing to fork from"
+  fi
+
+  if [[ "$IHAR_FLAG_JSON" == true ]]; then
+    case "$IHAR_COMMAND:${IHAR_SUBCOMMAND:-list}" in
+      check:*|sessions:list|daemon:status|daemon:stop|daemon:restart) ;;
+      *) ihar_die 2 "--json is not supported by 'ihar $IHAR_COMMAND${IHAR_SUBCOMMAND:+ $IHAR_SUBCOMMAND}'" ;;
+    esac
   fi
 }
 
@@ -136,6 +145,16 @@ try: ihar $1 $IHAR_COMMAND ..."
         [[ "$IHAR_COMMAND" == check ]] \
           || ihar_die 2 "--conformance belongs to 'ihar check'"
         IHAR_FLAG_CONFORMANCE=true; shift; continue
+        ;;
+      --diff)
+        [[ "$IHAR_COMMAND" == check ]] \
+          || ihar_die 2 "--diff belongs to 'ihar check'"
+        IHAR_FLAG_DIFF=true; shift; continue
+        ;;
+      --migrate-store)
+        [[ "$IHAR_COMMAND" == install ]] \
+          || ihar_die 2 "--migrate-store belongs to 'ihar install'"
+        IHAR_FLAG_MIGRATE_STORE=true; shift; continue
         ;;
       --microvm)
         [[ "$IHAR_COMMAND" == install ]] \

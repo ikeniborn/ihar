@@ -27,6 +27,57 @@ export IHAR_CODEX_BIN="$IHAR_STORE/bin/codex"
 export IHAR_CLAUDE_ACP_BIN="$IHAR_STORE/acp/bin/claude-agent-acp"
 export IHAR_CODEX_ACP_BIN="$IHAR_STORE/acp/bin/codex-acp"
 
+# --- copy-only legacy store migration -----------------------------------------------
+
+LEGACY_STORE="$IHAR_TEST_TMP/legacy-store"
+mkdir -p "$LEGACY_STORE/hooks" "$LEGACY_STORE/skills" "$LEGACY_STORE/config" "$LEGACY_STORE/state"
+printf 'old hook\n' > "$LEGACY_STORE/hooks/old"
+printf 'old skill\n' > "$LEGACY_STORE/skills/old"
+printf 'do not copy\n' > "$LEGACY_STORE/config/settings.json"
+printf 'do not copy\n' > "$LEGACY_STORE/state/session.jsonl"
+printf '{"schema":1,"release_lock_sha256":"%064d","installed_at":"2026-09-20T00:00:00Z","components":{}}\n' 0 > "$LEGACY_STORE/install-receipt.json"
+legacy_before="$(find "$LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+
+lock_ready="$IHAR_TEST_TMP/store-lock-ready"
+bash -c 'exec {fd}>"$1.ihar-lifecycle.lock"; flock -s "$fd"; : > "$2"; sleep 30' _ \
+  "$LEGACY_STORE" "$lock_ready" &
+legacy_lock_pid=$!
+while [[ ! -e "$lock_ready" ]]; do :; done
+assert_exit "store migration refuses a held lifecycle lock" 3 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; IHAR_LEGACY_STORE='$LEGACY_STORE' IHAR_ROOT='$ROOT' IHAR_STORE='$IHAR_STORE/migrated' IHAR_STORE_MIGRATION_LOCK_TIMEOUT=1 ihar_store_migrate"
+kill "$legacy_lock_pid" 2>/dev/null || true
+wait "$legacy_lock_pid" 2>/dev/null || true
+assert_exit "lock refusal copies nothing" 1 test -e "$IHAR_STORE/migrated/hooks/old"
+
+mkdir -p "$IHAR_STORE/migrated"
+assert_exit "stable store migration succeeds" 0 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; IHAR_LEGACY_STORE='$LEGACY_STORE' IHAR_ROOT='$ROOT' IHAR_STORE='$IHAR_STORE/migrated' ihar_store_migrate"
+assert_exit "eligible hooks are copied" 0 test -f "$IHAR_STORE/migrated/hooks/old"
+assert_exit "eligible skills are copied" 0 test -f "$IHAR_STORE/migrated/skills/old"
+assert_exit "old receipt is copied" 0 test -f "$IHAR_STORE/migrated/install-receipt.json"
+assert_exit "legacy configuration is excluded" 1 test -e "$IHAR_STORE/migrated/config/settings.json"
+assert_exit "legacy state is excluded" 1 test -e "$IHAR_STORE/migrated/state/session.jsonl"
+assert_eq "legacy source stays byte-identical" "$legacy_before" \
+  "$(find "$LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+
+RACE_STORE="$IHAR_TEST_TMP/legacy-store-race"
+RACE_TARGET="$IHAR_STORE/migrated-race"
+RACE_BIN="$IHAR_TEST_TMP/store-race-bin"
+mkdir -p "$RACE_STORE/hooks" "$RACE_BIN"
+printf 'before\n' > "$RACE_STORE/hooks/old"
+cat > "$RACE_BIN/rsync" <<'EOF'
+#!/usr/bin/env bash
+/usr/bin/rsync "$@" || exit
+if [[ ! -e "$IHAR_TEST_RACE_DONE" ]]; then
+  : > "$IHAR_TEST_RACE_DONE"
+  printf 'during copy\n' >> "$IHAR_TEST_RACE_SOURCE/hooks/old"
+fi
+EOF
+chmod +x "$RACE_BIN/rsync"
+assert_exit "a changing legacy store discards its stage" 3 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; PATH='$RACE_BIN':\"\$PATH\" IHAR_TEST_RACE_SOURCE='$RACE_STORE' IHAR_TEST_RACE_DONE='$IHAR_TEST_TMP/store-race-done' IHAR_LEGACY_STORE='$RACE_STORE' IHAR_ROOT='$ROOT' IHAR_STORE='$RACE_TARGET' ihar_store_migrate"
+assert_exit "an unstable store publishes no eligible entry" 1 test -e "$RACE_TARGET/hooks/old"
+
 # --- a stub release, and a stub fetcher that serves it --------------------------------
 
 RELEASE_DIR="$IHAR_TEST_TMP/releases"

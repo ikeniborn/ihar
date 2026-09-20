@@ -698,6 +698,49 @@ KINDS: dict[str, dict[str, Any]] = {
         },
         "rules": [_asset_manifest_rules],
     },
+    "check-result": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "profile": {"type": dict, "fields": {
+                "name": {"type": str, "pattern": _SLUG},
+                "guarantee": {"type": str, "min_len": 1},
+            }},
+            "masking": {"type": dict, "fields": {
+                "level": {"type": str, "enum": ("off", "secrets", "standard")},
+                "floor": {"type": str, "enum": ("off", "secrets", "standard")},
+                "engine": {"type": str, "min_len": 1},
+                "dropped_env": {"type": list, "items": {"type": str, "min_len": 1}},
+            }},
+            "gateway": {"type": dict, "fields": {
+                "mode": {"type": str, "enum": ("off", "explicit")},
+                "network_policy": _NULLABLE_STR,
+                "instances": {"type": list, "items": {"type": str, "min_len": 1}},
+            }},
+            "vendors": {"type": dict, "fields": {
+                vendor: {"type": dict, "fields": {
+                    "receipt": {"type": str, "enum": ("valid", "stale", "missing", "invalid", "not-installed")},
+                    "hooks": {"type": str, "enum": ("enforced", "best-effort")},
+                    "conformance": {"type": str, "enum": ("proven", "stale", "unproven", "not-installed")},
+                    "capabilities": {"type": list, "items": {"type": str, "min_len": 1}},
+                }} for vendor in _VENDOR
+            }},
+            "assets": {"type": list, "items": {"type": dict, "fields": {
+                "requirement": {"type": str, "enum": ("required", "optional")},
+                "presence": {"type": str, "enum": ("present", "missing")},
+                "source": {"type": str, "pattern": _SAFE_REL},
+                "target": {"type": str, "pattern": _SAFE_REL},
+            }}},
+            "mcp": {"type": dict, "fields": {
+                "strict": {"type": bool},
+                "notes": {"type": dict, "fields": {
+                    vendor: {"type": list, "items": {"type": str, "min_len": 1}}
+                    for vendor in _VENDOR
+                }},
+            }},
+            "known_gaps": {"type": list, "items": {"type": str, "min_len": 1}},
+        },
+        "rules": [],
+    },
 }
 
 

@@ -708,6 +708,31 @@ IHAR_ASSUME_YES=1 ihar_state_clean_orphans >/dev/null
 assert_exit "the orphan state is removed" 1 test -d "$gone_state"
 assert_exit "the live state is kept" 0 test -d "$STATE"
 
+# Operator cleanup is runtime-only. No-id resolves current state; an id selects only
+# that exact marked state. Orphans and all persistent st/ content survive.
+CURRENT_STATE="$STATE"
+NAMED_PROJECT="$IHAR_TEST_TMP/named-project"
+mkdir -p "$NAMED_PROJECT"
+NAMED_STATE="$(ihar_state_setup "$NAMED_PROJECT")"
+NAMED_ID="$(basename "$NAMED_STATE")"
+ORPHAN_STATE="$IHAR_STATE_ROOT/orphan-kept"
+mkdir -p "$CURRENT_STATE/r/old/claude" "$CURRENT_STATE/st/claude" \
+  "$NAMED_STATE/r/old/codex" "$NAMED_STATE/st/codex" "$ORPHAN_STATE/r/old/claude"
+touch -d '60 days ago' "$CURRENT_STATE/r/old" "$NAMED_STATE/r/old" "$ORPHAN_STATE/r/old"
+printf 'current\n' > "$CURRENT_STATE/st/claude/sentinel"
+printf 'named\n' > "$NAMED_STATE/st/codex/sentinel"
+assert_exit "clean current runtimes" 0 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean"
+assert_exit "clean exact state runtimes" 0 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$NAMED_ID'"
+assert_exit "unknown state id is usage" 2 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean missing"
+assert_exit "current persistent state survives" 0 test -f "$CURRENT_STATE/st/claude/sentinel"
+assert_exit "named persistent state survives" 0 test -f "$NAMED_STATE/st/codex/sentinel"
+assert_exit "orphan state survives" 0 test -d "$ORPHAN_STATE"
+assert_exit "current expired runtime is removed" 1 test -d "$CURRENT_STATE/r/old"
+assert_exit "named expired runtime is removed" 1 test -d "$NAMED_STATE/r/old"
+
 # A state without a readable marker is unattributable, not unwanted.
 NOMARKER="$IHAR_STATE_ROOT/no-marker-000000000000"
 mkdir -p "$NOMARKER"
