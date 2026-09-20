@@ -20,6 +20,7 @@ source "$ROOT/lib/core/init.sh"
 source "$ROOT/lib/core/lock.sh"
 source "$ROOT/lib/store/lockfile.sh"
 source "$ROOT/lib/store/assets.sh"
+source "$ROOT/lib/store/migrate.sh"
 source "$ROOT/lib/store/install.sh"
 
 export IHAR_CLAUDE_BIN="$IHAR_NVM/npm-global/bin/claude"
@@ -77,6 +78,65 @@ chmod +x "$RACE_BIN/rsync"
 assert_exit "a changing legacy store discards its stage" 3 \
   bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; PATH='$RACE_BIN':\"\$PATH\" IHAR_TEST_RACE_SOURCE='$RACE_STORE' IHAR_TEST_RACE_DONE='$IHAR_TEST_TMP/store-race-done' IHAR_LEGACY_STORE='$RACE_STORE' IHAR_ROOT='$ROOT' IHAR_STORE='$RACE_TARGET' ihar_store_migrate"
 assert_exit "an unstable store publishes no eligible entry" 1 test -e "$RACE_TARGET/hooks/old"
+
+FINGERPRINT_STORE="$IHAR_TEST_TMP/legacy-fingerprint"
+mkdir -p "$FINGERPRINT_STORE/hooks"
+ln -s first "$FINGERPRINT_STORE/hooks/link"
+fingerprint_before="$(_ihar_store_full_fingerprint "$FINGERPRINT_STORE" hooks)"
+ln -sfn second "$FINGERPRINT_STORE/hooks/link"
+fingerprint_after="$(_ihar_store_full_fingerprint "$FINGERPRINT_STORE" hooks)"
+assert_exit "full migration fingerprint includes symlink targets" 1 \
+  test "$fingerprint_before" = "$fingerprint_after"
+
+# Every source must be staged and validated before one activation. If the second
+# source changes, bytes from the first source must not become active.
+MULTI_A="$IHAR_TEST_TMP/legacy-multi-a"
+MULTI_B="$IHAR_TEST_TMP/legacy-multi-b"
+MULTI_TARGET="$IHAR_STORE/migrated-multi"
+MULTI_BIN="$IHAR_TEST_TMP/store-multi-bin"
+mkdir -p "$MULTI_A/hooks" "$MULTI_B/skills" "$MULTI_TARGET/hooks" "$MULTI_BIN"
+printf 'new hook\n' > "$MULTI_A/hooks/entry"
+printf 'new skill\n' > "$MULTI_B/skills/entry"
+printf 'active hook\n' > "$MULTI_TARGET/hooks/entry"
+cat > "$MULTI_BIN/rsync" <<'EOF'
+#!/usr/bin/env bash
+/usr/bin/rsync "$@" || exit
+if [[ "$*" == *"$IHAR_TEST_MUTATE_SOURCE"* && ! -e "$IHAR_TEST_MUTATE_DONE" ]]; then
+  : > "$IHAR_TEST_MUTATE_DONE"
+  printf 'changed\n' >> "$IHAR_TEST_MUTATE_SOURCE/skills/entry"
+fi
+EOF
+chmod +x "$MULTI_BIN/rsync"
+assert_exit "all store sources validate before one activation" 3 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; PATH='$MULTI_BIN':\"\$PATH\" IHAR_TEST_MUTATE_SOURCE='$MULTI_B' IHAR_TEST_MUTATE_DONE='$IHAR_TEST_TMP/multi-done' IHAR_LEGACY_STORE='$MULTI_A:$MULTI_B' IHAR_ROOT='$ROOT' IHAR_STORE='$MULTI_TARGET' ihar_store_migrate"
+assert_eq "a late source failure leaves the active store untouched" "active hook" \
+  "$(cat "$MULTI_TARGET/hooks/entry")"
+assert_exit "a late source failure publishes no second-source bytes" 1 \
+  test -e "$MULTI_TARGET/skills/entry"
+
+# Activation failure rolls every published path back. A failed restore keeps the
+# recovery backup and reports its location instead of destroying recoverable data.
+ROLL_SOURCE="$IHAR_TEST_TMP/legacy-roll"
+ROLL_TARGET="$IHAR_STORE/migrated-roll"
+mkdir -p "$ROLL_SOURCE/hooks" "$ROLL_SOURCE/skills" "$ROLL_TARGET/hooks" "$ROLL_TARGET/skills"
+printf 'new hook\n' > "$ROLL_SOURCE/hooks/entry"
+printf 'new skill\n' > "$ROLL_SOURCE/skills/entry"
+printf 'old hook\n' > "$ROLL_TARGET/hooks/entry"
+printf 'old skill\n' > "$ROLL_TARGET/skills/entry"
+assert_exit "store publication failure rolls back every activated path" 1 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; ihar_store_migration_move() { if [[ \"\$1\" == */.ihar-store-migrate-stage-*/skills && \"\$2\" == '$ROLL_TARGET/skills' ]]; then return 1; fi; command mv -- \"\$@\"; }; IHAR_LEGACY_STORE='$ROLL_SOURCE' IHAR_ROOT='$ROOT' IHAR_STORE='$ROLL_TARGET' ihar_store_migrate"
+assert_eq "publication rollback restores old hooks" "old hook" "$(cat "$ROLL_TARGET/hooks/entry")"
+assert_eq "publication rollback restores old skills" "old skill" "$(cat "$ROLL_TARGET/skills/entry")"
+
+incomplete_status=0
+incomplete_out="$(bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; ihar_store_migration_move() { if [[ \"\$1\" == */.ihar-store-migrate-stage-*/skills && \"\$2\" == '$ROLL_TARGET/skills' ]]; then return 1; fi; if [[ \"\$1\" == */.ihar-store-migrate-backup-*/hooks && \"\$2\" == '$ROLL_TARGET/hooks' ]]; then return 1; fi; command mv -- \"\$@\"; }; IHAR_LEGACY_STORE='$ROLL_SOURCE' IHAR_ROOT='$ROOT' IHAR_STORE='$ROLL_TARGET' ihar_store_migrate" 2>&1)" \
+  || incomplete_status=$?
+assert_eq "incomplete store rollback is fail-closed" "3" "$incomplete_status"
+assert_contains "incomplete rollback reports retained recovery backup" \
+  "$incomplete_out" "recovery backup retained at"
+recovery_store_backup="$(sed -n 's/.*recovery backup retained at //p' <<<"$incomplete_out" | tail -1)"
+assert_exit "incomplete rollback preserves recoverable old hooks" 0 \
+  test -f "$recovery_store_backup/hooks/entry"
 
 # --- a stub release, and a stub fetcher that serves it --------------------------------
 

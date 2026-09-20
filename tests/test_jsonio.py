@@ -59,8 +59,8 @@ CHECK_RESULT = {
     "masking": {"level": "standard", "floor": "standard", "engine": "regex", "dropped_env": ["TOKEN"]},
     "gateway": {"mode": "explicit", "network_policy": "protected", "instances": ["abc port 1234"]},
     "vendors": {
-        "claude": {"receipt": "valid", "hooks": "enforced", "conformance": "proven", "capabilities": ["fork", "remote-control"]},
-        "codex": {"receipt": "missing", "hooks": "enforced", "conformance": "unproven", "capabilities": ["archive", "fork"]},
+        "claude": {"receipt": "valid", "hooks": [{"id": "security-pretool", "trust": "configured"}], "conformance": "proven", "capabilities": ["fork", "remote-control"]},
+        "codex": {"receipt": "missing", "hooks": [{"id": "security-pretool", "trust": "recorded"}], "conformance": "unproven", "capabilities": ["archive", "fork"]},
     },
     "assets": [{"requirement": "optional", "presence": "missing", "source": "commands", "target": "commands"}],
     "mcp": {"strict": True, "notes": {"claude": ["missing TOKEN"], "codex": []}},
@@ -307,7 +307,7 @@ def test_check_result_text_and_json_render_the_same_facts():
     jsonio.check("check-result", json.loads(encoded))
     for value in (
         "protected", "masked model egress", "standard", "explicit", "valid", "missing",
-        "commands", "enforced", "missing TOKEN", "claude-agent-acp #144",
+        "commands", "security-pretool", "recorded", "missing TOKEN", "claude-agent-acp #144",
     ):
         assert value in rendered, value
         assert value in encoded, value

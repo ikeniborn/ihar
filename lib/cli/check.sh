@@ -19,6 +19,19 @@ ihar_check_conformance_status() { # <vendor> <binary>
   fi
 }
 
+_ihar_check_config_hash() { # <vendor>
+  local vendor="$1"
+  ihar_config_hash \
+    "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
+    "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
+    "$(ihar_manifest_digest)" "$(ihar_registry_digest)" "$(ihar_vendor_version "$vendor")"
+}
+
+_ihar_check_runtime() { # <vendor> [state]
+  local vendor="$1" state="${2:-$(_ihar_project_state)}"
+  printf '%s/r/%s/%s\n' "$state" "$(_ihar_check_config_hash "$vendor")" "$vendor"
+}
+
 # ihar_check_collect <target-json> — gather every fact exactly once.
 ihar_check_collect() {
   local target="$1" vendor binary capabilities notes
@@ -39,9 +52,9 @@ ihar_check_collect() {
     printf -v "_IHAR_CHECK_${vendor^^}_CAPABILITIES" '%s' "$capabilities"
     printf -v "_IHAR_CHECK_${vendor^^}_RECEIPT" '%s' \
       "$(ihar_check_receipt_status "$vendor" "$binary")"
-    printf -v "_IHAR_CHECK_${vendor^^}_HOOKS" '%s' "$IHAR_PROFILE_HOOKS"
     printf -v "_IHAR_CHECK_${vendor^^}_CONFORMANCE" '%s' \
       "$(ihar_check_conformance_status "$vendor" "$binary")"
+    printf -v "_IHAR_CHECK_${vendor^^}_RUNTIME" '%s' "$(_ihar_check_runtime "$vendor")"
     printf -v "_IHAR_CHECK_MCP_${vendor^^}" '%s' "$notes"
   done
 
@@ -49,22 +62,12 @@ ihar_check_collect() {
   export IHAR_GATEWAY_MASKING_LEVEL IHAR_PROFILE_GATEWAY IHAR_PROFILE_NETPOLICY
   export IHAR_PROFILE_MCP_STRICT _IHAR_CHECK_MASK_ENGINE _IHAR_CHECK_DROPPED_ENV
   export _IHAR_CHECK_GATEWAY_INSTANCES _IHAR_CHECK_ASSETS _IHAR_CHECK_KNOWN_GAPS
+  _IHAR_CHECK_MANIFEST="$IHAR_ROOT/manifests/hooks.json"; export _IHAR_CHECK_MANIFEST
   export _IHAR_CHECK_CLAUDE_CAPABILITIES _IHAR_CHECK_CLAUDE_RECEIPT
-  export _IHAR_CHECK_CLAUDE_HOOKS _IHAR_CHECK_CLAUDE_CONFORMANCE _IHAR_CHECK_MCP_CLAUDE
+  export _IHAR_CHECK_CLAUDE_RUNTIME _IHAR_CHECK_CLAUDE_CONFORMANCE _IHAR_CHECK_MCP_CLAUDE
   export _IHAR_CHECK_CODEX_CAPABILITIES _IHAR_CHECK_CODEX_RECEIPT
-  export _IHAR_CHECK_CODEX_HOOKS _IHAR_CHECK_CODEX_CONFORMANCE _IHAR_CHECK_MCP_CODEX
+  export _IHAR_CHECK_CODEX_RUNTIME _IHAR_CHECK_CODEX_CONFORMANCE _IHAR_CHECK_MCP_CODEX
   ihar_python ihar.check_result collect "$target"
-}
-
-_ihar_check_active_runtime() { # <vendor>
-  local vendor="$1" state runtime newest=""
-  state="$(_ihar_project_state)"
-  [[ -n "$state" ]] || return 0
-  for runtime in "$state"/r/*/"$vendor"; do
-    [[ -d "$runtime" ]] || continue
-    if [[ -z "$newest" || "$runtime" -nt "$newest" ]]; then newest="$runtime"; fi
-  done
-  printf '%s\n' "$newest"
 }
 
 _ihar_check_file_matches() { # <desired> <active> <relative>
@@ -80,16 +83,27 @@ _ihar_check_file_matches() { # <desired> <active> <relative>
 # ihar_check_diff — compare temporary desired renders with active homes.
 ihar_check_diff() (
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
-  local temp state vendor desired active file relative found=false
+  local temp="" state vendor desired active file relative found=false gateway_key port
+  trap '[[ -z "$temp" ]] || rm -rf -- "$temp"' EXIT
   temp="$(mktemp -d "${TMPDIR:-/tmp}/ihar-check-diff-XXXXXX")" || return 1
   state="$(_ihar_project_state)"
   IHAR_STATE="$state"; export IHAR_STATE
   IHAR_GATEWAY_MODE="$IHAR_PROFILE_GATEWAY"; export IHAR_GATEWAY_MODE
-  IHAR_GATEWAY_ACTIVE_PORT="${IHAR_GATEWAY_ACTIVE_PORT:-0}"; export IHAR_GATEWAY_ACTIVE_PORT
+  case "$IHAR_PROFILE_GATEWAY" in
+    off) IHAR_GATEWAY_ACTIVE_PORT=0 ;;
+    explicit)
+      gateway_key="$(ihar_gateway_key)"
+      port="$(cat "$IHAR_STATE_ROOT/gw/$gateway_key/port" 2>/dev/null || true)"
+      [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) \
+        || ihar_die 3 "gateway configuration $gateway_key has no valid recorded port"
+      IHAR_GATEWAY_ACTIVE_PORT="$port"
+      ;;
+  esac
+  export IHAR_GATEWAY_ACTIVE_PORT
   for vendor in claude codex; do
     desired="$temp/$vendor"
     ihar_render_all "$vendor" "$desired"
-    active="$(_ihar_check_active_runtime "$vendor")"
+    active="$(_ihar_check_runtime "$vendor" "$state")"
     while IFS= read -r -d '' file; do
       relative="${file#"$desired"/}"
       if [[ -z "$active" || ! -f "$active/$relative" ]]; then
@@ -102,23 +116,22 @@ ihar_check_diff() (
     done < <(find "$desired" -type f -print0 | sort -z)
   done
   [[ "$found" == true ]] || printf 'no differences\n'
-  rm -rf -- "$temp"
 )
 
-ihar_cmd_check() {
+ihar_cmd_check() (
+  local result=""
+  trap '[[ -z "$result" ]] || rm -f -- "$result"' EXIT
   if [[ "$IHAR_FLAG_CONFORMANCE" == true ]]; then
     if [[ "$IHAR_FLAG_JSON" == true ]]; then ihar_cmd_conformance >/dev/null; else ihar_cmd_conformance; fi
   fi
   if [[ "$IHAR_FLAG_DIFF" == true ]]; then ihar_check_diff; return $?; fi
-  local result
   result="$(mktemp "${TMPDIR:-/tmp}/ihar-check-result-XXXXXX.json")" || return 1
-  ihar_check_collect "$result"
+  ihar_check_collect "$result" || return $?
   local status=0
   if [[ "$IHAR_FLAG_JSON" == true ]]; then
     ihar_python ihar.check_result json "$result" || status=$?
   else
     ihar_python ihar.check_result text "$result" || status=$?
   fi
-  rm -f -- "$result"
   return "$status"
-}
+)

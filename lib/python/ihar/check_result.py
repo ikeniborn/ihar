@@ -30,8 +30,9 @@ def render_text(result: dict) -> str:
     lines.extend(f"             {item}" for item in result["gateway"]["instances"])
     for vendor in ("claude", "codex"):
         item = result["vendors"][vendor]
+        hooks = ", ".join(f"{hook['id']}={hook['trust']}" for hook in item["hooks"]) or "none"
         lines.append(
-            f"{vendor:<12} receipt {item['receipt']}; hooks {item['hooks']}; "
+            f"{vendor:<12} receipt {item['receipt']}; hooks {hooks}; "
             f"conformance {item['conformance']}"
         )
         lines.append(f"             capabilities {', '.join(item['capabilities']) or 'none'}")
@@ -51,6 +52,60 @@ def _split_lines(name: str) -> list[str]:
     return [line for line in os.environ.get(name, "").splitlines() if line]
 
 
+def _hook_facts(vendor: str) -> list[dict[str, str]]:
+    """Report each selected hook's observed vendor trust state without probing it."""
+    manifest = jsonio.read("hook-manifest", os.environ["_IHAR_CHECK_MANIFEST"])
+    runtime = os.environ[f"_IHAR_CHECK_{vendor.upper()}_RUNTIME"]
+    config_name = "settings.json" if vendor == "claude" else "hooks.json"
+    try:
+        with open(os.path.join(runtime, config_name), encoding="utf-8") as handle:
+            rendered = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        rendered = {}
+
+    commands: set[str] = set()
+
+    def collect_commands(value: object) -> None:
+        if isinstance(value, dict):
+            command = value.get("command")
+            if isinstance(command, str):
+                commands.add(command)
+            for child in value.values():
+                collect_commands(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect_commands(child)
+
+    collect_commands(rendered)
+
+    codex_recorded = False
+    if vendor == "codex" and os.path.isfile(os.path.join(runtime, ".ihar-sealed")):
+        try:
+            with open(os.path.join(runtime, "config.toml"), encoding="utf-8") as handle:
+                codex_recorded = "# ihar:hook-trust:start" in handle.read()
+        except OSError:
+            pass
+
+    profile = os.environ["IHAR_PROFILE"]
+    facts = []
+    for entry in manifest["entries"]:
+        if vendor not in entry["vendors"]:
+            continue
+        if "*" not in entry["profiles"] and profile not in entry["profiles"]:
+            continue
+        home_var = "CLAUDE_CONFIG_DIR" if vendor == "claude" else "CODEX_HOME"
+        expected = f'python3 -I "${home_var}/hooks/{entry["script"]}"'
+        if entry["args"]:
+            expected += " " + " ".join(entry["args"])
+        expected += f" --vendor {vendor}"
+        configured = expected in commands
+        trust = "unavailable"
+        if configured:
+            trust = "configured" if vendor == "claude" else ("recorded" if codex_recorded else "unavailable")
+        facts.append({"id": entry["id"], "trust": trust})
+    return sorted(facts, key=lambda item: item["id"])
+
+
 def _collect(target: str) -> None:
     assets = []
     for line in _split_lines("_IHAR_CHECK_ASSETS"):
@@ -64,7 +119,7 @@ def _collect(target: str) -> None:
         names = [name.replace("_", "-") for name, value in capabilities.items() if value is True]
         vendors[vendor] = {
             "receipt": os.environ[prefix + "RECEIPT"],
-            "hooks": os.environ[prefix + "HOOKS"],
+            "hooks": _hook_facts(vendor),
             "conformance": os.environ[prefix + "CONFORMANCE"],
             "capabilities": sorted(names),
         }

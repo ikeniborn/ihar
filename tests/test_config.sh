@@ -91,6 +91,8 @@ assert_exit "install alone accepts migrate-store" 0 \
   bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/cli/args.sh'; ihar_args_parse install --migrate-store; test \"\$IHAR_FLAG_MIGRATE_STORE\" = true"
 assert_exit "check rejects migrate-store" 2 \
   bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/cli/args.sh'; ihar_args_parse check --migrate-store"
+assert_exit "JSON diff is rejected instead of emitting text" 2 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/cli/args.sh'; ihar_args_parse --json check --diff; ihar_guard_undelivered"
 
 store_in_checkout="$(in_shell "unset IHAR_STORE
                                HOME=/tmp/home XDG_DATA_HOME= ihar_init '$ROOT/ihar.sh'

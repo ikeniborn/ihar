@@ -58,11 +58,49 @@ ihar_state_clean_orphans() {
 # given age. Project state under st/ is never touched: a runtime home rebuilds from
 # its configuration, a transcript does not.
 ihar_state_clean_runtimes() {
-  local days="${1:-30}" state="${2:-$IHAR_STATE}" dir removed=0
+  local days="${1:-30}" state="${2:-$IHAR_STATE}"
   [[ -d "$state/r" ]] || { printf '0\n'; return 0; }
-  while IFS= read -r -d '' dir; do
-    rm -rf "$dir"
+  ihar_with_lock --required "$state/.ihar.lock" "${IHAR_CLEAN_LOCK_TIMEOUT:-30}" \
+    _ihar_state_clean_runtimes_locked "$days" "$state"
+}
+
+_ihar_runtime_is_active() {
+  local runtime="$1" process environment
+  for process in /proc/[0-9]*; do
+    environment="$process/environ"
+    [[ -r "$environment" ]] || continue
+    if grep -zFqx "IHAR_RUNTIME=$runtime/claude" "$environment" 2>/dev/null \
+      || grep -zFqx "IHAR_RUNTIME=$runtime/codex" "$environment" 2>/dev/null \
+      || grep -zFqx "CLAUDE_CONFIG_DIR=$runtime/claude" "$environment" 2>/dev/null \
+      || grep -zFqx "CODEX_HOME=$runtime/codex" "$environment" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+_ihar_state_clean_runtimes_locked() {
+  local days="$1" state="$2" hash runtime expired removed=0
+  local -a removed_hashes=()
+  expired="$(ihar_python ihar.state_marker --expired-runtimes "$state/home.json" "$days")" \
+    || ihar_die 3 "cannot determine expired runtimes for $state"
+  while IFS= read -r hash; do
+    [[ -n "$hash" ]] || continue
+    [[ "$hash" =~ ^[0-9a-f]{8}$ ]] \
+      || ihar_die 3 "state marker returned invalid runtime hash '$hash'"
+    runtime="$state/r/$hash"
+    if [[ -d "$runtime" ]] && _ihar_runtime_is_active "$runtime"; then
+      continue
+    fi
+    if [[ -e "$runtime" ]] && ! rm -rf -- "$runtime"; then
+      ihar_die 3 "cannot remove expired runtime $hash"
+    fi
+    removed_hashes+=("$hash")
     removed=$((removed + 1))
-  done < <(find "$state/r" -mindepth 1 -maxdepth 1 -type d -mtime "+$days" -print0)
+  done <<<"$expired"
+  if (( ${#removed_hashes[@]} )); then
+    ihar_python ihar.state_marker --remove-runtimes "$state/home.json" "${removed_hashes[@]}" \
+      || ihar_die 3 "cannot update runtime inventory for $state"
+  fi
   printf '%s\n' "$removed"
 }

@@ -53,6 +53,16 @@ def read_root(path: str) -> int:
     return 0
 
 
+def validate_root(path: str) -> int:
+    """Validate a current ihar marker before an explicit cleanup target is used."""
+    try:
+        marker = jsonio.read("home-marker", path)
+    except (OSError, jsonio.SchemaError):
+        return 1
+    print(marker["project_root"])
+    return 0
+
+
 def record_migration(path: str, vendor: str, source: str) -> int:
     """Record one successfully copied legacy home in the project marker."""
     if vendor not in {"claude", "codex"} or not source:
@@ -67,11 +77,71 @@ def record_migration(path: str, vendor: str, source: str) -> int:
     return 0
 
 
+def touch_runtime(path: str, runtime_hash: str, profile: str, vendor: str) -> int:
+    """Record authoritative use of one configuration-keyed runtime."""
+    if vendor not in {"claude", "codex"}:
+        return 2
+    try:
+        marker = jsonio.read("home-marker", path)
+        now = _now()
+        current = marker["runtimes"].get(runtime_hash, {})
+        marker["runtimes"][runtime_hash] = {
+            "profile": profile,
+            "created": current.get("created", now),
+            "last_used": now,
+        }
+        marker["vendors"] = sorted(set(marker["vendors"]) | {vendor})
+        jsonio.write("home-marker", path, marker)
+    except (jsonio.SchemaError, OSError) as error:
+        print(f"ihar: cannot refresh runtime use in {path}: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def expired_runtimes(path: str, days: str) -> int:
+    """Print runtime hashes whose recorded last use predates the cutoff."""
+    try:
+        age = int(days)
+        if age < 0:
+            raise ValueError
+        marker = jsonio.read("home-marker", path)
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=age)
+        for runtime_hash, record in sorted(marker["runtimes"].items()):
+            last_used = datetime.datetime.fromisoformat(record["last_used"].replace("Z", "+00:00"))
+            if last_used < cutoff:
+                print(runtime_hash)
+    except (ValueError, jsonio.SchemaError, OSError) as error:
+        print(f"ihar: cannot read runtime ages from {path}: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def remove_runtimes(path: str, runtime_hashes: list[str]) -> int:
+    """Forget runtime records only after their directories were removed."""
+    try:
+        marker = jsonio.read("home-marker", path)
+        for runtime_hash in runtime_hashes:
+            marker["runtimes"].pop(runtime_hash, None)
+        jsonio.write("home-marker", path, marker)
+    except (jsonio.SchemaError, OSError) as error:
+        print(f"ihar: cannot update runtime inventory in {path}: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if len(argv) == 2 and argv[0] == "--read":
         return read_root(argv[1])
+    if len(argv) == 2 and argv[0] == "--validate-root":
+        return validate_root(argv[1])
     if len(argv) == 4 and argv[0] == "--record-migration":
         return record_migration(argv[1], argv[2], argv[3])
+    if len(argv) == 5 and argv[0] == "--touch-runtime":
+        return touch_runtime(argv[1], argv[2], argv[3], argv[4])
+    if len(argv) == 3 and argv[0] == "--expired-runtimes":
+        return expired_runtimes(argv[1], argv[2])
+    if len(argv) >= 3 and argv[0] == "--remove-runtimes":
+        return remove_runtimes(argv[1], argv[2:])
     if len(argv) != 2:
         print(__doc__, file=sys.stderr)
         return 2

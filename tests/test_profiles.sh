@@ -29,6 +29,8 @@ assert_exit "the failed transparent profile is unavailable" 2 \
 json_check="$(ihar --json check)"
 assert_eq "JSON check validates as a closed result" "standard" \
   "$(PYTHONPATH="$ROOT/lib/python" python3 -c 'import json,sys; from ihar import jsonio; print(jsonio.check("check-result", json.load(sys.stdin))["profile"]["name"])' <<<"$json_check")"
+assert_eq "JSON check carries per-hook trust facts" "True" \
+  "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(bool(d["vendors"]["claude"]["hooks"]) and all(set(x)=={"id","trust"} for x in d["vendors"]["claude"]["hooks"]+d["vendors"]["codex"]["hooks"]))' <<<"$json_check")"
 assert_contains "text and JSON check share the profile" "$(ihar check)" \
   "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["profile"]["name"])' <<<"$json_check")"
 
@@ -38,12 +40,35 @@ CHECK_STATE="$IHAR_STATE_ROOT/$(printf '%s' "$PROJECT" | sha256sum | cut -c1-8)"
 mkdir -p "$CHECK_STATE/r/deadbeef/claude" "$CHECK_STATE/r/deadbeef/codex"
 printf 'different\n' > "$CHECK_STATE/r/deadbeef/claude/settings.json"
 printf 'different\n' > "$CHECK_STATE/r/deadbeef/codex/config.toml"
-check_fingerprint() { find "$IHAR_STORE" "$IHAR_STATE_ROOT" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1; }
+check_fingerprint() {
+  { find "$IHAR_STORE" "$IHAR_STATE_ROOT" -printf '%y\t%m\t%P\t%l\n' | sort
+    find "$IHAR_STORE" "$IHAR_STATE_ROOT" -type f -print0 | sort -z | xargs -0 -r sha256sum; } | sha256sum | cut -d' ' -f1
+}
 before_check="$(check_fingerprint)"
 diff_out="$(ihar check --diff)"
 assert_contains "diff names Claude relative path" "$diff_out" "claude settings.json"
 assert_contains "diff names Codex relative path" "$diff_out" "codex config.toml"
 assert_eq "diff leaves persistent files unchanged" "$before_check" "$(check_fingerprint)"
+
+EVIDENCE="$IHAR_TEST_TMP/conformance-called"
+PY_WRAPPER="$IHAR_TEST_TMP/check-python"
+VENDOR_STUB="$IHAR_TEST_TMP/vendor-stub"
+cat > "$PY_WRAPPER" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"ihar.conformance.run"* ]]; then : > "$IHAR_TEST_EVIDENCE"; exit 0; fi
+exec python3 "$@"
+EOF
+printf '#!/usr/bin/env bash\necho vendor 1.0\n' > "$VENDOR_STUB"
+chmod +x "$PY_WRAPPER" "$VENDOR_STUB"
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
+  IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$VENDOR_STUB" ihar check >/dev/null
+assert_exit "plain check does not run conformance" 1 test -e "$EVIDENCE"
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
+  IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$VENDOR_STUB" ihar check --diff >/dev/null
+assert_exit "diff does not run conformance" 1 test -e "$EVIDENCE"
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
+  IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$VENDOR_STUB" ihar check --conformance >/dev/null
+assert_exit "only conformance mode invokes live evidence" 0 test -e "$EVIDENCE"
 
 # --- the masking floor may be tightened, never loosened ------------------------------
 #
@@ -93,6 +118,10 @@ source "$ROOT/lib/core/init.sh"
 IHAR_ROOT="$ROOT"; export IHAR_ROOT
 source "$ROOT/lib/state/runtime.sh"
 source "$ROOT/lib/render/config.sh"
+source "$ROOT/lib/render/hooks.sh"
+source "$ROOT/lib/codex/daemon.sh"
+source "$ROOT/lib/cli/commands.sh"
+IHAR_CODEX_BIN="$IHAR_TEST_TMP/missing-codex"; export IHAR_CODEX_BIN
 
 render_codex() { # <sandbox> [approval]
   local dir="$IHAR_TEST_TMP/render-$RANDOM"
@@ -236,5 +265,59 @@ assert_exit "a different masking level keys a different one" 1 test "$key_a" = "
 key_d="$(IHAR_PROFILE_GATEWAY=explicit IHAR_GATEWAY_MASKING_LEVEL=standard \
          IHAR_GATEWAY_ENGINE=regex ihar_gateway_key)"
 assert_exit "so does a different engine" 1 test "$key_a" = "$key_d"
+
+# Diff selects the exact desired configuration hash and the gateway port recorded
+# for the real gateway key. A newer unrelated runtime must not be compared.
+source "$ROOT/lib/render/hooks.sh"
+source "$ROOT/lib/store/lockfile.sh"
+source "$ROOT/lib/cli/commands.sh"
+IHAR_LOCKFILE="$ROOT/.ihar-lockfile.json"; export IHAR_LOCKFILE
+IHAR_PROJECT_ROOT="$PROJECT"; export IHAR_PROJECT_ROOT
+IHAR_STATE="$CHECK_STATE"; export IHAR_STATE
+IHAR_FLAG_PROFILE=protected
+ihar_profile_resolve protected
+gateway_key="$(ihar_gateway_key)"
+mkdir -p "$IHAR_STATE_ROOT/gw/$gateway_key"
+printf '41234\n' > "$IHAR_STATE_ROOT/gw/$gateway_key/port"
+IHAR_GATEWAY_MODE=explicit IHAR_GATEWAY_ACTIVE_PORT=41234
+export IHAR_GATEWAY_MODE IHAR_GATEWAY_ACTIVE_PORT
+hooks_digest="$(ihar_manifest_digest)"
+registry_digest="$(ihar_registry_digest)"
+for vendor in claude codex; do
+  expected_hash="$(ihar_config_hash \
+    "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
+    "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
+    "$hooks_digest" "$registry_digest" "$(ihar_vendor_version "$vendor")")"
+  expected_render="$IHAR_TEST_TMP/expected-$vendor"
+  ihar_render_all "$vendor" "$expected_render"
+  mkdir -p "$CHECK_STATE/r/$expected_hash/$vendor"
+  cp -R "$expected_render/." "$CHECK_STATE/r/$expected_hash/$vendor/"
+done
+mkdir -p "$CHECK_STATE/r/ffffffff/claude" "$CHECK_STATE/r/ffffffff/codex"
+printf 'wrong newest\n' > "$CHECK_STATE/r/ffffffff/claude/settings.json"
+printf 'wrong newest\n' > "$CHECK_STATE/r/ffffffff/codex/config.toml"
+touch "$CHECK_STATE/r/ffffffff"
+exact_diff="$(ihar --profile protected check --diff)"
+assert_eq "diff uses exact desired runtime and real gateway inputs" "no differences" "$exact_diff"
+
+FAIL_TMP="$IHAR_TEST_TMP/check-failure-temp"
+FAIL_PY="$IHAR_TEST_TMP/fail-check-python"
+mkdir -p "$FAIL_TMP"
+cat > "$FAIL_PY" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"ihar.render.hooks"* || "$*" == *"ihar.check_result collect"* ]]; then exit 3; fi
+exec python3 "$@"
+EOF
+chmod +x "$FAIL_PY"
+assert_exit "failed diff reports render failure" 3 \
+  env TMPDIR="$FAIL_TMP" IHAR_PY="$FAIL_PY" IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
+  bash -c "cd '$PROJECT'; '$ROOT/ihar.sh' check --diff"
+assert_exit "failed diff removes temporary render directories" 1 \
+  compgen -G "$FAIL_TMP/ihar-check-diff-*"
+assert_exit "failed collection reports validation failure" 3 \
+  env TMPDIR="$FAIL_TMP" IHAR_PY="$FAIL_PY" IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
+  bash -c "cd '$PROJECT'; '$ROOT/ihar.sh' check"
+assert_exit "failed collection removes temporary result files" 1 \
+  compgen -G "$FAIL_TMP/ihar-check-result-*"
 
 finish

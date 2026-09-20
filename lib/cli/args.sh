@@ -51,6 +51,9 @@ running now would report success while doing nothing"
   fi
 
   if [[ "$IHAR_FLAG_JSON" == true ]]; then
+    if [[ "$IHAR_COMMAND" == check && "$IHAR_FLAG_DIFF" == true ]]; then
+      ihar_die 2 "--json is not supported with 'ihar check --diff'"
+    fi
     case "$IHAR_COMMAND:${IHAR_SUBCOMMAND:-list}" in
       check:*|sessions:list|daemon:status|daemon:stop|daemon:restart) ;;
       *) ihar_die 2 "--json is not supported by 'ihar $IHAR_COMMAND${IHAR_SUBCOMMAND:+ $IHAR_SUBCOMMAND}'" ;;

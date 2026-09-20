@@ -716,13 +716,45 @@ mkdir -p "$NAMED_PROJECT"
 NAMED_STATE="$(ihar_state_setup "$NAMED_PROJECT")"
 NAMED_ID="$(basename "$NAMED_STATE")"
 ORPHAN_STATE="$IHAR_STATE_ROOT/orphan-kept"
-mkdir -p "$CURRENT_STATE/r/old/claude" "$CURRENT_STATE/st/claude" \
-  "$NAMED_STATE/r/old/codex" "$NAMED_STATE/st/codex" "$ORPHAN_STATE/r/old/claude"
-touch -d '60 days ago' "$CURRENT_STATE/r/old" "$NAMED_STATE/r/old" "$ORPHAN_STATE/r/old"
+CURRENT_OLD=aaaaaaaa
+NAMED_OLD=bbbbbbbb
+ACTIVE_OLD=cccccccc
+RECENT_RUNTIME=dddddddd
+REUSE_RUNTIME=eeeeeeee
+mkdir -p "$CURRENT_STATE/r/$CURRENT_OLD/claude" "$CURRENT_STATE/st/claude" \
+  "$NAMED_STATE/r/$NAMED_OLD/codex" "$NAMED_STATE/st/codex" \
+  "$CURRENT_STATE/r/$ACTIVE_OLD/claude" "$CURRENT_STATE/r/$RECENT_RUNTIME/codex" \
+  "$CURRENT_STATE/r/$REUSE_RUNTIME/claude" "$ORPHAN_STATE/r/ffffffff/claude"
+touch -d '60 days ago' "$CURRENT_STATE/r/$RECENT_RUNTIME"
+python3 - "$CURRENT_STATE/home.json" "$NAMED_STATE/home.json" <<'PY'
+import json, sys
+old = "2020-01-01T00:00:00Z"
+recent = "2099-01-01T00:00:00Z"
+for path, records in (
+    (sys.argv[1], {"aaaaaaaa": old, "cccccccc": old, "dddddddd": recent, "eeeeeeee": old}),
+    (sys.argv[2], {"bbbbbbbb": old}),
+):
+    marker = json.load(open(path, encoding="utf-8"))
+    for runtime_hash, used in records.items():
+        marker["runtimes"][runtime_hash] = {"profile": "standard", "created": old, "last_used": used}
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(marker, handle)
+PY
 printf 'current\n' > "$CURRENT_STATE/st/claude/sentinel"
 printf 'named\n' > "$NAMED_STATE/st/codex/sentinel"
+
+IHAR_STATE="$CURRENT_STATE"
+reuse_before="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtimes"]["eeeeeeee"]["last_used"])' "$CURRENT_STATE/home.json")"
+ihar_runtime_materialise claude "$REUSE_RUNTIME" "" writable >/dev/null
+reuse_after="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtimes"]["eeeeeeee"]["last_used"])' "$CURRENT_STATE/home.json")"
+assert_exit "runtime reuse refreshes authoritative last_used" 1 test "$reuse_before" = "$reuse_after"
+
+IHAR_RUNTIME="$CURRENT_STATE/r/$ACTIVE_OLD/claude" sleep 30 &
+active_runtime_pid=$!
 assert_exit "clean current runtimes" 0 \
   bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean"
+kill "$active_runtime_pid" 2>/dev/null || true
+wait "$active_runtime_pid" 2>/dev/null || true
 assert_exit "clean exact state runtimes" 0 \
   bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$NAMED_ID'"
 assert_exit "unknown state id is usage" 2 \
@@ -730,8 +762,47 @@ assert_exit "unknown state id is usage" 2 \
 assert_exit "current persistent state survives" 0 test -f "$CURRENT_STATE/st/claude/sentinel"
 assert_exit "named persistent state survives" 0 test -f "$NAMED_STATE/st/codex/sentinel"
 assert_exit "orphan state survives" 0 test -d "$ORPHAN_STATE"
-assert_exit "current expired runtime is removed" 1 test -d "$CURRENT_STATE/r/old"
-assert_exit "named expired runtime is removed" 1 test -d "$NAMED_STATE/r/old"
+assert_exit "current expired runtime is removed by marker age" 1 test -d "$CURRENT_STATE/r/$CURRENT_OLD"
+assert_exit "named expired runtime is removed by marker age" 1 test -d "$NAMED_STATE/r/$NAMED_OLD"
+assert_exit "active expired runtime survives" 0 test -d "$CURRENT_STATE/r/$ACTIVE_OLD"
+assert_exit "recent marker runtime survives old directory mtime" 0 test -d "$CURRENT_STATE/r/$RECENT_RUNTIME"
+assert_eq "deleted runtime is removed from marker" "False" \
+  "$(python3 -c 'import json,sys; print("aaaaaaaa" in json.load(open(sys.argv[1]))["runtimes"])' "$CURRENT_STATE/home.json")"
+
+LOCKED_PROJECT="$IHAR_TEST_TMP/locked-clean-project"
+mkdir -p "$LOCKED_PROJECT"
+LOCKED_STATE="$(ihar_state_setup "$LOCKED_PROJECT")"
+LOCKED_ID="$(basename "$LOCKED_STATE")"
+lock_ready="$IHAR_TEST_TMP/clean-lock-ready"
+bash -c 'exec {fd}>"$1/.ihar.lock"; flock -x "$fd"; : > "$2"; sleep 30' _ \
+  "$LOCKED_STATE" "$lock_ready" &
+clean_lock_pid=$!
+while [[ ! -e "$lock_ready" ]]; do :; done
+assert_exit "runtime cleanup requires the state lock" 3 \
+  bash -c "cd '$PROJECT'; IHAR_CLEAN_LOCK_TIMEOUT=1 IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$LOCKED_ID'"
+kill "$clean_lock_pid" 2>/dev/null || true
+wait "$clean_lock_pid" 2>/dev/null || true
+
+COLLISION_PROJECT="$IHAR_TEST_TMP/collision-project"
+mkdir -p "$COLLISION_PROJECT"
+COLLISION_ID="$(ihar_home_id "$COLLISION_PROJECT")"
+COLLISION_STATE="$IHAR_STATE_ROOT/$COLLISION_ID"
+mkdir -p "$COLLISION_STATE/r/11111111/claude"
+python3 - "$COLLISION_STATE/home.json" <<'PY'
+import json, sys
+json.dump({"schema":3,"project_root":"/different/project","created":"2020-01-01T00:00:00Z","vendors":[],"runtimes":{"11111111":{"profile":"standard","created":"2020-01-01T00:00:00Z","last_used":"2020-01-01T00:00:00Z"}},"migrated_from":{}}, open(sys.argv[1], "w", encoding="utf-8"))
+PY
+assert_exit "current cleanup rejects a colliding project marker" 2 \
+  bash -c "cd '$COLLISION_PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean"
+assert_exit "collision rejection preserves its runtime" 0 test -d "$COLLISION_STATE/r/11111111"
+
+MALFORMED_ID=22222222
+MALFORMED_STATE="$IHAR_STATE_ROOT/$MALFORMED_ID"
+mkdir -p "$MALFORMED_STATE/r/33333333/claude"
+printf 'broken\n' > "$MALFORMED_STATE/home.json"
+assert_exit "named cleanup rejects a malformed marker" 2 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$MALFORMED_ID'"
+assert_exit "malformed marker rejection preserves its runtime" 0 test -d "$MALFORMED_STATE/r/33333333"
 
 # A state without a readable marker is unattributable, not unwanted.
 NOMARKER="$IHAR_STATE_ROOT/no-marker-000000000000"

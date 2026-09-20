@@ -48,6 +48,7 @@ _ihar_runtime_materialise() {
     # files first so configuration drift still fails closed, then run the state-only
     # verifier: store links are outside this reuse contract.
     ihar_verify_runtime_state_links "$vendor" "$runtime" "$IHAR_STATE" || return
+    _ihar_runtime_touch_marker "$vendor" "$hash"
     return 0
   fi
 
@@ -71,6 +72,7 @@ _ihar_runtime_materialise() {
     rm -rf "$staging"
     [[ -d "$runtime" ]] || ihar_die 1 "cannot publish the runtime home at $runtime"
     _ihar_runtime_verify "$runtime" "$render"
+    _ihar_runtime_touch_marker "$vendor" "$hash"
     return 0
   fi
   rm -rf "$staging"
@@ -84,6 +86,15 @@ _ihar_runtime_materialise() {
   fi
 
   _ihar_runtime_freeze "$runtime" "$render" "$mode"
+  _ihar_runtime_touch_marker "$vendor" "$hash"
+}
+
+_ihar_runtime_touch_marker() {
+  local vendor="$1" hash="$2"
+  [[ -f "$IHAR_STATE/home.json" ]] || return 0
+  ihar_python ihar.state_marker --touch-runtime \
+    "$IHAR_STATE/home.json" "$hash" "${IHAR_PROFILE:-standard}" "$vendor" \
+    || ihar_die 3 "cannot refresh authoritative runtime use for $hash"
 }
 
 # _ihar_runtime_freeze <runtime> <render> <mode> — seal what ihar rendered, and only

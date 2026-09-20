@@ -257,15 +257,18 @@ ihar_cmd_homes() {
         clean_state="$IHAR_STATE_ROOT/$clean_id"
         [[ -d "$clean_state" && -f "$clean_state/home.json" ]] \
           || ihar_die 2 "unknown state id '$clean_id'"
-        ihar_python ihar.state_marker --read "$clean_state/home.json" >/dev/null 2>&1 \
+        ihar_python ihar.state_marker --validate-root "$clean_state/home.json" >/dev/null 2>&1 \
           || ihar_die 2 "state id '$clean_id' has an invalid marker"
       else
         clean_state="$IHAR_STATE_ROOT/$(ihar_home_id "$IHAR_PROJECT_ROOT")"
         if [[ ! -d "$clean_state" ]]; then printf '0\n'; return 0; fi
         [[ -f "$clean_state/home.json" ]] \
           || ihar_die 2 "current state has no valid marker"
-        ihar_python ihar.state_marker --read "$clean_state/home.json" >/dev/null 2>&1 \
+        local marker_root
+        marker_root="$(ihar_python ihar.state_marker --validate-root "$clean_state/home.json" 2>/dev/null)" \
           || ihar_die 2 "current state has an invalid marker"
+        [[ "$marker_root" == "$IHAR_PROJECT_ROOT" ]] \
+          || ihar_die 2 "current state marker belongs to '$marker_root', not '$IHAR_PROJECT_ROOT'"
       fi
       ihar_state_clean_runtimes 30 "$clean_state"
       ;;

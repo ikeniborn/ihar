@@ -5,7 +5,7 @@ IHAR_STORE_MIGRATION_LOCK_FDS=()
 
 _ihar_store_legacy_sources() {
   if [[ -n "${IHAR_LEGACY_STORE:-}" ]]; then
-    printf '%s\n' "$IHAR_LEGACY_STORE"
+    tr ':' '\n' <<<"$IHAR_LEGACY_STORE"
     return 0
   fi
   local parent
@@ -14,9 +14,29 @@ _ihar_store_legacy_sources() {
   [[ -d "$parent/icodex/.codex-isolated" ]] && printf '%s\n' "$parent/icodex/.codex-isolated"
 }
 
+ihar_store_migration_move() {
+  command mv -- "$@"
+}
+
 _ihar_store_migration_entries() {
   ihar_asset_store_roots
   printf 'install-receipt.json\n'
+}
+
+_ihar_store_full_fingerprint() { # <root> <entry>...
+  local root="$1" entry regular metadata; shift
+  regular="$(ihar_python ihar.migration_fingerprint "$root" "$@")" || return 1
+  metadata="$(
+    set -o pipefail
+    cd "$root" || exit 1
+    {
+      for entry in "$@"; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        find -P "$entry" -printf '%y\0%m\0%s\0%T@\0%p\0%l\0'
+      done
+    } | sort -z | sha256sum | cut -d' ' -f1
+  )" || return 1
+  printf '%s\0%s\n' "$regular" "$metadata" | sha256sum | cut -d' ' -f1
 }
 
 _ihar_store_source_writer_pid() { # <source>
@@ -58,7 +78,7 @@ _ihar_store_acquire_source_locks() { # sources...
 }
 
 _ihar_store_publish_stage() { # <stage>
-  local stage="$1" backup name status=0 index
+  local stage="$1" backup name status=0 rollback_status=0 index published_index
   local -a names=() published=() had_old=()
   backup="$(mktemp -d "$(dirname "$IHAR_STORE")/.ihar-store-migrate-backup-XXXXXX")" || return 1
   while IFS= read -r name; do
@@ -70,51 +90,64 @@ _ihar_store_publish_stage() { # <stage>
     mkdir -p "$(dirname "$backup/$name")" "$(dirname "$IHAR_STORE/$name")"
     had_old+=(0)
     if [[ -e "$IHAR_STORE/$name" || -L "$IHAR_STORE/$name" ]]; then
-      mv -- "$IHAR_STORE/$name" "$backup/$name" || { status=$?; break; }
+      ihar_store_migration_move "$IHAR_STORE/$name" "$backup/$name" \
+        || { status=$?; break; }
       had_old[index]=1
     fi
     published+=("$index")
-    mv -- "$stage/$name" "$IHAR_STORE/$name" || { status=$?; break; }
+    ihar_store_migration_move "$stage/$name" "$IHAR_STORE/$name" \
+      || { status=$?; break; }
   done
   if (( status != 0 )); then
     for ((index=${#published[@]} - 1; index >= 0; index--)); do
-      name="${names[${published[$index]}]}"
-      rm -rf -- "$IHAR_STORE/$name"
-      if [[ "${had_old[${published[$index]}]}" == 1 ]]; then
+      published_index="${published[$index]}"
+      name="${names[$published_index]}"
+      rm -rf -- "$IHAR_STORE/$name" || rollback_status=3
+      if [[ "${had_old[$published_index]}" == 1 ]]; then
         mkdir -p "$(dirname "$IHAR_STORE/$name")"
-        mv -- "$backup/$name" "$IHAR_STORE/$name" || status=3
+        ihar_store_migration_move "$backup/$name" "$IHAR_STORE/$name" \
+          || rollback_status=3
       fi
     done
+    if (( rollback_status != 0 )); then
+      ihar_warn "store migration rollback incomplete; recovery backup retained at $backup"
+      return 3
+    fi
   fi
   rm -rf -- "$backup"
   return "$status"
 }
 
 _ihar_store_migrate_locked() {
-  local source stage source_before source_after staged writer status=0 entry
-  local -a sources=() entries=()
+  local source source_stage combined source_before source_after source_copy staged writer status=0 entry
+  local source_path target_path
+  local -a sources=() entries=() source_stages=() source_fingerprints=()
   while IFS= read -r source; do [[ -n "$source" && -d "$source" ]] && sources+=("$source"); done \
     < <(_ihar_store_legacy_sources)
   (( ${#sources[@]} )) || return 0
   while IFS= read -r entry; do [[ -n "$entry" ]] && entries+=("$entry"); done \
     < <(_ihar_store_migration_entries)
   _ihar_store_acquire_source_locks "${sources[@]}" || return $?
+  combined="$(mktemp -d "$(dirname "$IHAR_STORE")/.ihar-store-migrate-stage-XXXXXX")" \
+    || status=1
   for source in "${sources[@]}"; do
+    (( status == 0 )) || break
     if writer="$(_ihar_store_source_writer_pid "$source")"; then
       ihar_warn "legacy store $source is active in process $writer"
       status=3
       break
     fi
-    source_before="$(ihar_python ihar.migration_fingerprint "$source" "${entries[@]}")" \
+    source_before="$(_ihar_store_full_fingerprint "$source" "${entries[@]}")" \
       || { status=3; break; }
-    stage="$(mktemp -d "$(dirname "$IHAR_STORE")/.ihar-store-migrate-stage-XXXXXX")" \
+    source_fingerprints+=("$source_before")
+    source_stage="$(mktemp -d "$(dirname "$IHAR_STORE")/.ihar-store-source-stage-XXXXXX")" \
       || { status=1; break; }
-    local source_path target_path
+    source_stages+=("$source_stage")
     for entry in "${entries[@]}"; do
       [[ -e "$source/$entry" && ! -L "$source/$entry" ]] || continue
-      mkdir -p "$(dirname "$stage/$entry")"
+      mkdir -p "$(dirname "$source_stage/$entry")"
       source_path="$source/$entry"
-      target_path="$stage/$entry"
+      target_path="$source_stage/$entry"
       if [[ -d "$source_path" ]]; then
         mkdir -p "$target_path"
         source_path="$source_path/"
@@ -123,30 +156,55 @@ _ihar_store_migrate_locked() {
       if ! rsync -a --no-links --no-specials --no-devices \
         "$source_path" "$target_path" >/dev/null 2>&1; then status=3; break; fi
     done
-    source_after="$(ihar_python ihar.migration_fingerprint "$source" "${entries[@]}")" \
+    source_after="$(_ihar_store_full_fingerprint "$source" "${entries[@]}")" \
       || status=3
-    staged="$(ihar_python ihar.migration_fingerprint "$stage" "${entries[@]}")" \
+    source_copy="$(ihar_python ihar.migration_fingerprint "$source" "${entries[@]}")" \
       || status=3
-    if (( status != 0 )) || [[ "$source_before" != "$source_after" || "$source_after" != "$staged" ]]; then
-      rm -rf -- "$stage"
+    staged="$(ihar_python ihar.migration_fingerprint "$source_stage" "${entries[@]}")" \
+      || status=3
+    if (( status != 0 )) || [[ "$source_before" != "$source_after" || "$source_copy" != "$staged" ]]; then
       ihar_warn "legacy store $source changed during migration; staged copy discarded"
       status=3
       break
     fi
     if writer="$(_ihar_store_source_writer_pid "$source")"; then
-      rm -rf -- "$stage"
       ihar_warn "legacy store $source became active in process $writer; staged copy discarded"
       status=3
       break
     fi
-    if [[ -f "$stage/install-receipt.json" ]]; then
-      ihar_python ihar.check_result validate-receipt "$stage/install-receipt.json" \
-        || { rm -rf -- "$stage"; status=3; break; }
+    if [[ -f "$source_stage/install-receipt.json" ]]; then
+      ihar_python ihar.check_result validate-receipt "$source_stage/install-receipt.json" \
+        || { status=3; break; }
     fi
-    _ihar_store_publish_stage "$stage" || status=$?
-    rm -rf -- "$stage"
-    (( status == 0 )) || break
   done
+  if (( status == 0 )); then
+    local index final_fingerprint
+    for index in "${!sources[@]}"; do
+      source="${sources[$index]}"
+      final_fingerprint="$(_ihar_store_full_fingerprint "$source" "${entries[@]}")" \
+        || { status=3; break; }
+      if [[ "$final_fingerprint" != "${source_fingerprints[$index]}" ]]; then
+        ihar_warn "legacy store $source changed after staging; all staged copies discarded"
+        status=3
+        break
+      fi
+      if writer="$(_ihar_store_source_writer_pid "$source")"; then
+        ihar_warn "legacy store $source became active in process $writer; all staged copies discarded"
+        status=3
+        break
+      fi
+    done
+  fi
+  if (( status == 0 )); then
+    for source_stage in "${source_stages[@]}"; do
+      rsync -a --no-links --no-specials --no-devices "$source_stage/" "$combined/" \
+        >/dev/null 2>&1 || { status=3; break; }
+    done
+  fi
+  if (( status == 0 )); then
+    _ihar_store_publish_stage "$combined" || status=$?
+  fi
+  rm -rf -- "${source_stages[@]}" ${combined:+"$combined"}
   _ihar_store_release_source_locks
   return "$status"
 }

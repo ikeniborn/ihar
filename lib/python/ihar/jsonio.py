@@ -719,7 +719,10 @@ KINDS: dict[str, dict[str, Any]] = {
             "vendors": {"type": dict, "fields": {
                 vendor: {"type": dict, "fields": {
                     "receipt": {"type": str, "enum": ("valid", "stale", "missing", "invalid", "not-installed")},
-                    "hooks": {"type": str, "enum": ("enforced", "best-effort")},
+                    "hooks": {"type": list, "items": {"type": dict, "fields": {
+                        "id": {"type": str, "pattern": _SLUG},
+                        "trust": {"type": str, "enum": ("configured", "recorded", "unavailable")},
+                    }}},
                     "conformance": {"type": str, "enum": ("proven", "stale", "unproven", "not-installed")},
                     "capabilities": {"type": list, "items": {"type": str, "min_len": 1}},
                 }} for vendor in _VENDOR
