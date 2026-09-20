@@ -207,6 +207,49 @@ mutable_tree_fingerprint() { # <root>
   } | sha256sum | cut -d' ' -f1
 }
 
+write_noncanonical_mutable_manifest() { # <path> <case>
+  local path="$1" case_name="$2"
+  case "$case_name" in
+    auth-dot)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/.","target":".credentials.json","kind":"file"}]}' > "$path"
+      ;;
+    duplicate-plugin-target)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/one","target":"plugins","kind":"file"},{"vendor":"claude","source":"auth/claude/two","target":"plugins/.","kind":"file"}]}' > "$path"
+      ;;
+    repeated-separator)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth//claude/.credentials.json","target":".credentials.json","kind":"file"}]}' > "$path"
+      ;;
+    trailing-separator)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/.credentials.json","target":"plugins/","kind":"file"}]}' > "$path"
+      ;;
+  esac
+}
+
+assert_noncanonical_mutable_store_preserved() { # <case>
+  local case_name="$1" case_root store store_before inventory_status=0 prepare_status=0
+  case_root="$IHAR_TEST_TMP/install-mutable-path-$case_name"
+  store="$case_root/store"
+  mkdir -p "$case_root/manifests" "$store"
+  write_noncanonical_mutable_manifest \
+    "$case_root/manifests/mutable-links.json" "$case_name"
+  printf 'store stays\n' > "$store/sentinel"
+
+  store_before="$(mutable_tree_fingerprint "$store")"
+  IHAR_ROOT="$case_root" ihar_mutable_inventory all >/dev/null 2>&1 \
+    || inventory_status=$?
+  IHAR_ROOT="$case_root" ihar_prepare_mutable_store "$store" >/dev/null 2>&1 \
+    || prepare_status=$?
+  assert_eq "$case_name mutable path is rejected by the inventory query" \
+    "3" "$inventory_status"
+  assert_eq "$case_name mutable path aborts store preparation" "3" "$prepare_status"
+  assert_eq "$case_name mutable path leaves the store unchanged" \
+    "$store_before" "$(mutable_tree_fingerprint "$store")"
+}
+
+for case_name in auth-dot duplicate-plugin-target repeated-separator trailing-separator; do
+  assert_noncanonical_mutable_store_preserved "$case_name"
+done
+
 assert_invalid_mutable_store_preserved() { # <topology>
   local topology="$1" case_root store outside store_before outside_before status=0
   case_root="$IHAR_TEST_TMP/install-mutable-$topology"

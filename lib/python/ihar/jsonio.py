@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import tempfile
 from typing import Any, Mapping
@@ -335,8 +336,11 @@ def _mutable_link_manifest_rules(obj: Mapping[str, Any]) -> None:
     sources: set[str] = set()
     targets: set[tuple[str, str]] = set()
     for entry in obj["entries"]:
-        source = entry["source"]
-        target = (entry["vendor"], entry["target"])
+        raw_source = entry["source"]
+        raw_target = entry["target"]
+        source = posixpath.normpath(raw_source)
+        target_path = posixpath.normpath(raw_target)
+        target = (entry["vendor"], target_path)
         if source in sources:
             raise SchemaError(f"mutable-link manifest: duplicate source {source!r}")
         if target in targets:
@@ -346,6 +350,24 @@ def _mutable_link_manifest_rules(obj: Mapping[str, Any]) -> None:
             )
         sources.add(source)
         targets.add(target)
+
+        if "." in raw_source.split("/"):
+            raise SchemaError(
+                f"mutable-link manifest: source {raw_source!r} contains a non-canonical dot segment"
+            )
+        if "." in raw_target.split("/"):
+            raise SchemaError(
+                f"mutable-link manifest: target {raw_target!r} contains a non-canonical dot segment"
+            )
+        if source != raw_source:
+            raise SchemaError(
+                f"mutable-link manifest: source {raw_source!r} is not canonical; use {source!r}"
+            )
+        if target_path != raw_target:
+            raise SchemaError(
+                f"mutable-link manifest: target {raw_target!r} is not canonical; "
+                f"use {target_path!r}"
+            )
 
         parts = source.split("/")
         if len(parts) < 2 or parts[0] not in ("auth", "plugins") \

@@ -215,10 +215,21 @@ reject "a mutable source cannot escape the store" mutable-link-manifest \
   "{'schema':1,'entries':[{**$mutable_entry,'source':'../credentials'}]}"
 reject "a mutable runtime target cannot escape its home" mutable-link-manifest \
   "{'schema':1,'entries':[{**$mutable_entry,'target':'../credentials'}]}"
+reject "a mutable source cannot use a dot-segment alias" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'source':'auth/claude/.'}]}"
+reject "a mutable target cannot be a dot segment" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'target':'.'}]}"
+reject "a mutable source cannot use repeated separators" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'source':'auth//claude/.credentials.json'}]}"
+reject "a mutable target cannot use a trailing separator" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'target':'plugins/'}]}"
 reject "persistent state is not a mutable auth or plugin link" mutable-link-manifest \
   "{'schema':1,'entries':[{**$mutable_entry,'source':'st/claude/history.jsonl'}]}"
 reject "a mutable runtime target is unique per vendor" mutable-link-manifest \
   "{'schema':1,'entries':[$mutable_entry, {**$mutable_entry,'source':'auth/claude/other'}]}"
+reject "mutable target aliases are duplicate paths" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'target':'plugins'},
+    {**$mutable_entry,'source':'auth/claude/other','target':'plugins/.'}]}"
 
 assert_exit "the mutable-link manifest validates" 0 \
   py 'import sys; from ihar import jsonio; jsonio.read("mutable-link-manifest", sys.argv[1])' \

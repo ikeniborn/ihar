@@ -358,6 +358,55 @@ runtime_mutable_tree_fingerprint() { # <root>
   } | sha256sum | cut -d' ' -f1
 }
 
+write_noncanonical_runtime_manifest() { # <path> <case>
+  local path="$1" case_name="$2"
+  case "$case_name" in
+    auth-dot)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/.","target":".credentials.json","kind":"file"}]}' > "$path"
+      ;;
+    duplicate-plugin-target)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/one","target":"plugins","kind":"file"},{"vendor":"claude","source":"auth/claude/two","target":"plugins/.","kind":"file"}]}' > "$path"
+      ;;
+    repeated-separator)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth//claude/.credentials.json","target":".credentials.json","kind":"file"}]}' > "$path"
+      ;;
+    trailing-separator)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/.credentials.json","target":"plugins/","kind":"file"}]}' > "$path"
+      ;;
+  esac
+}
+
+assert_runtime_rejects_noncanonical_mutable_path() { # <case>
+  local case_name="$1" case_root store runtime state store_before runtime_before status=0
+  case_root="$IHAR_TEST_TMP/runtime-mutable-path-$case_name"
+  store="$case_root/store"
+  runtime="$case_root/runtime"
+  state="$case_root/state"
+  mkdir -p "$case_root/root/manifests" "$store" "$runtime" "$state"
+  ln -s "$ROOT/lib" "$case_root/root/lib"
+  cp "$ROOT/manifests/assets.json" "$case_root/root/manifests/assets.json"
+  cp "$ROOT/manifests/state.json" "$case_root/root/manifests/state.json"
+  write_noncanonical_runtime_manifest \
+    "$case_root/root/manifests/mutable-links.json" "$case_name"
+  ihar_asset_install "$store" >/dev/null
+  printf 'store stays\n' > "$store/sentinel"
+  printf 'runtime stays\n' > "$runtime/sentinel"
+
+  store_before="$(runtime_mutable_tree_fingerprint "$store")"
+  runtime_before="$(runtime_mutable_tree_fingerprint "$runtime")"
+  (IHAR_ROOT="$case_root/root" IHAR_STORE="$store" \
+    ihar_link_runtime claude "$runtime" "$state") >/dev/null 2>&1 || status=$?
+  assert_eq "$case_name mutable path aborts runtime linking" "3" "$status"
+  assert_eq "$case_name mutable path leaves the store unchanged" \
+    "$store_before" "$(runtime_mutable_tree_fingerprint "$store")"
+  assert_eq "$case_name mutable path leaves the runtime unchanged" \
+    "$runtime_before" "$(runtime_mutable_tree_fingerprint "$runtime")"
+}
+
+for case_name in auth-dot duplicate-plugin-target repeated-separator trailing-separator; do
+  assert_runtime_rejects_noncanonical_mutable_path "$case_name"
+done
+
 assert_runtime_rejects_invalid_mutable_source() { # <topology>
   local topology="$1" case_root store outside runtime state outside_before status=0
   case_root="$IHAR_TEST_TMP/runtime-mutable-$topology"

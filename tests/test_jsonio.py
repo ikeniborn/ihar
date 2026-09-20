@@ -347,6 +347,22 @@ def test_mutable_link_manifest_accepts_only_safe_store_and_runtime_paths():
         "auth or plugins",
     )
 
+    entry = MUTABLE_LINK_MANIFEST["entries"][0]
+    for field, path in (
+        ("source", "auth/codex/."),
+        ("source", "auth//codex/auth.json"),
+        ("source", "auth/codex/auth.json/"),
+        ("target", "."),
+        ("target", "./auth.json"),
+        ("target", "auth//auth.json"),
+        ("target", "auth.json/"),
+    ):
+        rejects(
+            "mutable-link-manifest",
+            {**MUTABLE_LINK_MANIFEST, "entries": [{**entry, field: path}]},
+            field,
+        )
+
 
 def test_mutable_link_manifest_rejects_duplicate_sources_and_runtime_targets():
     entry = MUTABLE_LINK_MANIFEST["entries"][0]
@@ -358,6 +374,19 @@ def test_mutable_link_manifest_rejects_duplicate_sources_and_runtime_targets():
     rejects(
         "mutable-link-manifest",
         {**MUTABLE_LINK_MANIFEST, "entries": [entry, {**entry, "source": "auth/codex/other.json"}]},
+        "duplicate target",
+    )
+
+    source_alias = {**entry, "source": "auth/codex/./auth.json", "target": "other.json"}
+    rejects(
+        "mutable-link-manifest",
+        {**MUTABLE_LINK_MANIFEST, "entries": [entry, source_alias]},
+        "duplicate source",
+    )
+    target_alias = {**entry, "source": "auth/codex/other.json", "target": "auth.json/."}
+    rejects(
+        "mutable-link-manifest",
+        {**MUTABLE_LINK_MANIFEST, "entries": [entry, target_alias]},
         "duplicate target",
     )
 
