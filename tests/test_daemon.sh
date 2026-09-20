@@ -248,11 +248,10 @@ assert_contains "the update stops the daemons before replacing the binary" \
 assert_contains "and starts them after" \
   "$(cat "$ROOT/lib/store/install.sh")" "ihar_codex_daemon_start_pending"
 
-# --- ihar check reports the daemon, and reports it without state --------------------------------
+# --- ihar check remains complete and read-only without project state --------------------------
 #
-# `check` never calls ihar_state_setup, so IHAR_STATE is unset there. Reading it
-# unguarded aborted the whole report under `set -u`: the daemon line and everything
-# after it simply vanished, which is the worst shape a status command can fail in.
+# The closed Task 5 result no longer carries daemon or state-root fields. `check`
+# still must not create state merely to report the profile, receipt and guarantee.
 
 PROJECT="$IHAR_TEST_TMP/check-project"
 mkdir -p "$PROJECT"
@@ -262,18 +261,11 @@ check() {
 }
 
 check_out="$(check check)"
-assert_contains "check reports the daemon" "$check_out" "daemon "
-assert_contains "and says there is none rather than saying nothing" "$check_out" \
-  "no Codex runtime home"
-# The report must still be whole: the lines before the daemon are the evidence that
-# nothing aborted in the middle.
-assert_contains "the report is not truncated" "$check_out" "state root"
-assert_contains "and still carries the profile guarantee" "$check_out" "guarantee"
-
-# With a runtime home present but no socket, the answer changes rather than staying
-# generic — "no daemon" and "a daemon nobody examined" are different states.
-mkdir -p "$IHAR_STATE_ROOT/$(printf '%s' "$PROJECT" | sha256sum | cut -c1-8)/r/deadbeef/codex"
-assert_contains "a home with no socket reports not running" "$(check check)" "not running"
+assert_contains "check remains complete without project state" "$check_out" "profile      standard"
+assert_contains "check still carries the profile guarantee" "$check_out" "guarantee"
+assert_contains "check still carries receipt state" "$check_out" "receipt missing receipt"
+assert_exit "check does not create project state" 1 \
+  test -e "$IHAR_STATE_ROOT/$(printf '%s' "$PROJECT" | sha256sum | cut -c1-8)"
 
 assert_eq "an unknown daemon action is a usage error" "2" \
   "$(check daemon nonesuch >/dev/null 2>&1; echo $?)"

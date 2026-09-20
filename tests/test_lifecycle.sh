@@ -9,6 +9,12 @@ ihar_sandbox
 
 PROJECT="$IHAR_TEST_TMP/proj"
 mkdir -p "$PROJECT"
+IHAR_LOCKFILE="$IHAR_TEST_TMP/lifecycle-lock.json"
+export IHAR_LOCKFILE
+printf '%s\n' \
+  '{"schema":1,"claude":{"version":"2.1.274"},"codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"hooks":{},"managedHooks":{}}' \
+  > "$IHAR_LOCKFILE"
+cp -R "$ROOT/hooks" "$ROOT/manifests" "$ROOT/skills" "$IHAR_STORE/"
 
 # The launcher runs under `set -e`; the tests must exercise it that way, because the
 # failure this catches only happens there.
@@ -97,5 +103,30 @@ rm -f "$PROJECT/.ihar_config"
 state_dir="$(dirname "$(dirname "$(dirname "$claude_home")")")"
 assert_exit "the project state carries a marker" 0 test -f "$state_dir/home.json"
 assert_exit "vendor state sits beside the runtime homes" 0 test -d "$state_dir/st/claude"
+
+# --- enforced receipt failure precedes vendor execution -------------------------------
+
+FAKE_CLAUDE="$IHAR_TEST_TMP/receipt-claude"
+START_MARKER="$IHAR_TEST_TMP/vendor-started"
+cat > "$FAKE_CLAUDE" <<SH
+#!/usr/bin/env bash
+touch '$START_MARKER'
+SH
+chmod +x "$FAKE_CLAUDE"
+RECEIPT_LOCK="$IHAR_TEST_TMP/receipt-lock.json"
+printf '%s\n' '{"schema":1,"claude":{"version":"2.1.274"},"hooks":{},"managedHooks":{}}' \
+  > "$RECEIPT_LOCK"
+lock_sha="$(sha256sum "$RECEIPT_LOCK" | cut -d' ' -f1)"
+printf '{"schema":1,"release_lock_sha256":"%s","installed_at":"2026-09-20T00:00:00Z","components":{"claude":{"version":"2.1.274","binary_sha256":"%064d"}}}\n' \
+  "$lock_sha" 0 > "$IHAR_STORE/install-receipt.json"
+
+receipt_status=0
+receipt_out="$(cd "$PROJECT" && \
+  IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
+  IHAR_LOCKFILE="$RECEIPT_LOCK" IHAR_CLAUDE_BIN="$FAKE_CLAUDE" \
+  "$ROOT/ihar.sh" --profile protected claude 2>&1)" || receipt_status=$?
+assert_eq "an enforced receipt mismatch exits fail-closed" "3" "$receipt_status"
+assert_contains "the launch names receipt verification" "$receipt_out" "install receipt"
+assert_exit "receipt failure occurs before the vendor starts" 1 test -e "$START_MARKER"
 
 finish

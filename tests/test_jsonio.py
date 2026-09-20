@@ -67,8 +67,8 @@ CHECK_RESULT = {
     "masking": {"level": "standard", "floor": "standard", "engine": "regex", "dropped_env": ["TOKEN"]},
     "gateway": {"mode": "explicit", "network_policy": "protected", "instances": ["abc port 1234"]},
     "vendors": {
-        "claude": {"receipt": "valid", "hooks": [{"id": "security-pretool", "trust": "configured", **HOOK_DETAIL_EMPTY}], "conformance": "proven", "capabilities": ["fork", "remote-control"]},
-        "codex": {"receipt": "missing", "hooks": [{"id": "security-pretool", "trust": "trusted", "trusted_hash": "sha256:" + "a" * 64, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": "sha256:" + "a" * 64}], "conformance": "unproven", "capabilities": ["archive", "fork"]},
+        "claude": {"receipt": "verified", "hooks": [{"id": "security-pretool", "trust": "configured", **HOOK_DETAIL_EMPTY}], "conformance": "proven", "capabilities": ["fork", "remote-control"]},
+        "codex": {"receipt": "missing receipt", "hooks": [{"id": "security-pretool", "trust": "trusted", "trusted_hash": "sha256:" + "a" * 64, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": "sha256:" + "a" * 64}], "conformance": "unproven", "capabilities": ["archive", "fork"]},
     },
     "assets": [{"requirement": "optional", "presence": "missing", "source": "commands", "target": "commands"}],
     "mcp": {"strict": True, "notes": {"claude": ["missing TOKEN"], "codex": []}},
@@ -314,7 +314,7 @@ def test_check_result_text_and_json_render_the_same_facts():
     encoded = check_result.render_json(CHECK_RESULT)
     jsonio.check("check-result", json.loads(encoded))
     for value in (
-        "protected", "masked model egress", "standard", "explicit", "valid", "missing",
+        "protected", "masked model egress", "standard", "explicit", "verified", "missing receipt",
         "commands", "security-pretool", "trusted", "trusted_hash", "trustStatus", "enabled",
         "source", "user", "currentHash", "sha256:" + "a" * 64,
         "missing TOKEN", "claude-agent-acp #144",

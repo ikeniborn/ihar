@@ -2,8 +2,7 @@
 # Collect one validated status result, then render it without persistent writes.
 
 ihar_check_receipt_status() { # <vendor> <binary>
-  ihar_python ihar.check_result receipt "$IHAR_STORE/install-receipt.json" \
-    "$IHAR_LOCKFILE" "$1" "$2"
+  ihar_receipt_binary_status "$1" "$2"
 }
 
 ihar_check_conformance_status() { # <vendor> <binary>

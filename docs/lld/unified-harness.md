@@ -2,8 +2,8 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 9 (S9 native web surfaces implemented and measured) |
-| Date | 2026-09-18 |
+| Status | revision 10 (receipt verification and executable test inventory implemented) |
+| Date | 2026-09-20 |
 | Derived from | `docs/hld/unified-harness.md` revision 2 (commit `ec2df36`) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
 | Verified against | Claude Code 2.1.274, Codex CLI 0.154.0 (`--help`, `app-server generate-json-schema`, binary strings), iclaude and icodex checkouts on this machine |
@@ -179,7 +179,7 @@ hooks/
   security-pretool.py chain-gate.py gwt-gate.py session-register.py handoff-inject.py
   claude-only/…
 manifests/
-  hooks.json  assets.json  state.json
+  hooks.json  assets.json  state.json  tests.json
   mcp/registry.json  profiles/*.json  netpolicy/*.json
   config/claude/…  config/codex/…
 skills/  tests/  docs/
@@ -220,7 +220,7 @@ Order is fixed by four dependencies: the profile decides how severe a store mism
 |---|----------|--------|-------|
 | 1 | `ihar_config_load` | parse `.ihar_config`, apply the env map | usage |
 | 2 | `ihar_profile_resolve` | flag > file > `standard`; resolve the effective masking level and validate it against the gateway (§12.3) | usage |
-| 3 | `ihar_store_verify "$profile"` | lockfile drift, binary and hook sha256, and for enforced profiles the hook conformance record for this vendor version (§6.6) | fail-closed |
+| 3 | `ihar_store_verify <vendor> <selected-binary>` | lockfile drift, selected executable bytes against the install receipt, hook sha256, and for enforced profiles the hook conformance record for this vendor version (§6.6) | fail-soft for receipt failure under `standard`; otherwise fail-closed |
 | 4 | `ihar_state_setup "$root"` | marker, `st/`, socket path preflight (§2.2) | runtime |
 | 5 | `ihar_enforce_start` | gateway (§8.1), sandbox and network policy (§9), all fail-closed | fail-closed |
 | 6 | `ihar_render_all <vendor>` | hooks, MCP, config fragments, using the gateway result; compute `<config-hash>` | fail-closed |
@@ -790,7 +790,7 @@ Revision 2 allowed `ihar claude --mask-level standard` under `standard`, which s
 
 In order, each fail-closed: hook integrity and, for Codex, trust state through `hooks/list` (§6.5); conformance record for the pinned version (§6.6); gateway acquisition (§8.1); sandbox and network policy (§9); runtime home immutability (§4.2); daemon reconciliation (§5.5). `--web` for a vendor outside `remote` is exit 2; `acp` under `refuse` is exit 2.
 
-`ihar check` prints the profile, the guarantee text of §1.4 verbatim, the effective masking level, each enforcement point with its state, the vendor defaults in force under `vendor-default`, the dropped environment names, hook trust and conformance status, the gateway refusal counters, unmet registry `requires_env`, MCP entries Codex cannot express, adapter capabilities, and the known-gaps table.
+`ihar check` prints the profile, the guarantee text of §1.4 verbatim, the effective masking level, each enforcement point with its state, the vendor defaults in force under `vendor-default`, the dropped environment names, hook trust and conformance status, the gateway refusal counters, unmet registry `requires_env`, MCP entries Codex cannot express, adapter capabilities, and the known-gaps table. Per-vendor receipt state comes from the same `ihar_receipt_binary_status` helper used by launch and is exactly `verified`, `mismatched`, or `missing receipt`.
 
 ## 13. Web and ACP (slices S9, S11)
 
@@ -828,7 +828,7 @@ Machine-local evidence lives in `$IHAR_STORE/install-receipt.json`: installation
 
 ### 14.2 Verification at launch
 
-Release-lock drift warns that install evidence is stale. Each launch compares the selected executable with the install receipt: a mismatch warns under `standard` and is exit 3 elsewhere. A missing or unreadable receipt is likewise exit 3 for enforced profiles. A hook or managed-hook hash mismatch is exit 3 in every profile. For enforced profiles, a missing, stale or failing conformance record is exit 3.
+Release-lock drift warns that install evidence is stale. `ihar_receipt_binary_status <vendor> <selected-binary>` validates `$IHAR_STORE/install-receipt.json`, its release-lock digest and the selected executable bytes, then returns exactly `verified`, `mismatched`, or `missing receipt`. Missing, malformed and unreadable receipt evidence all report `missing receipt`; a missing component, changed release lock or changed executable reports `mismatched`. Either non-verified state warns and continues under `standard`, and exits 3 before vendor execution under `protected` and `isolated`. Dry-run and ACP do not execute the native binary and therefore skip only this receipt comparison; hook and store integrity checks remain in force. A hook or managed-hook hash mismatch is exit 3 in every profile. For enforced profiles, a missing, stale or failing conformance record is exit 3.
 
 ### 14.3 Commands
 
@@ -859,6 +859,7 @@ Release-lock drift warns that install evidence is stale. Each launch compares th
 | Release lockfile | §14.1 | `.ihar-lockfile.json` |
 | Install receipt | §14.1 | `$IHAR_STORE/install-receipt.json` |
 | Check result | §12.4 | `ihar check --json` |
+| Test inventory | §16 | `manifests/tests.json` |
 | Project configuration | §2.6 | `.ihar_config` |
 
 Every JSON contract carries `schema` and is validated on read and write by `ihar.jsonio.check`; an unknown key or wrong type is an error. `.ihar_config` is validated by its key table.
@@ -870,10 +871,11 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | Slice | File | Cases |
 |-------|------|-------|
 | S0 | `tests/test_contracts.sh` | every profile file validates; the guarantee text of §1.4 exists per profile; the manifest linter rejects two `updatedInput` hooks on one event; netpolicy files validate |
+| S0 | `tests/test_jsonio.py`, `tests/test_ids.py`, `tests/test_config.sh` | closed JSON contracts and atomic writes; UUID identities; parsed project configuration and output-mode grammar |
 | S1 | `tests/test_state.sh` | id derivation; marker schema 3 and upgrades from 1 and 2; `st/` and `r/` separation; **socket path preflight aborts when over the limit**; runtime home immutability (a second launch with the same hash reuses it, a drifted file aborts); different profiles produce different hashes; `chmod 444` under enforced profiles; link rules; migration by hash |
 | S1 | `tests/test_locks.sh` | `--required` exits 3 without `flock` or on timeout; `--best-effort` warns and continues; every security call site uses `--required` |
 | S2 | `tests/test_adapters.sh` | dry-run argv and environment per vendor; **passthrough per vendor**, `--` for Claude and none for Codex; unknown flag exit 2; capabilities validate |
-| S2 | `tests/test_lifecycle.sh` | step order: profile before store verify, gateway before render, render before materialise, daemon reconcile before launch; the gateway port reaches the Codex provider region |
+| S2 | `tests/test_lifecycle.sh` | step order: profile before store verify, gateway before render, render before materialise, daemon reconcile before launch; the gateway port reaches the Codex provider region; enforced receipt failure occurs before the vendor start marker |
 | S3 | `tests/test_hooks.sh` | rendered outputs match golden files per profile; **matcher regex translation** and a real match against `mcp__iwiki-local__wiki_update_page`; `args` rendered outside the quoted path; `python3 -I` in the command; one decision per security hook on fixtures for both vendors; fail-closed against fail-open classes; `hookio` rejects disallowed keys; the store-write refusal has no exclusion for store hook paths |
 | S3 | `tests/test_hook_trust.sh` | `hooks/list` responses drive the decision: `untrusted`, `modified`, `source: project` and a hash mismatch each abort with exit 3 under `protected`; the same responses warn under `standard`; sealing makes only ihar's own hooks trusted and a project hook is never in the trust block; `bypass_hook_trust` appears in no render |
 | S3 | `tests/test_conformance.py` | the suite's own cases run against fakes; a missing or stale record aborts an enforced launch |
@@ -889,9 +891,12 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | S10 | `tests/test_microvm.sh` | both homes visible in the guest; policy bundle read-only; deny-by-default network with the gateway reachable and an arbitrary host not; Codex boots and answers `--version` |
 | S11 | `tests/test_acp.sh` | environment reaches the adapter; enforced profiles exit 2 with the issue list; `standard` proceeds and `ihar check` prints the gap |
 | daemon | `tests/test_daemon.sh` | a daemon on an older binary is restarted; a config-hash change restarts an ihar-started daemon and refuses against a foreign one; `ihar update` stops and restarts only what was running |
-| concurrency | `tests/test_concurrency.sh` | two launches of one project and vendor with different profiles get different runtime homes and neither is modified; two gateway clients with different masking levels get different instances; parallel install attempts serialise; releasing one consumer leaves a live instance running for the other |
+| install | `tests/test_install.sh`, `tests/test_lockfile.sh` | transactional store activation and rollback; immutable release inputs; receipt-backed executable verification with standard warning and enforced exit 3 |
+| web | `tests/test_web.sh` | native Claude and Codex web argv, profile gates, daemon attachment and LAN spelling |
+| workflow | `tests/test_workflow_gates.sh` | validated chain transitions, stale-hash rejection and bounded gate evidence |
+| concurrency | `tests/test_concurrency.sh` | a marker-paused runtime publication holds the required state lock while a second profile waits, then distinct homes publish and remain unchanged; different masking levels create different gateway instances; store-lock entry markers prove parallel installs serialise; releasing one consumer leaves the shared gateway PID and endpoint live for the other |
 
-`tests/run.sh` runs everything and is the command each slice's verification names.
+`manifests/tests.json` is the closed schema-1 inventory of every discovered test file named above. Paths are unique, repository-relative `tests/test_*.sh` or `tests/test_*.py` names. Before executing anything, `tests/run.sh` validates the manifest and fails with exit 3 for malformed, duplicate, unsafe, missing, unlisted-discovered, or listed-but-undiscovered paths. It then runs the inventory-equivalent discovered set and is the command each slice's verification names.
 
 ## 17. Failure handling matrix
 
@@ -903,7 +908,7 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | profile | masking level above `off` with no gateway | usage | 2 |
 | state | socket path over the limit | usage | 2 |
 | store | hook or managed-hook sha256 mismatch | fail-closed | 3 |
-| store | binary sha256 mismatch, `standard` / other | fail-soft / fail-closed | 0 / 3 |
+| store | executable receipt state is `mismatched` or `missing receipt`, `standard` / enforced | fail-soft / fail-closed | 0 / 3 |
 | store | conformance record missing, stale or failing, enforced profile | fail-closed | 3 |
 | hooks | Codex `hooks/list` reports untrusted, modified, project-sourced or hash-mismatched required hook | fail-closed | 3 |
 | lock | `--required` unavailable or timed out | fail-closed | 3 |

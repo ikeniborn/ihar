@@ -8,6 +8,7 @@ ihar_sandbox
 
 PROJECT="$IHAR_TEST_TMP/proj"
 mkdir -p "$PROJECT"
+cp -R "$ROOT/hooks" "$ROOT/manifests" "$ROOT/skills" "$IHAR_STORE/"
 
 CLAUDE_ACP="$IHAR_TEST_TMP/claude-agent-acp"
 CODEX_ACP="$IHAR_TEST_TMP/codex-acp"

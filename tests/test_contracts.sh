@@ -166,7 +166,7 @@ accept "a nested script path inside the hooks directory is accepted" hook-manife
 
 for kind in profile netpolicy hook-manifest mcp-registry capabilities session \
             launch-claim handoff daemon-record conformance home-marker lockfile \
-            install-receipt state-manifest asset-manifest; do
+            install-receipt state-manifest asset-manifest test-inventory; do
   assert_exit "contract kind '$kind' is registered" 0 py "
 import sys
 from ihar import jsonio
@@ -206,6 +206,26 @@ assert_exit "the tracked-asset manifest validates" 0 \
 assert_exit "the tracked release lockfile validates" 0 \
   py 'import sys; from ihar import jsonio; jsonio.read("lockfile", sys.argv[1])' \
   "$ROOT/.ihar-lockfile.json"
+
+# --- executable test inventory is closed and safe ------------------------------------
+
+test_path="{'schema':1,'paths':['tests/test_contracts.sh']}"
+accept "a minimal test inventory is accepted" test-inventory "$test_path"
+reject "duplicate test paths are rejected" test-inventory \
+  "{'schema':1,'paths':['tests/test_contracts.sh','tests/test_contracts.sh']}"
+reject "a test path cannot escape the repository" test-inventory \
+  "{'schema':1,'paths':['../outside/test_bad.sh']}"
+reject "inventory paths must name discovered test files" test-inventory \
+  "{'schema':1,'paths':['tests/helpers.sh']}"
+
+assert_exit "the shipped test inventory validates" 0 \
+  py 'import sys; from ihar import jsonio; jsonio.read("test-inventory", sys.argv[1])' \
+  "$ROOT/manifests/tests.json"
+
+MISSING_INVENTORY="$IHAR_TEST_TMP/missing-tests.json"
+printf '%s\n' '{"schema":1,"paths":["tests/test_missing.sh"]}' > "$MISSING_INVENTORY"
+assert_exit "the runner rejects a missing inventory path before execution" 3 \
+  env IHAR_TEST_INVENTORY="$MISSING_INVENTORY" bash "$ROOT/tests/run.sh"
 
 assert_exit "every shipped hook has exactly one reviewed release pin" 0 \
   py '

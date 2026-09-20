@@ -314,6 +314,18 @@ def _asset_manifest_rules(obj: Mapping[str, Any]) -> None:
             raise SchemaError("asset manifest: generated settings are not tracked assets")
 
 
+def _test_inventory_rules(obj: Mapping[str, Any]) -> None:
+    seen: set[str] = set()
+    for path in obj["paths"]:
+        if path in seen:
+            raise SchemaError(f"test inventory: duplicate path {path!r}")
+        seen.add(path)
+        if not re.fullmatch(r"tests/test_[A-Za-z0-9._-]+\.(sh|py)", path):
+            raise SchemaError(
+                f"test inventory: {path!r} is not a discovered tests/test_*.sh or tests/test_*.py path"
+            )
+
+
 # --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
@@ -698,6 +710,16 @@ KINDS: dict[str, dict[str, Any]] = {
         },
         "rules": [_asset_manifest_rules],
     },
+    "test-inventory": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "paths": {
+                "type": list,
+                "items": {"type": str, "pattern": _SAFE_REL},
+            },
+        },
+        "rules": [_test_inventory_rules],
+    },
     "check-result": {
         "fields": {
             "schema": {"type": int, "const": 1},
@@ -718,7 +740,7 @@ KINDS: dict[str, dict[str, Any]] = {
             }},
             "vendors": {"type": dict, "fields": {
                 vendor: {"type": dict, "fields": {
-                    "receipt": {"type": str, "enum": ("valid", "stale", "missing", "invalid", "not-installed")},
+                    "receipt": {"type": str, "enum": ("verified", "mismatched", "missing receipt")},
                     "hooks": {"type": list, "items": {"type": dict, "fields": {
                         "id": {"type": str, "pattern": _SLUG},
                         "trust": {"type": str, "enum": ("configured", "trusted", "untrusted", "unavailable")},

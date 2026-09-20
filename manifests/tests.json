@@ -1,0 +1,32 @@
+{
+  "paths": [
+    "tests/test_acp.sh",
+    "tests/test_adapters.sh",
+    "tests/test_concurrency.sh",
+    "tests/test_config.sh",
+    "tests/test_conformance.py",
+    "tests/test_contracts.sh",
+    "tests/test_daemon.sh",
+    "tests/test_gateway_explicit.sh",
+    "tests/test_gateway_routes.py",
+    "tests/test_handoff.sh",
+    "tests/test_handoff_build.py",
+    "tests/test_hook_trust.sh",
+    "tests/test_hooks.sh",
+    "tests/test_ids.py",
+    "tests/test_install.sh",
+    "tests/test_jsonio.py",
+    "tests/test_lifecycle.sh",
+    "tests/test_lockfile.sh",
+    "tests/test_locks.sh",
+    "tests/test_mcp.sh",
+    "tests/test_microvm.sh",
+    "tests/test_profiles.sh",
+    "tests/test_sessions.sh",
+    "tests/test_sessions_readers.py",
+    "tests/test_state.sh",
+    "tests/test_web.sh",
+    "tests/test_workflow_gates.sh"
+  ],
+  "schema": 1
+}

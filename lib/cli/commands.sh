@@ -35,7 +35,16 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
 
   # 3. store integrity, at the severity the profile asks for
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR
-  ihar_store_verify
+  local native_binary
+  case "$vendor" in
+    claude) native_binary="$IHAR_CLAUDE_BIN" ;;
+    codex)  native_binary="$IHAR_CODEX_BIN" ;;
+  esac
+  local verify_receipt=true
+  if [[ "$IHAR_FLAG_DRY_RUN" == true || "${IHAR_ACP_MODE:-false}" == true ]]; then
+    verify_receipt=false
+  fi
+  ihar_store_verify "$vendor" "$native_binary" "$verify_receipt"
 
   # 4. project state. Called directly rather than in a command substitution: the
   # setup exports IHAR_STATE, and a subshell would drop that export while still
