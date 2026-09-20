@@ -12,7 +12,9 @@ The record is keyed by vendor, version, binary digest and manifest digest, so an
 upgrade of either invalidates it rather than inheriting a pass.
 
 Usage:
-    python3 -m ihar.conformance.run <vendor> <binary> <store> <manifest> [--protected-store <path>] [--json]
+    python3 -m ihar.conformance.run <vendor> <binary> <store> <manifest>
+        --auth-store <active-store> --lockfile <release-lock>
+        [--protected-store <path>] [--json]
 """
 
 from __future__ import annotations
@@ -37,22 +39,54 @@ from . import LIVE_CASES, REQUIRED_CASES
 
 _SESSION_CONTEXT = "IHAR-CONFORMANCE-SESSION-CONTEXT"
 _FAKE_SECRET = "sk-ant-abcdefghijklmnopqrstuvwxyz0123"
+_HOOK_TIMEOUT_SECONDS = 1
+_HOOK_TIMEOUT_TOLERANCE_SECONDS = 1.5
 _PROBE_SCRIPT = r'''#!/usr/bin/env python3
 import json
+import os
 import pathlib
+import subprocess
 import sys
 import time
 
 mode, marker = sys.argv[1:3]
+if mode == "watch":
+    parent = int(marker)
+    started, ended = float(sys.argv[3]), pathlib.Path(sys.argv[4])
+    while time.monotonic() - started < 8:
+        try:
+            os.kill(parent, 0)
+        except ProcessLookupError:
+            ended.write_text(str(time.monotonic() - started), encoding="utf-8")
+            raise SystemExit(0)
+        time.sleep(0.02)
+    ended.write_text("8", encoding="utf-8")
+    raise SystemExit(0)
+
 payload = sys.stdin.read()
 pathlib.Path(marker).write_text(payload, encoding="utf-8")
-if mode == "context":
+if mode == "deny":
+    pathlib.Path(marker + ".decision").write_text("deny\n", encoding="utf-8")
+    json.dump({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                      "permissionDecision": "deny",
+                                      "permissionDecisionReason": "conformance deny probe"}},
+              sys.stdout)
+    sys.stdout.write("\n")
+    raise SystemExit(2)
+elif mode == "context":
     json.dump({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                       "additionalContext": "IHAR-CONFORMANCE-SESSION-CONTEXT"}},
               sys.stdout)
     sys.stdout.write("\n")
 elif mode == "timeout":
+    started = time.monotonic()
+    subprocess.Popen(
+        [sys.executable, __file__, "watch", str(os.getpid()), str(started), marker + ".ended"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     time.sleep(5)
+    pathlib.Path(marker + ".completed").write_text("completed\n", encoding="utf-8")
 '''
 
 _MCP_SCRIPT = r'''#!/usr/bin/env python3
@@ -100,6 +134,8 @@ def _stage(
     vendor: str,
     home: str,
     protected_roots: list[str] | None = None,
+    *,
+    auth_store: str,
 ) -> None:
     """A throwaway vendor home carrying the rendered hooks and the scripts."""
     os.makedirs(os.path.join(home, "hooks"), exist_ok=True)
@@ -130,7 +166,7 @@ def _stage(
         }, handle, sort_keys=True)
 
     auth_name = ".credentials.json" if vendor == "claude" else "auth.json"
-    auth_source = os.path.join(store, "auth", vendor, auth_name)
+    auth_source = os.path.join(auth_store, "auth", vendor, auth_name)
     if os.path.isfile(auth_source):
         os.symlink(auth_source, os.path.join(home, auth_name))
 
@@ -337,6 +373,8 @@ def _run_live_case(vendor, binary, home, workdir, name):
     target = os.path.join(workdir, f".{name}-target")
     _remove_probe(observed)
     _remove_probe(target)
+    for suffix in (".decision", ".completed", ".ended"):
+        _remove_probe(observed + suffix)
     mcp_config = None
     allowed_tool = "Bash"
 
@@ -344,7 +382,7 @@ def _run_live_case(vendor, binary, home, workdir, name):
         sensitive = os.path.join(workdir, ".ssh", "id_rsa")
         os.makedirs(os.path.dirname(sensitive), exist_ok=True)
         _remove_probe(sensitive)
-        _add_probe_hook(home, vendor, "PreToolUse", "observe", observed, matcher="Bash")
+        _add_probe_hook(home, vendor, "PreToolUse", "deny", observed, matcher="Bash")
         prompt = (
             "Use the Bash tool exactly once and run this command verbatim; do not use another "
             f"tool: printf denied > {shlex.quote(sensitive)}"
@@ -378,7 +416,8 @@ def _run_live_case(vendor, binary, home, workdir, name):
         target = called
     elif name == "timeout-behaviour":
         _add_probe_hook(
-            home, vendor, "PreToolUse", "timeout", observed, matcher="Bash", timeout=1,
+            home, vendor, "PreToolUse", "timeout", observed, matcher="Bash",
+            timeout=_HOOK_TIMEOUT_SECONDS,
         )
         prompt = (
             "Use the Bash tool exactly once and run this command verbatim; do not use another "
@@ -405,9 +444,17 @@ def _run_live_case(vendor, binary, home, workdir, name):
     if name != "timeout-behaviour" and result.returncode != 0:
         return "failed", f"the vendor fired the hook but the turn exited {result.returncode}"
     if name == "deny-blocks-the-tool":
+        decision = observed + ".decision"
+        try:
+            with open(decision, encoding="utf-8") as handle:
+                recorded_decision = handle.read().strip()
+        except OSError:
+            recorded_decision = ""
+        if recorded_decision != "deny":
+            return "failed", "the probe hook fired without recording an explicit deny decision"
         if os.path.exists(target):
             return "failed", "the denied Bash command created its sentinel"
-        return "passed", "vendor fired PreToolUse and did not execute the denied command"
+        return "passed", "vendor received an explicit deny and did not execute the command"
     if name == "rewrite-reaches-the-tool":
         try:
             with open(target, encoding="utf-8") as handle:
@@ -431,8 +478,23 @@ def _run_live_case(vendor, binary, home, workdir, name):
             return "failed", "the MCP tool did not run"
         return "passed", "vendor fired the MCP matcher and ran the stub MCP tool"
 
+    completed = observed + ".completed"
+    ended = observed + ".ended"
+    deadline = time.monotonic() + _HOOK_TIMEOUT_TOLERANCE_SECONDS
+    while not os.path.isfile(ended) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if os.path.isfile(completed):
+        return "failed", "the vendor ignored the hook timeout and let the 5s hook complete"
+    try:
+        with open(ended, encoding="utf-8") as handle:
+            elapsed = float(handle.read().strip())
+    except (OSError, ValueError) as error:
+        return "failed", f"the timeout probe did not record termination: {error}"
+    maximum = _HOOK_TIMEOUT_SECONDS + _HOOK_TIMEOUT_TOLERANCE_SECONDS
+    if elapsed > maximum:
+        return "failed", f"the hook timeout took {elapsed:.2f}s, above {maximum:.2f}s"
     outcome = "executed" if os.path.isfile(target) else "blocked"
-    return "passed", f"vendor timed out the hook and the tool was {outcome}"
+    return "passed", f"vendor terminated the hook after {elapsed:.2f}s; tool was {outcome}"
 
 
 def _claude_protected_roots(home: str) -> list[str]:
@@ -594,16 +656,32 @@ def vendor_version(vendor: str, binary: str) -> str:
     return (result.stdout or result.stderr).strip().splitlines()[0] if result.stdout or result.stderr else "unknown"
 
 
+def _validate_release_pin(vendor: str, version: str, lockfile_path: str) -> None:
+    lockfile = jsonio.read("lockfile", lockfile_path)
+    pinned = lockfile[vendor]["version"]
+    if vendor == "codex":
+        pinned = pinned.removeprefix("rust-v")
+    match = re.search(r"\d+\.\d+\.\d+", version)
+    actual = match.group(0) if match else ""
+    if actual != pinned:
+        raise RuntimeError(
+            f"{vendor} binary version {version!r} does not match pinned release {pinned!r}"
+        )
+
+
 def run(
     vendor: str,
     binary: str,
     store: str,
     manifest_path: str,
     *,
+    auth_store: str,
+    lockfile_path: str,
     protected_store: str | None = None,
 ) -> dict:
     """Run staged hooks/binary while probing denial against the final store."""
     version = vendor_version(vendor, binary)
+    _validate_release_pin(vendor, version, lockfile_path)
     record = {
         "schema": 1,
         "vendor": vendor,
@@ -620,7 +698,10 @@ def run(
     try:
         protected_roots = [protected_store or store, state_root, home] \
             if vendor == "claude" else None
-        _stage(store, manifest_path, vendor, home, protected_roots)
+        _stage(
+            store, manifest_path, vendor, home, protected_roots,
+            auth_store=auth_store,
+        )
         for name, case in CASES.items():
             if name in CLAUDE_ONLY_CASES and vendor != "claude":
                 continue
@@ -650,6 +731,8 @@ def main(argv: list[str]) -> int:
     vendor, binary, store, manifest_path = argv[:4]
     options = argv[4:]
     protected_store = None
+    auth_store = None
+    lockfile_path = None
     if "--protected-store" in options:
         index = options.index("--protected-store")
         if index + 1 >= len(options):
@@ -657,12 +740,30 @@ def main(argv: list[str]) -> int:
             return 2
         protected_store = options[index + 1]
         del options[index:index + 2]
-    if any(option != "--json" for option in options):
+    if "--auth-store" in options:
+        index = options.index("--auth-store")
+        if index + 1 >= len(options):
+            print(__doc__, file=sys.stderr)
+            return 2
+        auth_store = options[index + 1]
+        del options[index:index + 2]
+    if "--lockfile" in options:
+        index = options.index("--lockfile")
+        if index + 1 >= len(options):
+            print(__doc__, file=sys.stderr)
+            return 2
+        lockfile_path = options[index + 1]
+        del options[index:index + 2]
+    if auth_store is None or lockfile_path is None \
+            or any(option != "--json" for option in options):
         print(__doc__, file=sys.stderr)
         return 2
     try:
         record = run(
-            vendor, binary, store, manifest_path, protected_store=protected_store
+            vendor, binary, store, manifest_path,
+            auth_store=auth_store,
+            lockfile_path=lockfile_path,
+            protected_store=protected_store,
         )
     except (RuntimeError, OSError, jsonio.SchemaError) as error:
         print(f"ihar: conformance could not run: {error}", file=sys.stderr)

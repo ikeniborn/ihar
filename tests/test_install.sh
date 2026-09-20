@@ -178,6 +178,35 @@ assert_eq "install never rewrites release lock" "$before_lock" \
 # back on the path a hook is loaded from.
 assert_exit "the store is a copy, not a link into the checkout" 1 test -L "$IHAR_STORE/hooks"
 
+# Conformance executes staged hooks and binaries, but reads mutable authentication
+# from the stable active store that owns it.
+CONFORMANCE_STAGE="$IHAR_TEST_TMP/conformance-stage"
+CONFORMANCE_ACTIVE="$IHAR_TEST_TMP/conformance-active"
+CONFORMANCE_ARGS="$IHAR_TEST_TMP/conformance-args"
+mkdir -p "$CONFORMANCE_STAGE/bin" "$CONFORMANCE_STAGE/nvm/bin" \
+  "$CONFORMANCE_ACTIVE/auth/claude" "$CONFORMANCE_ACTIVE/auth/codex"
+printf '#!/bin/sh\nexit 0\n' > "$CONFORMANCE_STAGE/nvm/bin/claude"
+printf '#!/bin/sh\nexit 0\n' > "$CONFORMANCE_STAGE/bin/codex"
+chmod +x "$CONFORMANCE_STAGE/nvm/bin/claude" "$CONFORMANCE_STAGE/bin/codex"
+(
+  export IHAR_STORE="$CONFORMANCE_STAGE"
+  export IHAR_CLAUDE_BIN="$CONFORMANCE_STAGE/nvm/bin/claude"
+  export IHAR_CODEX_BIN="$CONFORMANCE_STAGE/bin/codex"
+  ihar_python() { printf '%s\n' "$*" >> "$CONFORMANCE_ARGS"; }
+  ihar_install_conformance "$CONFORMANCE_ACTIVE"
+)
+assert_contains "install conformance keeps the staged store as its runtime source" \
+  "$(cat "$CONFORMANCE_ARGS")" \
+  "ihar.conformance.run claude $CONFORMANCE_STAGE/nvm/bin/claude $CONFORMANCE_STAGE"
+assert_contains "install conformance reads auth from the stable active store" \
+  "$(cat "$CONFORMANCE_ARGS")" "--auth-store $CONFORMANCE_ACTIVE"
+assert_contains "install conformance validates the immutable release lock" \
+  "$(cat "$CONFORMANCE_ARGS")" "--lockfile $IHAR_LOCKFILE"
+assert_contains "install conformance protects the stable active store" \
+  "$(cat "$CONFORMANCE_ARGS")" "--protected-store $CONFORMANCE_ACTIVE"
+assert_exit "install conformance does not copy mutable auth into its stage" 1 \
+  test -e "$CONFORMANCE_STAGE/auth"
+
 # Required asset inputs are checked before an install transaction can touch the
 # active store. Optional sources stay visible for check collection without blocking
 # publication.

@@ -247,7 +247,8 @@ ihar_cmd_conformance() {
     [[ -x "$binary" ]] || continue
     printf '\n%s conformance\n' "$vendor"
     ihar_python ihar.conformance.run "$vendor" "$binary" "$IHAR_STORE" \
-      "$IHAR_ROOT/manifests/hooks.json" || status=$?
+      "$IHAR_ROOT/manifests/hooks.json" \
+      --auth-store "$IHAR_STORE" --lockfile "$IHAR_LOCKFILE" || status=$?
   done
   return "$status"
 }

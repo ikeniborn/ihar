@@ -21,16 +21,134 @@ from ihar.conformance import run as conformance   # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 MANIFEST = os.path.join(ROOT, "manifests", "hooks.json")
+LOCKFILE = os.path.join(ROOT, ".ihar-lockfile.json")
 CODEX = os.environ.get(
     "IHAR_CODEX_BIN",
     "/home/ikeniborn/Documents/Project/icodex/.codex-isolated/bin/codex",
 )
+
+EXPECTED_REQUIRED_CASES = {
+    "claude": {
+        "deny-blocks-the-tool",
+        "rewrite-reaches-the-tool",
+        "session-start-context",
+        "mcp-matcher-fires",
+        "timeout-behaviour",
+        "sandbox-direct-write",
+        "sandbox-child-write",
+        "sandbox-workspace-write",
+    },
+    "codex": {
+        "deny-blocks-the-tool",
+        "rewrite-reaches-the-tool",
+        "session-start-context",
+        "mcp-matcher-fires",
+        "timeout-behaviour",
+        "hook-is-loaded",
+        "trust-is-recordable",
+        "tampering-is-detected",
+    },
+}
 
 
 def _store():
     store = tempfile.mkdtemp(prefix="ihar-conf-store-")
     shutil.copytree(os.path.join(ROOT, "hooks"), os.path.join(store, "hooks"))
     return store
+
+
+def _fake_claude(store):
+    binary = os.path.join(store, "claude")
+    with open(binary, "w", encoding="utf-8") as handle:
+        handle.write(r'''#!/usr/bin/env python3
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print("2.1.274 (Claude Code)")
+    raise SystemExit(0)
+
+home = os.environ["CLAUDE_CONFIG_DIR"]
+with open(os.path.join(home, "settings.json"), encoding="utf-8") as stream:
+    settings = json.load(stream)
+
+
+def run_hooks(event, tool="", tool_input=None):
+    payload = {"hook_event_name": event, "tool_name": tool,
+               "tool_input": tool_input or {}, "session_id": "fake-session"}
+    decisions = []
+    updated = None
+    contexts = []
+    for group in settings["hooks"].get(event, []):
+        matcher = group.get("matcher")
+        if matcher is not None and re.fullmatch(matcher, tool) is None:
+            continue
+        for hook in group["hooks"]:
+            timeout = None if os.environ.get("IHAR_FAKE_IGNORE_TIMEOUT") else hook["timeout"]
+            try:
+                result = subprocess.run(
+                    hook["command"], input=json.dumps(payload), text=True,
+                    capture_output=True, env=os.environ, timeout=timeout,
+                    shell=True, executable="/bin/bash",
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            body = json.loads(result.stdout) if result.stdout.strip() else {}
+            output = body.get("hookSpecificOutput", {})
+            if output.get("permissionDecision"):
+                decisions.append(output["permissionDecision"])
+            if output.get("updatedInput"):
+                updated = output["updatedInput"]
+            if output.get("additionalContext"):
+                contexts.append(output["additionalContext"])
+    return decisions, updated, contexts
+
+
+_, _, contexts = run_hooks("SessionStart")
+prompt = sys.argv[-1]
+if "MCP server's prove tool" in prompt:
+    tool = "mcp__ihar-conformance__prove"
+    decisions, _, _ = run_hooks("PreToolUse", tool, {})
+    if "deny" not in decisions:
+        path = sys.argv[sys.argv.index("--mcp-config") + 1]
+        with open(path, encoding="utf-8") as stream:
+            config = json.load(stream)["mcpServers"]["ihar-conformance"]
+        server = subprocess.Popen(
+            [config["command"], *config["args"]], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, text=True,
+        )
+        for request in (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "prove", "arguments": {}}},
+        ):
+            server.stdin.write(json.dumps(request) + "\n")
+            server.stdin.flush()
+            json.loads(server.stdout.readline())
+        server.stdin.close()
+        server.wait(timeout=5)
+elif "SessionStart hook supplied" in prompt:
+    target = prompt.rsplit(" to ", 1)[1].removesuffix(".")
+    token = next(value for value in contexts if value.startswith("IHAR-CONFORMANCE-"))
+    command = f"printf '%s' {shlex.quote(token)} > {target}"
+    decisions, updated, _ = run_hooks("PreToolUse", "Bash", {"command": command})
+    if "deny" not in decisions:
+        subprocess.run((updated or {"command": command})["command"], shell=True, check=True)
+else:
+    command = prompt.split("tool: ", 1)[1]
+    decisions, updated, _ = run_hooks("PreToolUse", "Bash", {"command": command})
+    if "deny" not in decisions:
+        subprocess.run((updated or {"command": command})["command"], shell=True, check=True)
+print("{}")
+''')
+    os.chmod(binary, 0o755)
+    return binary
 
 
 def test_the_record_validates_as_a_contract():
@@ -42,7 +160,7 @@ def test_the_record_validates_as_a_contract():
         "created_at": "2026-09-18T10:00:00Z",
         "cases": {
             name: {"status": "passed", "detail": "x"}
-            for name in conformance.REQUIRED_CASES["codex"]
+            for name in EXPECTED_REQUIRED_CASES["codex"]
         },
     }
     jsonio.check("conformance", record)
@@ -68,7 +186,8 @@ def test_records_require_every_vendor_live_case_without_skips():
         "manifest_digest": "b" * 64,
         "created_at": "2026-09-18T10:00:00Z",
     }
-    for vendor, required in conformance.REQUIRED_CASES.items():
+    assert conformance.REQUIRED_CASES == EXPECTED_REQUIRED_CASES
+    for vendor, required in EXPECTED_REQUIRED_CASES.items():
         complete = {
             **base,
             "vendor": vendor,
@@ -94,38 +213,79 @@ def test_records_require_every_vendor_live_case_without_skips():
             raise AssertionError(f"incomplete {vendor} live evidence validated: {broken}")
 
 
-def test_run_routes_every_mandatory_live_case_through_the_vendor():
+def test_fake_native_vendor_executes_every_mandatory_live_hook_protocol():
     store = _store()
-    binary = os.path.join(store, "codex")
-    with open(binary, "w", encoding="utf-8") as handle:
-        handle.write("#!/bin/sh\nprintf 'codex-cli pinned-test\\n'\n")
-    os.chmod(binary, 0o755)
-
-    seen = []
-    original = conformance._run_live_case
-    original_cases = conformance.CASES
-
-    def fake_live_case(vendor, selected_binary, home, workdir, name):
-        assert vendor == "codex"
-        assert selected_binary == binary
-        seen.append(name)
-        return "passed", "vendor loaded, fired and honoured the hook"
-
-    conformance._run_live_case = fake_live_case
-    conformance.CASES = {
-        name: (lambda _vendor, _binary, _home, _workdir: ("passed", "existing proof"))
-        for name in original_cases
-    }
+    binary = _fake_claude(store)
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
     try:
-        record = conformance.run("codex", binary, store, MANIFEST)
+        conformance._stage(store, MANIFEST, "claude", home, auth_store=store)
+        results = {
+            name: conformance._run_live_case("claude", binary, home, workdir, name)
+            for name in (
+                "deny-blocks-the-tool",
+                "rewrite-reaches-the-tool",
+                "session-start-context",
+                "mcp-matcher-fires",
+                "timeout-behaviour",
+            )
+        }
     finally:
-        conformance._run_live_case = original
-        conformance.CASES = original_cases
-        shutil.rmtree(store, ignore_errors=True)
+        for directory in (store, home, workdir):
+            shutil.rmtree(directory, ignore_errors=True)
+    assert all(status == "passed" for status, _ in results.values()), results
 
-    assert set(seen) == conformance.LIVE_CASES, seen
-    assert all(record["cases"][name]["status"] == "passed"
-               for name in conformance.LIVE_CASES)
+
+def test_deny_needs_an_explicit_probe_decision_not_only_an_absent_sentinel():
+    store = _store()
+    binary = _fake_claude(store)
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
+    real_turn = conformance._vendor_turn
+
+    def incomplete_turn(_vendor, _binary, selected_home, selected_workdir, _prompt, **_kwargs):
+        block, _ = conformance._hook_block(selected_home, "claude")
+        command = next(
+            hook["command"] for group in block["PreToolUse"]
+            for hook in group["hooks"] if "conformance-probe.py" in hook["command"]
+        )
+        marker = shlex.split(command)[4]
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write("invoked\n")
+        return conformance.subprocess.CompletedProcess([_binary], 0, "{}", "")
+
+    import shlex
+    conformance._vendor_turn = incomplete_turn
+    try:
+        conformance._stage(store, MANIFEST, "claude", home, auth_store=store)
+        status, detail = conformance._run_live_case(
+            "claude", binary, home, workdir, "deny-blocks-the-tool"
+        )
+    finally:
+        conformance._vendor_turn = real_turn
+        for directory in (store, home, workdir):
+            shutil.rmtree(directory, ignore_errors=True)
+    assert status == "failed", detail
+    assert "deny decision" in detail
+
+
+def test_timeout_rejects_a_vendor_that_ignores_the_configured_limit():
+    store = _store()
+    binary = _fake_claude(store)
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
+    os.environ["IHAR_FAKE_IGNORE_TIMEOUT"] = "1"
+    try:
+        conformance._stage(store, MANIFEST, "claude", home, auth_store=store)
+        status, detail = conformance._run_live_case(
+            "claude", binary, home, workdir, "timeout-behaviour"
+        )
+    finally:
+        os.environ.pop("IHAR_FAKE_IGNORE_TIMEOUT", None)
+        for directory in (store, home, workdir):
+            shutil.rmtree(directory, ignore_errors=True)
+    assert status == "failed", detail
+    assert "timeout" in detail.lower()
 
 
 def test_resealing_codex_replaces_only_the_generated_trust_region():
@@ -185,22 +345,45 @@ def test_vendor_turn_uses_supported_native_cli_and_exact_claude_tool_allowlist()
 
 
 def test_staged_vendor_home_links_the_stable_shared_login():
-    store = _store()
+    stage = _store()
+    active = tempfile.mkdtemp(prefix="ihar-conf-active-store-")
     try:
         for vendor, name in (("claude", ".credentials.json"), ("codex", "auth.json")):
-            source_dir = os.path.join(store, "auth", vendor)
+            source_dir = os.path.join(active, "auth", vendor)
             os.makedirs(source_dir, exist_ok=True)
             source = os.path.join(source_dir, name)
             with open(source, "w", encoding="utf-8") as handle:
                 handle.write("login evidence\n")
             home = tempfile.mkdtemp(prefix=f"ihar-conf-{vendor}-")
             try:
-                conformance._stage(store, MANIFEST, vendor, home)
+                conformance._stage(stage, MANIFEST, vendor, home, auth_store=active)
                 target = os.path.join(home, name)
                 assert os.path.islink(target), f"{vendor} login was copied or omitted"
                 assert os.path.realpath(target) == os.path.realpath(source)
+                assert not os.path.exists(os.path.join(stage, "auth", vendor, name))
             finally:
                 shutil.rmtree(home, ignore_errors=True)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(active, ignore_errors=True)
+
+
+def test_run_rejects_a_binary_that_does_not_match_the_release_pin():
+    store = _store()
+    binary = os.path.join(store, "codex")
+    with open(binary, "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\nprintf 'codex-cli 9.9.9\\n'\n")
+    os.chmod(binary, 0o755)
+    try:
+        try:
+            conformance.run(
+                "codex", binary, store, MANIFEST,
+                auth_store=store, lockfile_path=LOCKFILE,
+            )
+        except RuntimeError as error:
+            assert "pinned" in str(error)
+        else:
+            raise AssertionError("an unpinned vendor binary produced conformance evidence")
     finally:
         shutil.rmtree(store, ignore_errors=True)
 
@@ -292,15 +475,24 @@ def test_claude_run_probes_native_sandbox_writes():
     conformance.subprocess.run = fake_vendor
     try:
         record = conformance.run(
-            "claude", binary, store, MANIFEST, protected_store=active_store
+            "claude", binary, store, MANIFEST,
+            auth_store=active_store,
+            lockfile_path=LOCKFILE,
+            protected_store=active_store,
         )
         protected_paths = tuple(probe_paths)
         protected_seen = {kind: set(paths) for kind, paths in seen.items()}
         protected_attempted = {kind: set(paths) for kind, paths in attempted.items()}
         mode[0] = "unavailable"
-        unavailable_record = conformance.run("claude", binary, store, MANIFEST)
+        unavailable_record = conformance.run(
+            "claude", binary, store, MANIFEST,
+            auth_store=active_store, lockfile_path=LOCKFILE,
+        )
         mode[0] = "unsandboxed"
-        unsandboxed_record = conformance.run("claude", binary, store, MANIFEST)
+        unsandboxed_record = conformance.run(
+            "claude", binary, store, MANIFEST,
+            auth_store=active_store, lockfile_path=LOCKFILE,
+        )
     finally:
         conformance.subprocess.run = real_run
         shutil.rmtree(store, ignore_errors=True)
@@ -338,7 +530,10 @@ def test_the_full_run_against_the_pinned_codex():
         return
     store = _store()
     try:
-        record = conformance.run("codex", CODEX, store, MANIFEST)
+        record = conformance.run(
+            "codex", CODEX, store, MANIFEST,
+            auth_store=store, lockfile_path=LOCKFILE,
+        )
         jsonio.check("conformance", record)
         failed = {name: case for name, case in record["cases"].items()
                   if case["status"] == "failed"}

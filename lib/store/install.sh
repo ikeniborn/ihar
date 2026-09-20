@@ -515,7 +515,9 @@ ihar_install_conformance() {
     binary="$(eval echo "\$IHAR_${vendor^^}_BIN")"
     [[ -x "$binary" ]] || continue
     ihar_python ihar.conformance.run "$vendor" "$binary" "$IHAR_STORE" \
-      "$IHAR_ROOT/manifests/hooks.json" --protected-store "$protected_store" >/dev/null \
+      "$IHAR_ROOT/manifests/hooks.json" \
+      --auth-store "$protected_store" --lockfile "$IHAR_LOCKFILE" \
+      --protected-store "$protected_store" >/dev/null \
       || { ihar_warn "hook conformance did not pass for $vendor"; status=1; }
   done
   return "$status"
