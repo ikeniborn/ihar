@@ -14,6 +14,9 @@ source "$ROOT/lib/state/runtime.sh"
 source "$ROOT/lib/state/migrate.sh"
 source "$ROOT/lib/state/gc.sh"
 
+assert_eq "legacy migration is explicit, never hidden in launch" "1" \
+  "$(grep -c 'ihar_migrate_vendor ' "$ROOT/lib/cli/commands.sh")"
+
 IHAR_ROOT="$ROOT"; export IHAR_ROOT
 PROJECT="$IHAR_TEST_TMP/My Project"
 mkdir -p "$PROJECT"
@@ -239,13 +242,216 @@ ihar_migrate_vendor claude "$UNREADABLE" "$PROJECT" >/dev/null 2>&1
 assert_exit "a legacy home with an unreadable marker is skipped" 1 \
   test -f "$UNREADABLE/st/claude/projects/one.jsonl"
 
-# With no marker at all, the hash match is all the evidence icodex ever provides.
+# Claude requires its marker; hash-only attribution is reserved for Codex.
 NOMARK="$IHAR_TEST_TMP/nomark-state"
 mkdir -p "$NOMARK/st/claude"
 rm -f "$LEGACY/home.json"
 ihar_migrate_vendor claude "$NOMARK" "$PROJECT" >/dev/null 2>&1
-assert_exit "a legacy home with no marker migrates on the hash match" 0 \
+assert_exit "a Claude legacy home with no marker is skipped" 1 \
   test -f "$NOMARK/st/claude/projects/one.jsonl"
+
+# A failed copy must leave the target empty and return failure, or the next attempt
+# would mistake partial data for live state and never retry.
+FAIL_PROJECT="$IHAR_TEST_TMP/fail-project"
+FAIL_HASH="$(printf '%s' "$FAIL_PROJECT" | sha256sum | cut -c1-12)"
+FAIL_LEGACY="$IHAR_TEST_TMP/parent/iclaude/.claude-homes/fail-$FAIL_HASH"
+FAIL_STATE="$IHAR_TEST_TMP/fail-state"
+mkdir -p "$FAIL_PROJECT" "$FAIL_LEGACY/projects" "$FAIL_STATE/st/claude"
+printf '{"schema":1,"project_root":"%s","created":"2026-01-01T00:00:00Z"}\n' \
+  "$FAIL_PROJECT" > "$FAIL_LEGACY/home.json"
+printf 'unreadable\n' > "$FAIL_LEGACY/projects/session.jsonl"
+chmod 000 "$FAIL_LEGACY/projects/session.jsonl"
+copy_status=0
+copy_out="$(ihar_migrate_vendor claude "$FAIL_STATE" "$FAIL_PROJECT" 2>/dev/null)" \
+  || copy_status=$?
+assert_eq "a failed migration returns failure" "1" "$copy_status"
+assert_eq "a failed migration reports no source" "" "$copy_out"
+assert_eq "a failed migration leaves the target empty" "0" \
+  "$(find "$FAIL_STATE/st/claude" -mindepth 1 -maxdepth 1 | wc -l)"
+chmod 600 "$FAIL_LEGACY/projects/session.jsonl"
+
+# The operator command migrates both vendors in one locked operation and records
+# the sources. Removing the `migrate` branch, either vendor call, or marker update
+# must break an observable assertion below.
+QUIET_PROJECT="$IHAR_TEST_TMP/quiescence-project"
+QUIET_STATE_ROOT="$IHAR_TEST_TMP/quiescence-state"
+QUIET_HASH="$(printf '%s' "$QUIET_PROJECT" | sha256sum | cut -c1-12)"
+QUIET_CLAUDE="$IHAR_TEST_TMP/parent/iclaude/.claude-homes/quiescence-$QUIET_HASH"
+QUIET_CODEX="$IHAR_TEST_TMP/parent/icodex/.codex-homes/quiescence-$QUIET_HASH"
+mkdir -p "$QUIET_PROJECT" "$QUIET_CLAUDE/projects" "$QUIET_CODEX"
+printf 'claude-active\n' > "$QUIET_CLAUDE/projects/session.jsonl"
+printf 'codex-active\n' > "$QUIET_CODEX/state_5.sqlite"
+printf '{"schema":1,"project_root":"%s","created":"2026-01-01T00:00:00Z"}\n' \
+  "$QUIET_PROJECT" > "$QUIET_CLAUDE/home.json"
+CODEX_HOME="$QUIET_CODEX" sleep 30 &
+writer_pid=$!
+quiet_status=0
+quiet_out="$(cd "$QUIET_PROJECT" && IHAR_ROOT="$IHAR_TEST_TMP/parent/ihar" \
+  IHAR_STATE_ROOT="$QUIET_STATE_ROOT" IHAR_STORE="$IHAR_STORE" \
+  "$ROOT/ihar.sh" homes migrate 2>&1)" || quiet_status=$?
+kill "$writer_pid" 2>/dev/null || true
+wait "$writer_pid" 2>/dev/null || true
+QUIET_STATE="$QUIET_STATE_ROOT/$(printf '%s' "$QUIET_PROJECT" | sha256sum | cut -c1-8)"
+assert_eq "an active legacy writer refuses the whole migration" "1" "$quiet_status"
+assert_contains "the refusal identifies the active Codex home" "$quiet_out" "$QUIET_CODEX"
+assert_eq "an active Codex writer prevents Claude copying too" "0" \
+  "$(find "$QUIET_STATE/st/claude" -mindepth 1 -maxdepth 1 | wc -l)"
+assert_eq "an active writer leaves Codex state empty" "0" \
+  "$(find "$QUIET_STATE/st/codex" -mindepth 1 -maxdepth 1 | wc -l)"
+
+lock_ready="$IHAR_TEST_TMP/lifecycle-lock-ready"
+bash -c 'exec {fd}>"$1.ihar-lifecycle.lock"; flock -s "$fd"; : > "$2"; sleep 30' _ \
+  "$QUIET_CODEX" "$lock_ready" &
+lock_writer_pid=$!
+while [[ ! -e "$lock_ready" ]]; do :; done
+lock_status=0
+(cd "$QUIET_PROJECT" && IHAR_ROOT="$IHAR_TEST_TMP/parent/ihar" \
+  IHAR_STATE_ROOT="$QUIET_STATE_ROOT" IHAR_STORE="$IHAR_STORE" \
+  IHAR_MIGRATION_LOCK_TIMEOUT=1 "$ROOT/ihar.sh" homes migrate) >/dev/null 2>&1 \
+  || lock_status=$?
+kill "$lock_writer_pid" 2>/dev/null || true
+wait "$lock_writer_pid" 2>/dev/null || true
+assert_eq "a wrapper lifecycle lock refuses migration" "3" "$lock_status"
+assert_eq "a lifecycle-lock refusal copies neither vendor" "0" \
+  "$(find "$QUIET_STATE/st/claude" "$QUIET_STATE/st/codex" -mindepth 1 -maxdepth 1 | wc -l)"
+
+# Environment detection is vendor-specific, and a process that no longer exposes
+# the vendor variable must still be caught through an open descriptor.
+CLAUDE_CONFIG_DIR="$QUIET_CLAUDE" sleep 30 &
+claude_writer_pid=$!
+assert_eq "a Claude environment identifies its writer" "$claude_writer_pid" \
+  "$(_ihar_legacy_writer_pid claude "$QUIET_CLAUDE")"
+kill "$claude_writer_pid" 2>/dev/null || true
+wait "$claude_writer_pid" 2>/dev/null || true
+
+fd_ready="$IHAR_TEST_TMP/fd-writer-ready"
+bash -c 'exec 9<"$1"; : > "$2"; sleep 30' _ \
+  "$QUIET_CODEX/state_5.sqlite" "$fd_ready" &
+fd_writer_pid=$!
+while [[ ! -e "$fd_ready" ]]; do :; done
+assert_eq "an open legacy descriptor identifies its writer" "$fd_writer_pid" \
+  "$(_ihar_legacy_writer_pid codex "$QUIET_CODEX")"
+kill "$fd_writer_pid" 2>/dev/null || true
+wait "$fd_writer_pid" 2>/dev/null || true
+
+# A transient process can mutate the source during rsync and exit before the next
+# process scan. The staged bytes must still be rejected as an unstable snapshot.
+RACE_PROJECT="$IHAR_TEST_TMP/race-project"
+RACE_HASH="$(printf '%s' "$RACE_PROJECT" | sha256sum | cut -c1-12)"
+RACE_LEGACY="$IHAR_TEST_TMP/parent/icodex/.codex-homes/race-$RACE_HASH"
+RACE_STATE="$IHAR_TEST_TMP/race-state"
+RACE_BIN="$IHAR_TEST_TMP/race-bin"
+mkdir -p "$RACE_PROJECT" "$RACE_LEGACY" "$RACE_STATE/st/codex" "$RACE_BIN"
+printf 'before\n' > "$RACE_LEGACY/state_5.sqlite"
+cat > "$RACE_BIN/rsync" <<'EOF'
+#!/usr/bin/env bash
+/usr/bin/rsync "$@" || exit
+if [[ ! -e "$IHAR_TEST_RACE_DONE" ]]; then
+  : > "$IHAR_TEST_RACE_DONE"
+  printf 'during-copy\n' >> "$IHAR_TEST_RACE_SOURCE/state_5.sqlite"
+fi
+EOF
+chmod +x "$RACE_BIN/rsync"
+race_status=0
+PATH="$RACE_BIN:$PATH" IHAR_TEST_RACE_SOURCE="$RACE_LEGACY" \
+  IHAR_TEST_RACE_DONE="$IHAR_TEST_TMP/race-done" \
+  ihar_migrate_vendor codex "$RACE_STATE" "$RACE_PROJECT" >/dev/null 2>&1 \
+  || race_status=$?
+assert_eq "a transient writer makes the migration fail" "1" "$race_status"
+assert_eq "an unstable snapshot is discarded" "0" \
+  "$(find "$RACE_STATE/st/codex" -mindepth 1 -maxdepth 1 | wc -l)"
+
+CLI_PROJECT="$IHAR_TEST_TMP/real-project"
+CLI_STATE_ROOT="$IHAR_TEST_TMP/real-state"
+CLI_HASH="$(printf '%s' "$CLI_PROJECT" | sha256sum | cut -c1-12)"
+CLI_CLAUDE="$IHAR_TEST_TMP/parent/iclaude/.claude-homes/real-$CLI_HASH"
+CLI_CODEX="$IHAR_TEST_TMP/parent/icodex/.codex-homes/real-$CLI_HASH"
+mkdir -p "$CLI_PROJECT" "$CLI_CLAUDE/projects" "$CLI_CODEX"
+printf 'claude-history\n' > "$CLI_CLAUDE/projects/session.jsonl"
+ln -s /etc/passwd "$CLI_CLAUDE/projects/nested-link"
+mkfifo "$CLI_CLAUDE/projects/nested-fifo"
+printf 'codex-history\n' > "$CLI_CODEX/state_5.sqlite"
+printf 'codex-wal\n' > "$CLI_CODEX/state_5.sqlite-wal"
+printf 'thread-history\n' > "$CLI_CODEX/thread_history_1.sqlite"
+printf 'thread-wal\n' > "$CLI_CODEX/thread_history_1.sqlite-wal"
+printf '{"schema":1,"project_root":"%s","created":"2026-01-01T00:00:00Z"}\n' \
+  "$CLI_PROJECT" > "$CLI_CLAUDE/home.json"
+
+LOCK_PROBE_BIN="$IHAR_TEST_TMP/lock-probe-bin"
+LOCK_PROBE_GAP="$IHAR_TEST_TMP/lock-probe-gap"
+mkdir -p "$LOCK_PROBE_BIN"
+cat > "$LOCK_PROBE_BIN/rsync" <<'EOF'
+#!/usr/bin/env bash
+source_path="${*: -2:1}"
+legacy="$(dirname "$source_path")"
+if flock -s -n "$legacy.ihar-lifecycle.lock" true 2>/dev/null; then
+  : > "$IHAR_TEST_LOCK_PROBE_GAP"
+fi
+exec /usr/bin/rsync "$@"
+EOF
+chmod +x "$LOCK_PROBE_BIN/rsync"
+migrate_out="$(cd "$CLI_PROJECT" && PATH="$LOCK_PROBE_BIN:$PATH" \
+  IHAR_TEST_LOCK_PROBE_GAP="$LOCK_PROBE_GAP" IHAR_ROOT="$IHAR_TEST_TMP/parent/ihar" \
+  IHAR_STATE_ROOT="$CLI_STATE_ROOT" IHAR_STORE="$IHAR_STORE" "$ROOT/ihar.sh" homes migrate 2>&1)"
+CLI_STATE="$CLI_STATE_ROOT/$(printf '%s' "$CLI_PROJECT" | sha256sum | cut -c1-8)"
+assert_contains "homes migrate reports the Claude source" "$migrate_out" "$CLI_CLAUDE"
+assert_contains "homes migrate reports the Codex source" "$migrate_out" "$CLI_CODEX"
+assert_exit "homes migrate copies Claude state" 0 \
+  test -f "$CLI_STATE/st/claude/projects/session.jsonl"
+assert_exit "homes migrate copies Codex state" 0 \
+  test -f "$CLI_STATE/st/codex/state_5.sqlite"
+assert_exit "homes migrate copies the Codex WAL with its database" 0 \
+  test -f "$CLI_STATE/st/codex/state_5.sqlite-wal"
+assert_exit "homes migrate copies the thread-history WAL with its database" 0 \
+  test -f "$CLI_STATE/st/codex/thread_history_1.sqlite-wal"
+assert_exit "homes migrate skips nested legacy symlinks" 1 \
+  test -e "$CLI_STATE/st/claude/projects/nested-link"
+assert_exit "homes migrate skips nested special files" 1 \
+  test -e "$CLI_STATE/st/claude/projects/nested-fifo"
+assert_exit "migration holds exclusive locks throughout rsync" 1 \
+  test -e "$LOCK_PROBE_GAP"
+assert_exit "homes migrate leaves Claude legacy state" 0 test -f "$CLI_CLAUDE/projects/session.jsonl"
+assert_exit "homes migrate leaves Codex legacy state" 0 test -f "$CLI_CODEX/state_5.sqlite"
+assert_eq "homes migrate records both sources" \
+  "$CLI_CLAUDE|$CLI_CODEX" \
+  "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["migrated_from"]; print(d["claude"]+"|"+d["codex"])' "$CLI_STATE/home.json")"
+
+printf 'live\n' > "$CLI_STATE/st/claude/projects/session.jsonl"
+(cd "$CLI_PROJECT" && IHAR_ROOT="$IHAR_TEST_TMP/parent/ihar" \
+  IHAR_STATE_ROOT="$CLI_STATE_ROOT" IHAR_STORE="$IHAR_STORE" "$ROOT/ihar.sh" homes migrate) \
+  >/dev/null 2>&1
+assert_eq "homes migrate never overwrites populated state" "live" \
+  "$(cat "$CLI_STATE/st/claude/projects/session.jsonl")"
+
+# A marker-write failure rolls that vendor back but must not prevent the other
+# vendor from completing and being recorded.
+MARK_PROJECT="$IHAR_TEST_TMP/marker-fail-project"
+MARK_STATE_ROOT="$IHAR_TEST_TMP/marker-fail-state"
+MARK_HASH="$(printf '%s' "$MARK_PROJECT" | sha256sum | cut -c1-12)"
+MARK_CLAUDE="$IHAR_TEST_TMP/parent/iclaude/.claude-homes/marker-$MARK_HASH"
+MARK_CODEX="$IHAR_TEST_TMP/parent/icodex/.codex-homes/marker-$MARK_HASH"
+mkdir -p "$MARK_PROJECT" "$MARK_CLAUDE/projects" "$MARK_CODEX/sessions"
+printf 'claude\n' > "$MARK_CLAUDE/projects/session.jsonl"
+printf 'codex\n' > "$MARK_CODEX/sessions/session.jsonl"
+printf '{"schema":1,"project_root":"%s","created":"2026-01-01T00:00:00Z"}\n' \
+  "$MARK_PROJECT" > "$MARK_CLAUDE/home.json"
+cat > "$IHAR_TEST_TMP/python-marker-fail" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"--record-migration"*" claude "* ]]; then exit 1; fi
+exec python3 "$@"
+EOF
+chmod +x "$IHAR_TEST_TMP/python-marker-fail"
+assert_exit "one marker failure makes the command fail" 1 \
+  bash -c "cd '$MARK_PROJECT' && IHAR_ROOT='$IHAR_TEST_TMP/parent/ihar' \
+    IHAR_STATE_ROOT='$MARK_STATE_ROOT' IHAR_STORE='$IHAR_STORE' \
+    IHAR_PY='$IHAR_TEST_TMP/python-marker-fail' '$ROOT/ihar.sh' homes migrate"
+MARK_STATE="$MARK_STATE_ROOT/$(printf '%s' "$MARK_PROJECT" | sha256sum | cut -c1-8)"
+assert_eq "a marker failure rolls its copied state back" "0" \
+  "$(find "$MARK_STATE/st/claude" -mindepth 1 -maxdepth 1 | wc -l)"
+assert_exit "a Claude marker failure does not block Codex migration" 0 \
+  test -f "$MARK_STATE/st/codex/sessions/session.jsonl"
+assert_eq "the successful Codex source is still recorded" "$MARK_CODEX" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["migrated_from"]["codex"])' "$MARK_STATE/home.json")"
 
 IHAR_ROOT="$ROOT"
 
