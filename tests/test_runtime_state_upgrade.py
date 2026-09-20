@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from unittest import mock
 
@@ -388,6 +389,125 @@ def test_unavailable_process_proof_fails_closed():
             raise AssertionError("missing process evidence was treated as quiescence")
 
 
+def test_unreadable_live_process_environment_fails_closed():
+    module = implementation()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest, state, (runtime,) = fixture(Path(tmp), "99999989")
+        write_materialized(runtime)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import ctypes,sys; "
+                    "assert ctypes.CDLL(None).prctl(4,0,0,0,0) == 0; "
+                    "print('ready', flush=True); sys.stdin.read()"
+                ),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdout is not None and process.stdout.readline().strip() == "ready"
+        try:
+            try:
+                run_upgrade(module, manifest, state, "codex", process.pid)
+            except module.UpgradeError as error:
+                assert "cannot prove" in str(error)
+                assert str(process.pid) in str(error)
+            else:
+                raise AssertionError("an unreadable live process was treated as irrelevant")
+        finally:
+            assert process.stdin is not None
+            process.stdin.close()
+            process.wait(timeout=5)
+
+        assert_materialized(runtime)
+        assert not any((state / "st" / "codex").iterdir())
+
+
+def test_partial_live_process_environment_fails_closed():
+    module = implementation()
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None and process.stdout.readline().strip() == "ready"
+    try:
+        with mock.patch.object(module, "_proc_processes", return_value=[Path(f"/proc/{process.pid}")]), \
+             mock.patch.object(module.Path, "read_bytes", return_value=b"CODEX_HOME=/partial"):
+            try:
+                module._require_quiescent(
+                    [Path("/state/r/generation/codex")],
+                    Path("/state/st/codex"),
+                    Path("/state/r/generation/codex"),
+                )
+            except module.UpgradeError as error:
+                assert "incomplete" in str(error)
+                assert str(process.pid) in str(error)
+            else:
+                raise AssertionError("a partial live process environment was accepted")
+    finally:
+        assert process.stdin is not None
+        process.stdin.close()
+        process.wait(timeout=5)
+
+
+def test_current_helper_is_excluded_by_pid_even_when_environment_is_unreadable():
+    module = implementation()
+    with mock.patch.object(module, "_proc_processes", return_value=[Path(f"/proc/{os.getpid()}")]), \
+         mock.patch.object(module.Path, "read_bytes", side_effect=PermissionError("unreadable")):
+        module._require_quiescent(
+            [Path("/state/r/generation/codex")],
+            Path("/state/st/codex"),
+            Path("/state/r/generation/codex"),
+        )
+
+
+def test_native_runtime_selectors_block_owner_sibling_and_canonical_state():
+    module = implementation()
+    cases = (
+        ("CODEX_HOME", "sibling"),
+        ("CLAUDE_CONFIG_DIR", "owner"),
+        ("CODEX_HOME", "canonical"),
+    )
+    for selector, target_kind in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, state, runtimes = fixture(Path(tmp), "99999987", "99999988")
+            write_materialized(runtimes[0])
+            targets = {
+                "owner": runtimes[0],
+                "sibling": runtimes[1],
+                "canonical": state / "st" / "codex",
+            }
+            environment = {**os.environ, selector: str(targets[target_kind])}
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            assert process.stdout is not None and process.stdout.readline().strip() == "ready"
+            try:
+                try:
+                    run_upgrade(module, manifest, state, "codex", process.pid)
+                except module.UpgradeError as error:
+                    assert selector in str(error)
+                    assert str(targets[target_kind]) in str(error)
+                else:
+                    raise AssertionError(f"active native selector {selector} was ignored")
+            finally:
+                assert process.stdin is not None
+                process.stdin.close()
+                process.wait(timeout=5)
+
+            assert_materialized(runtimes[0])
+            assert not any((state / "st" / "codex").iterdir())
+
+
 def test_active_sibling_runtime_blocks_materialized_owner_migration():
     module = implementation()
     with tempfile.TemporaryDirectory() as tmp:
@@ -477,6 +597,123 @@ def test_post_exchange_late_write_rolls_back_atomic_publication():
         assert (runtime / "history.jsonl").read_text() == "after exchange\n"
         assert not runtime.joinpath("history.jsonl").is_symlink()
         assert not any((state / "st" / "codex").iterdir())
+
+
+def test_atomic_exchange_uses_one_renameat2_exchange_syscall():
+    module = implementation()
+    calls = []
+
+    class RenameAt2:
+        argtypes = None
+        restype = None
+
+        def __call__(self, *args):
+            calls.append(args)
+            return 0
+
+    renameat2 = RenameAt2()
+    libc = type("LibC", (), {"renameat2": renameat2})()
+    with mock.patch.object(module.ctypes, "CDLL", return_value=libc):
+        module._exchange_directories(10, "staged", 20, "canonical")
+
+    assert calls == [(10, b"staged", 20, b"canonical", module._RENAME_EXCHANGE)]
+
+
+def test_atomic_exchange_never_exposes_a_missing_canonical_directory():
+    module = implementation()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "staged").mkdir()
+        (root / "canonical").mkdir()
+        parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        started = threading.Event()
+        stop = threading.Event()
+        missing = []
+
+        def observe():
+            started.set()
+            while not stop.is_set():
+                if not (root / "canonical").is_dir():
+                    missing.append(True)
+                    return
+
+        observer = threading.Thread(target=observe)
+        observer.start()
+        assert started.wait(timeout=5)
+        try:
+            for _attempt in range(500):
+                module._exchange_directories(parent_fd, "staged", parent_fd, "canonical")
+        finally:
+            stop.set()
+            observer.join(timeout=5)
+            os.close(parent_fd)
+
+        assert not observer.is_alive()
+        assert not missing, "canonical directory disappeared during publication"
+
+
+def test_missing_atomic_exchange_support_preserves_every_original_byte():
+    module = implementation()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest, state, (runtime,) = fixture(Path(tmp), "99999986")
+        write_materialized(runtime)
+        canonical = state / "st" / "codex"
+        before = (runtime / "history.jsonl").read_bytes()
+
+        with mock.patch.object(module.ctypes, "CDLL", return_value=object()):
+            try:
+                run_upgrade(module, manifest, state, "codex")
+            except module.UpgradeError as error:
+                assert "atomic directory exchange is unavailable" in str(error)
+            else:
+                raise AssertionError("migration published without atomic exchange support")
+
+        assert (runtime / "history.jsonl").read_bytes() == before
+        assert_materialized(runtime)
+        assert canonical.is_dir() and not any(canonical.iterdir())
+        assert not list((state / "st").glob(".runtime-upgrade-*"))
+
+
+def test_exchange_rollback_failure_reports_existing_recovery_with_original_bytes():
+    module = implementation()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest, state, (runtime,) = fixture(Path(tmp), "99999985")
+        write_materialized(runtime)
+        real_exchange = module._exchange_directories
+        real_fingerprint = module._fingerprint_entries
+        exchange_calls = 0
+        recovery_checks = 0
+
+        def publish_then_fail_rollback(*args, **kwargs):
+            nonlocal exchange_calls
+            exchange_calls += 1
+            if exchange_calls == 1:
+                return real_exchange(*args, **kwargs)
+            raise OSError("injected recovery exchange failure")
+
+        def fail_after_relink(root_fd, entries):
+            nonlocal recovery_checks
+            result = real_fingerprint(root_fd, entries)
+            recovery_checks += 1
+            if recovery_checks == 7:
+                return "mismatch"
+            return result
+
+        with mock.patch.object(module, "_exchange_directories", side_effect=publish_then_fail_rollback), \
+             mock.patch.object(module, "_fingerprint_entries", side_effect=fail_after_relink):
+            try:
+                run_upgrade(module, manifest, state, "codex")
+            except module.UpgradeError as error:
+                message = str(error)
+                assert "rollback is incomplete" in message
+            else:
+                raise AssertionError("incomplete rollback was hidden")
+
+        marker = "preserved recovery at "
+        reported = Path(message.split(marker, 1)[1].split(": ", 1)[0])
+        assert reported.is_dir(), f"reported recovery directory is missing: {reported}"
+        assert (reported / "history.jsonl").read_text(encoding="utf-8") == "history\n"
+        assert (reported / "sessions" / "thread.jsonl").read_text(encoding="utf-8") == "thread\n"
 
 
 if __name__ == "__main__":

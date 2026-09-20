@@ -469,6 +469,32 @@ def _proc_processes(proc: Path) -> list[Path]:
     return list(proc.iterdir())
 
 
+def _same_process_session(pid: int) -> bool:
+    try:
+        return os.getsid(pid) == os.getsid(0)
+    except ProcessLookupError:
+        return False
+
+
+def _selected_runtime(
+    environment: list[bytes], runtime_paths: list[Path], canonical: Path, owner: Path
+) -> tuple[str, Path] | None:
+    roots = [*runtime_paths, canonical, owner]
+    resolved_roots = [Path(os.path.realpath(root)) for root in roots]
+    for selector in ("IHAR_RUNTIME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"):
+        prefix = os.fsencode(selector + "=")
+        value = next((item[len(prefix) :] for item in environment if item.startswith(prefix)), None)
+        if value is None:
+            continue
+        selected = Path(os.path.realpath(os.fsdecode(value)))
+        if any(
+            selected == root or _path_within(os.fspath(selected), root)
+            for root in resolved_roots
+        ):
+            return selector, selected
+    return None
+
+
 def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) -> None:
     proc = Path("/proc")
     if not proc.is_dir():
@@ -495,27 +521,27 @@ def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) 
         if uid != current_uid:
             continue
         try:
-            environment = (process / "environ").read_bytes().split(b"\0")
+            environment_bytes = (process / "environ").read_bytes()
         except FileNotFoundError:
-            continue
-        except PermissionError:
-            # Non-dumpable session services expose neither environment nor fds.
-            # They provide no project-runtime evidence; candidate processes remain
-            # fail-closed below once their environment can be inspected.
             continue
         except OSError as error:
             if not _process_exists(process):
                 continue
+            if not _same_process_session(pid):
+                continue
             uncertainties.append(f"process {pid} environment: {error}")
             continue
-        runtime_value = next(
-            (item[len(b"IHAR_RUNTIME=") :] for item in environment if item.startswith(b"IHAR_RUNTIME=")),
-            None,
-        )
-        if runtime_value is not None:
-            active_runtime = Path(os.fsdecode(runtime_value))
-            if any(active_runtime == runtime for runtime in runtime_paths):
-                raise UpgradeError(f"runtime state is active in process {pid}: {active_runtime}")
+        if not environment_bytes or not environment_bytes.endswith(b"\0"):
+            if _same_process_session(pid):
+                uncertainties.append(f"process {pid} environment is incomplete")
+            continue
+        environment = environment_bytes.split(b"\0")
+        selected = _selected_runtime(environment, runtime_paths, canonical, owner)
+        if selected is not None:
+            selector, active_runtime = selected
+            raise UpgradeError(
+                f"runtime state is active in process {pid}: {selector}={active_runtime}"
+            )
         links: list[tuple[str, Path]] = [("cwd", process / "cwd")]
         try:
             links.extend(("open file", entry) for entry in (process / "fd").iterdir())
@@ -603,6 +629,33 @@ def _restore_runtime_entries(
     return failures
 
 
+def _rollback_transaction(
+    runtime_fd: int,
+    recovery_fd: int,
+    moved: list[tuple[str, str]],
+    published: bool,
+    committed: bool,
+    stage_fd: int,
+    st_fd: int,
+    vendor: str,
+) -> tuple[list[str], bool]:
+    failures: list[str] = []
+    if published and not committed and stage_fd >= 0:
+        try:
+            _exchange_directories(stage_fd, "vendor", st_fd, vendor)
+            published = False
+        except OSError as error:
+            failures.append(f"canonical state rollback: {error}")
+            # Runtime links still address the published canonical tree. Keep
+            # originals in recovery until canonical publication can be repaired.
+            return failures, published
+    if moved and recovery_fd >= 0:
+        failures.extend(_restore_runtime_entries(runtime_fd, recovery_fd, moved))
+        if not failures:
+            moved.clear()
+    return failures, published
+
+
 def upgrade(
     manifest: str | os.PathLike[str],
     state: str | os.PathLike[str],
@@ -627,6 +680,7 @@ def upgrade(
     recovery_path: Path | None = None
     published = False
     committed = False
+    rollback_incomplete = False
     moved: list[tuple[str, str]] = []
     try:
         views = _runtime_views(state_path, state_fd, vendor, entries)
@@ -749,20 +803,18 @@ def upgrade(
             pass
         return recovery_path
     except UpgradeError:
-        rollback_failures = (
-            _restore_runtime_entries(owners[0].descriptor, recovery_fd, moved)
-            if moved and recovery_fd >= 0
-            else []
+        rollback_failures, published = _rollback_transaction(
+            owners[0].descriptor if owners else -1,
+            recovery_fd,
+            moved,
+            published,
+            committed,
+            stage_fd,
+            st_fd,
+            vendor,
         )
-        if not rollback_failures:
-            moved.clear()
-        if published and not committed and stage_fd >= 0:
-            try:
-                _exchange_directories(stage_fd, "vendor", st_fd, vendor)
-                published = False
-            except OSError as error:
-                rollback_failures.append(f"canonical state rollback: {error}")
         if rollback_failures:
+            rollback_incomplete = True
             location = recovery_path or (state_path / "st" / (stage_name or ""))
             raise UpgradeError(
                 "runtime state rollback is incomplete; preserved recovery at "
@@ -770,20 +822,18 @@ def upgrade(
             )
         raise
     except OSError as error:
-        rollback_failures = (
-            _restore_runtime_entries(owners[0].descriptor, recovery_fd, moved)
-            if moved and recovery_fd >= 0
-            else []
+        rollback_failures, published = _rollback_transaction(
+            owners[0].descriptor if owners else -1,
+            recovery_fd,
+            moved,
+            published,
+            committed,
+            stage_fd,
+            st_fd,
+            vendor,
         )
-        if not rollback_failures:
-            moved.clear()
-        if published and not committed and stage_fd >= 0:
-            try:
-                _exchange_directories(stage_fd, "vendor", st_fd, vendor)
-                published = False
-            except OSError as rollback_error:
-                rollback_failures.append(f"canonical state rollback: {rollback_error}")
         if rollback_failures:
+            rollback_incomplete = True
             location = recovery_path or (state_path / "st" / (stage_name or ""))
             raise UpgradeError(
                 "runtime state rollback is incomplete; preserved recovery at "
@@ -799,7 +849,13 @@ def upgrade(
                 stage_name = None
             except (OSError, UpgradeError):
                 pass
-        if recovery_path is not None and not committed and not moved and recovery_fd >= 0:
+        if (
+            recovery_path is not None
+            and not committed
+            and not rollback_incomplete
+            and not moved
+            and recovery_fd >= 0
+        ):
             try:
                 recovery_parent_fd = _open_or_create_chain(
                     state_fd, ("recovery", "runtime-state", vendor), "runtime-state recovery"

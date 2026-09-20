@@ -86,3 +86,32 @@ Focused evidence on the final executable state:
 - `bash tests/test_state.sh` — exit 0, `PASS=317 FAIL=0`.
 - Python compile, Bash syntax, and `git diff --check` — exit 0.
 - Full suite intentionally not run per review-fix scope.
+
+## Review fix round 2
+
+### RED evidence
+
+- Focused upgrade tests failed when a live same-session process made `/proc/<pid>/environ` unreadable: migration treated the unknown process as irrelevant and published state.
+- Live processes selecting owner, sibling, or canonical state through `CODEX_HOME` and `CLAUDE_CONFIG_DIR` were ignored because only `IHAR_RUNTIME` was inspected.
+- An injected post-relink failure plus failed atomic rollback reported a recovery path that cleanup deleted.
+- Publication lacked direct tests that intercepted the exact `renameat2(..., RENAME_EXCHANGE)` call, rejected missing syscall support without mutation, and continuously observed canonical-directory presence.
+
+### Remediation
+
+- Same-UID, same-session processes with unreadable, empty, or partial environments are unknown consumers and fail closed. The current helper and its invoking ancestry are excluded by exact PID proof; unreadable processes outside that execution session are not candidate descendants.
+- Quiescence resolves `IHAR_RUNTIME`, `CODEX_HOME`, and `CLAUDE_CONFIG_DIR` and rejects selectors naming any same-vendor owner, sibling runtime, canonical root, or their descendants. Open-descriptor and cwd checks remain active.
+- Rollback restores canonical publication before runtime entries. When the atomic rollback fails, runtime links and original recovery bytes remain coherent; cleanup retains the exact recovery directory named in the error. All incomplete rollback paths now suppress evidence cleanup.
+- Tests intercept one libc `renameat2` invocation with the exact `RENAME_EXCHANGE` flag, exercise 500 exchanges under a concurrent canonical-presence observer, and prove missing atomic syscall support leaves canonical and materialized bytes unchanged.
+
+### GREEN evidence
+
+- `PYTHONPATH=lib/python python3 tests/test_jsonio.py` — exit 0, `PASS=29 FAIL=0`.
+- `PYTHONPATH=lib/python python3 tests/test_runtime_state_upgrade.py` — exit 0, `PASS=23 FAIL=0`.
+- `bash tests/test_contracts.sh` — exit 0, `PASS=84 FAIL=0`.
+- `PYTHONPATH=lib/python python3 tests/test_sessions_readers.py` — exit 0.
+- `bash tests/test_config.sh` — exit 0, `PASS=20 FAIL=0`.
+- `bash tests/test_profiles.sh` — exit 0, `PASS=58 FAIL=0`.
+- `bash tests/test_concurrency.sh` — exit 0, `PASS=33 FAIL=0`.
+- `bash tests/test_state.sh` — exit 0, `PASS=317 FAIL=0`.
+- Python compile, Bash syntax, and `git diff --check` — exit 0.
+- Full suite intentionally not run per review-fix scope.
