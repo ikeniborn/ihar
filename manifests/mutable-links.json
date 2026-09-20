@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "entries": [
+    {"vendor":"claude","source":"auth/claude/.credentials.json","target":".credentials.json","kind":"file"},
+    {"vendor":"codex","source":"auth/codex/auth.json","target":"auth.json","kind":"file"},
+    {"vendor":"claude","source":"plugins/claude","target":"plugins","kind":"directory"},
+    {"vendor":"codex","source":"plugins/codex","target":"plugins","kind":"directory"}
+  ]
+}

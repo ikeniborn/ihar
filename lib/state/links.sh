@@ -14,6 +14,52 @@ ihar_state_inventory() {
   ihar_python ihar.inventory state "$IHAR_ROOT/manifests/state.json" "$1"
 }
 
+# _ihar_reconcile_runtime_mutable_links <vendor> <runtime-dir> <inventory> —
+# validate every target before creating any link. A materialised or wrong target
+# may contain the only auth/plugin bytes from an older layout, so preserve it and
+# fail with a recovery instruction instead of repairing over it.
+_ihar_reconcile_runtime_mutable_links() {
+  local vendor="$1" runtime="$2" inventory="$3"
+  local source name kind target
+
+  while IFS=$'\t' read -r source name kind; do
+    [[ -n "$source" ]] || continue
+    source="$IHAR_STORE/$source"
+    target="$runtime/$name"
+    if [[ -L "$target" ]]; then
+      if [[ "$(readlink "$target")" != "$source" ]]; then
+        ihar_die 3 "runtime mutable link $target points to $(readlink "$target"), not $source, and was preserved; remove or recover the wrong link, then retry"
+      fi
+    elif [[ -e "$target" ]]; then
+      ihar_die 3 "runtime mutable entry $target is materialised and was preserved; move it to a recovery location, then retry so ihar can link $source"
+    fi
+  done <<< "$inventory"
+
+  while IFS=$'\t' read -r source name kind; do
+    [[ -n "$source" ]] || continue
+    source="$IHAR_STORE/$source"
+    target="$runtime/$name"
+    if [[ "$kind" == directory ]]; then
+      (umask 077; mkdir -p -- "$source") \
+        || ihar_die 3 "cannot create canonical mutable directory $source"
+    else
+      (umask 077; mkdir -p -- "$(dirname "$source")") \
+        || ihar_die 3 "cannot create canonical mutable parent for $source"
+    fi
+    [[ -L "$target" ]] && continue
+    mkdir -p -- "$(dirname "$target")" \
+      || ihar_die 3 "cannot create runtime mutable parent for $target"
+    ln -s "$source" "$target" \
+      || ihar_die 3 "cannot link runtime mutable entry $target -> $source"
+  done <<< "$inventory"
+}
+
+ihar_verify_runtime_mutable_links() {
+  local vendor="$1" runtime="$2" inventory
+  inventory="$(ihar_mutable_inventory "$vendor")" || return 3
+  _ihar_reconcile_runtime_mutable_links "$vendor" "$runtime" "$inventory"
+}
+
 # ihar_verify_runtime_asset_links <vendor> <runtime-dir> — verify store links
 # before reusing a published runtime. Reuse never repairs or removes an entry: a
 # wrong or materialised path may be the only evidence of runtime tampering.
@@ -140,9 +186,10 @@ _ihar_link() {
 
 # ihar_link_runtime <vendor> <runtime-dir> <state-dir> — wire one runtime home.
 ihar_link_runtime() {
-  local vendor="$1" runtime="$2" state="$3" asset_inventory source name kind required runtime_link suffix inventory
+  local vendor="$1" runtime="$2" state="$3" asset_inventory mutable_inventory source name kind required runtime_link suffix inventory
 
   asset_inventory="$(ihar_asset_inventory "$vendor")" || return 3
+  mutable_inventory="$(ihar_mutable_inventory "$vendor")" || return 3
   while IFS=$'\t' read -r source name kind required runtime_link; do
     [[ "$runtime_link" == true ]] || continue
     source="$IHAR_STORE/$source"
@@ -156,6 +203,8 @@ ihar_link_runtime() {
     mkdir -p "$(dirname "$runtime/$name")"
     _ihar_link "$source" "$runtime/$name"
   done <<< "$asset_inventory"
+
+  _ihar_reconcile_runtime_mutable_links "$vendor" "$runtime" "$mutable_inventory"
 
   inventory="$(ihar_state_inventory "$vendor")" \
     || { ihar_warn "cannot read $vendor state inventory"; return 3; }

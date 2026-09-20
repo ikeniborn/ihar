@@ -331,6 +331,34 @@ def _asset_manifest_rules(obj: Mapping[str, Any]) -> None:
             raise SchemaError("asset manifest: generated settings are not tracked assets")
 
 
+def _mutable_link_manifest_rules(obj: Mapping[str, Any]) -> None:
+    sources: set[str] = set()
+    targets: set[tuple[str, str]] = set()
+    for entry in obj["entries"]:
+        source = entry["source"]
+        target = (entry["vendor"], entry["target"])
+        if source in sources:
+            raise SchemaError(f"mutable-link manifest: duplicate source {source!r}")
+        if target in targets:
+            raise SchemaError(
+                f"mutable-link manifest: duplicate target for vendor {target[0]!r} "
+                f"and path {target[1]!r}"
+            )
+        sources.add(source)
+        targets.add(target)
+
+        parts = source.split("/")
+        if len(parts) < 2 or parts[0] not in ("auth", "plugins") \
+                or parts[1] != entry["vendor"]:
+            raise SchemaError(
+                "mutable-link manifest: source must belong to vendor auth or plugins"
+            )
+        if parts[0] == "auth" and entry["kind"] != "file":
+            raise SchemaError("mutable-link manifest: auth entries must be files")
+        if parts[0] == "plugins" and (len(parts) != 2 or entry["kind"] != "directory"):
+            raise SchemaError("mutable-link manifest: plugin entries must be vendor directories")
+
+
 def _test_inventory_rules(obj: Mapping[str, Any]) -> None:
     seen: set[str] = set()
     for path in obj["paths"]:
@@ -749,6 +777,24 @@ KINDS: dict[str, dict[str, Any]] = {
             },
         },
         "rules": [_asset_manifest_rules],
+    },
+    "mutable-link-manifest": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "entries": {
+                "type": list,
+                "items": {
+                    "type": dict,
+                    "fields": {
+                        "vendor": {"type": str, "enum": _VENDOR},
+                        "source": {"type": str, "pattern": _SAFE_REL},
+                        "target": {"type": str, "pattern": _SAFE_REL},
+                        "kind": {"type": str, "enum": ("directory", "file")},
+                    },
+                },
+            },
+        },
+        "rules": [_mutable_link_manifest_rules],
     },
     "test-inventory": {
         "fields": {

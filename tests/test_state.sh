@@ -22,6 +22,12 @@ IHAR_ROOT="$ROOT"; export IHAR_ROOT
 PROJECT="$IHAR_TEST_TMP/My Project"
 mkdir -p "$PROJECT"
 ihar_asset_install "$IHAR_STORE" >/dev/null
+mkdir -p "$IHAR_STORE/auth/claude" "$IHAR_STORE/auth/codex" \
+  "$IHAR_STORE/plugins/claude" "$IHAR_STORE/plugins/codex"
+printf 'claude auth\n' > "$IHAR_STORE/auth/claude/.credentials.json"
+printf 'codex auth\n' > "$IHAR_STORE/auth/codex/auth.json"
+printf 'claude plugin\n' > "$IHAR_STORE/plugins/claude/sentinel"
+printf 'codex plugin\n' > "$IHAR_STORE/plugins/codex/sentinel"
 
 # --- home id ---------------------------------------------------------------------
 
@@ -183,6 +189,10 @@ rt2_hash="$(ihar_config_hash a b c d e f g h)"
 rt2="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER")"
 assert_exit "a present store entry is linked" 0 test -L "$rt2/skills"
 assert_exit "an absent store entry is skipped" 1 test -e "$rt2/router.json"
+assert_eq "Claude auth links to the global store" \
+  "$IHAR_STORE/auth/claude/.credentials.json" "$(readlink "$rt2/.credentials.json")"
+assert_eq "Claude plugins link to the global store" \
+  "$IHAR_STORE/plugins/claude" "$(readlink "$rt2/plugins")"
 assert_exit "vendor state is linked out of the runtime home" 0 test -L "$rt2/projects"
 assert_eq "vendor state resolves into st/" "$STATE/st/claude/projects" \
   "$(readlink "$rt2/projects")"
@@ -281,6 +291,64 @@ assert_exit "a rejected missing hooks link is not repaired" 1 test -e "$rt2/hook
 assert_exit "asset rejection happens before state link restoration" 1 test -L "$rt2/projects"
 ln -s "$IHAR_STORE/hooks" "$rt2/hooks"
 ln -s "$STATE/st/claude/projects" "$rt2/projects"
+
+# Mutable auth and plugin links preserve one machine-global owner across runtime
+# reuse and profile changes. Missing links are repaired, but existing runtime data
+# is never replaced because it may be the only copy from an older layout.
+rm "$rt2/.credentials.json"
+ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null
+assert_eq "runtime reuse restores a missing mutable auth link" \
+  "$IHAR_STORE/auth/claude/.credentials.json" "$(readlink "$rt2/.credentials.json")"
+
+rm "$rt2/.credentials.json"
+printf 'runtime-only auth\n' > "$rt2/.credentials.json"
+mutable_auth_status=0
+mutable_auth_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || mutable_auth_status=$?
+assert_eq "runtime reuse rejects materialised mutable auth" "3" "$mutable_auth_status"
+assert_contains "materialised mutable auth gives a recovery instruction" \
+  "$mutable_auth_out" "move it to a recovery location"
+assert_eq "materialised mutable auth is preserved" "runtime-only auth" \
+  "$(cat "$rt2/.credentials.json")"
+assert_eq "canonical mutable auth is preserved" "claude auth" \
+  "$(cat "$IHAR_STORE/auth/claude/.credentials.json")"
+rm "$rt2/.credentials.json"
+ln -s "$IHAR_STORE/auth/claude/.credentials.json" "$rt2/.credentials.json"
+
+profile_runtime="$(ihar_runtime_materialise claude \
+  "$(ihar_config_hash mutable links cross profile a b c d)" "$RENDER")"
+assert_eq "another profile shares the same mutable auth owner" \
+  "$IHAR_STORE/auth/claude/.credentials.json" \
+  "$(readlink "$profile_runtime/.credentials.json")"
+assert_eq "another profile shares the same plugin owner" \
+  "$IHAR_STORE/plugins/claude" "$(readlink "$profile_runtime/plugins")"
+assert_eq "auth written through one profile reaches the other" "profile update" \
+  "$(printf 'profile update\n' > "$rt2/.credentials.json"; cat "$profile_runtime/.credentials.json")"
+
+codex_mutable_runtime="$(ihar_runtime_materialise codex \
+  "$(ihar_config_hash mutable links codex inventory a b c d)" "$RENDER")"
+assert_eq "Codex auth links to the global store" "$IHAR_STORE/auth/codex/auth.json" \
+  "$(readlink "$codex_mutable_runtime/auth.json")"
+assert_eq "Codex plugins link to the global store" "$IHAR_STORE/plugins/codex" \
+  "$(readlink "$codex_mutable_runtime/plugins")"
+
+INVALID_MUTABLE_ROOT="$IHAR_TEST_TMP/invalid-mutable-root"
+INVALID_MUTABLE_RUNTIME="$IHAR_TEST_TMP/invalid-mutable-runtime"
+mkdir -p "$INVALID_MUTABLE_ROOT/manifests" "$INVALID_MUTABLE_RUNTIME"
+ln -s "$ROOT/lib" "$INVALID_MUTABLE_ROOT/lib"
+cp "$ROOT/manifests/assets.json" "$INVALID_MUTABLE_ROOT/manifests/assets.json"
+cp "$ROOT/manifests/state.json" "$INVALID_MUTABLE_ROOT/manifests/state.json"
+printf 'not valid JSON\n' > "$INVALID_MUTABLE_ROOT/manifests/mutable-links.json"
+printf 'runtime auth stays\n' > "$INVALID_MUTABLE_RUNTIME/auth.json"
+invalid_mutable_status=0
+invalid_mutable_out="$(IHAR_ROOT="$INVALID_MUTABLE_ROOT" \
+  ihar_link_runtime codex "$INVALID_MUTABLE_RUNTIME" "$STATE" 2>&1)" \
+  || invalid_mutable_status=$?
+assert_eq "an invalid mutable inventory aborts linking" "3" "$invalid_mutable_status"
+assert_contains "an invalid mutable inventory is diagnosed" "$invalid_mutable_out" \
+  "cannot read mutable-link inventory"
+assert_eq "an invalid mutable inventory preserves runtime auth" "runtime auth stays" \
+  "$(cat "$INVALID_MUTABLE_RUNTIME/auth.json")"
 
 EXPECTED_RUNTIME_ASSETS="$(cat <<'ASSETS'
 claude	hooks	hooks	directory	true
@@ -475,6 +543,7 @@ cat > "$MANIFEST_ROOT/manifests/state.json" <<'JSON'
 }
 JSON
 printf '{"schema":1,"entries":[]}\n' > "$MANIFEST_ROOT/manifests/assets.json"
+printf '{"schema":1,"entries":[]}\n' > "$MANIFEST_ROOT/manifests/mutable-links.json"
 printf 'db\n' > "$MANIFEST_LEGACY/state.sqlite"
 printf 'wal\n' > "$MANIFEST_LEGACY/state.sqlite-wal"
 printf 'shm\n' > "$MANIFEST_LEGACY/state.sqlite-shm"

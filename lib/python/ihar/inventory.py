@@ -27,17 +27,29 @@ def asset_entries(
             yield entry["source"], entry["target"], entry["kind"], entry["required"], entry["runtime"]
 
 
+def mutable_link_entries(
+    manifest: str | os.PathLike[str], vendor: str
+) -> Iterator[tuple[str, str, str]]:
+    document = jsonio.read("mutable-link-manifest", manifest)
+    for entry in document["entries"]:
+        if vendor == "all" or entry["vendor"] == vendor:
+            yield entry["source"], entry["target"], entry["kind"]
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3 or argv[0] not in ("state", "assets"):
+    if len(argv) != 3 or argv[0] not in ("state", "assets", "mutable-links"):
         return 2
     command, manifest, vendor = argv
     try:
         if command == "state":
             for path, kind in state_entries(manifest, vendor):
                 print(f"{path}\t{kind}")
-        else:
+        elif command == "assets":
             for source, target, kind, required, runtime in asset_entries(manifest, vendor):
                 print(f"{source}\t{target}\t{kind}\t{str(required).lower()}\t{str(runtime).lower()}")
+        else:
+            for source, target, kind in mutable_link_entries(manifest, vendor):
+                print(f"{source}\t{target}\t{kind}")
     except (OSError, jsonio.SchemaError) as error:
         print(f"ihar: cannot read {command} inventory {manifest}: {error}", file=sys.stderr)
         return 1

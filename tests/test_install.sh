@@ -163,9 +163,41 @@ write_lock() {
 cp "$ROOT/.ihar-lockfile.json" "$IHAR_LOCKFILE"
 before_lock="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
 ihar_install_store >/dev/null 2>&1
+ihar_prepare_mutable_store "$IHAR_STORE"
 assert_exit "the store tree is created" 0 test -d "$IHAR_STORE/hooks/_shared"
 assert_exit "manifests are copied in" 0 test -f "$IHAR_STORE/manifests/hooks.json"
 assert_eq "the auth directory is owner-only" "700" "$(stat -c '%a' "$IHAR_STORE/auth")"
+assert_exit "fresh install creates the Claude plugin owner" 0 \
+  test -d "$IHAR_STORE/plugins/claude"
+assert_exit "fresh install creates the Codex plugin owner" 0 \
+  test -d "$IHAR_STORE/plugins/codex"
+assert_exit "fresh install leaves absent Claude credentials for the vendor to create" 1 \
+  test -e "$IHAR_STORE/auth/claude/.credentials.json"
+assert_exit "fresh install leaves absent Codex auth for the vendor to create" 1 \
+  test -e "$IHAR_STORE/auth/codex/auth.json"
+assert_eq "the mutable inventory is explicit" \
+  $'auth/claude/.credentials.json\t.credentials.json\tfile\nauth/codex/auth.json\tauth.json\tfile\nplugins/claude\tplugins\tdirectory\nplugins/codex\tplugins\tdirectory' \
+  "$(ihar_mutable_inventory all | sort)"
+
+printf 'preserve auth\n' > "$IHAR_STORE/auth/claude/.credentials.json"
+printf 'preserve plugin\n' > "$IHAR_STORE/plugins/claude/sentinel"
+ihar_prepare_mutable_store "$IHAR_STORE"
+assert_eq "mutable store preparation preserves existing auth" "preserve auth" \
+  "$(cat "$IHAR_STORE/auth/claude/.credentials.json")"
+assert_eq "mutable store preparation preserves existing plugins" "preserve plugin" \
+  "$(cat "$IHAR_STORE/plugins/claude/sentinel")"
+
+MALFORMED_MUTABLE_ROOT="$IHAR_TEST_TMP/malformed-mutable-root"
+MALFORMED_MUTABLE_STORE="$IHAR_TEST_TMP/malformed-mutable-store"
+mkdir -p "$MALFORMED_MUTABLE_ROOT/manifests" "$MALFORMED_MUTABLE_STORE"
+printf 'not valid JSON\n' > "$MALFORMED_MUTABLE_ROOT/manifests/mutable-links.json"
+printf 'active bytes\n' > "$MALFORMED_MUTABLE_STORE/sentinel"
+malformed_mutable_before="$(sha256sum "$MALFORMED_MUTABLE_STORE/sentinel" | cut -d' ' -f1)"
+assert_exit "a malformed mutable inventory aborts store preparation" 3 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/store/assets.sh'; PYTHONPATH='$ROOT/lib/python' IHAR_ROOT='$MALFORMED_MUTABLE_ROOT' ihar_prepare_mutable_store '$MALFORMED_MUTABLE_STORE'"
+assert_eq "a malformed mutable inventory preserves the active store" \
+  "$malformed_mutable_before" \
+  "$(sha256sum "$MALFORMED_MUTABLE_STORE/sentinel" | cut -d' ' -f1)"
 
 pinned="$(python3 -c "
 import json,sys
@@ -634,7 +666,12 @@ assert_eq "incomplete migrated install leaves legacy source byte-identical" \
 assert_migration_stage_observed migration-rollback
 
 reset_active_generation
+rm -rf "$IHAR_STORE/auth" "$IHAR_STORE/plugins"
 run_install_scenario success >/dev/null 2>&1
+assert_exit "successful transaction prepares active mutable owners" 0 \
+  test -d "$IHAR_STORE/auth/claude"
+assert_exit "successful transaction prepares active plugin owners" 0 \
+  test -d "$IHAR_STORE/plugins/codex"
 assert_contains "successful install activates staged hook bytes" \
   "$(cat "$IHAR_STORE/hooks/security-pretool.py")" "new hook"
 assert_contains "successful install activates staged Claude bytes" \

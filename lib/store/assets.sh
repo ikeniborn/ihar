@@ -13,6 +13,39 @@ ihar_asset_inventory() {
     || { ihar_error "cannot read tracked asset inventory"; return 3; }
 }
 
+# ihar_mutable_inventory <vendor|all> — print canonical store source, runtime
+# target and kind from the separate mutable-link inventory.
+ihar_mutable_inventory() {
+  local vendor="$1"
+  ihar_python ihar.inventory mutable-links \
+    "$IHAR_ROOT/manifests/mutable-links.json" "$vendor" \
+    || { ihar_error "cannot read mutable-link inventory"; return 3; }
+}
+
+# ihar_prepare_mutable_store <store> — create canonical owners, never their file
+# payloads. Vendors create missing auth files through dangling runtime links.
+# Existing auth and plugin bytes are never copied, removed or replaced.
+ihar_prepare_mutable_store() {
+  local store="$1" inventory source target kind path
+  inventory="$(ihar_mutable_inventory all)" || return 3
+  while IFS=$'\t' read -r source target kind; do
+    [[ -n "$source" ]] || continue
+    path="$store/$source"
+    case "$kind" in
+      directory)
+        (umask 077; mkdir -p -- "$path") \
+          || { ihar_error "cannot create mutable store directory $path"; return 3; }
+        ;;
+      file)
+        (umask 077; mkdir -p -- "$(dirname "$path")") \
+          || { ihar_error "cannot create mutable store parent for $path"; return 3; }
+        ;;
+    esac
+  done <<< "$inventory"
+  [[ ! -d "$store/auth" ]] || chmod 700 "$store/auth" \
+    || { ihar_error "cannot protect mutable auth root $store/auth"; return 3; }
+}
+
 # ihar_asset_validate <manifest> — verify every required repository source exists
 # before a store stage is created or changed. Exit 3 on failure.
 ihar_asset_validate() {

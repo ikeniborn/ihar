@@ -62,6 +62,18 @@ STATE_MANIFEST = {
     ],
 }
 
+MUTABLE_LINK_MANIFEST = {
+    "schema": 1,
+    "entries": [
+        {
+            "vendor": "codex",
+            "source": "auth/codex/auth.json",
+            "target": "auth.json",
+            "kind": "file",
+        },
+    ],
+}
+
 CHECK_RESULT = {
     "schema": 1,
     "profile": {"name": "protected", "guarantee": "masked model egress"},
@@ -317,6 +329,37 @@ def test_state_manifest_rejects_duplicate_vendor_path_keys():
     entry = STATE_MANIFEST["entries"][0]
     duplicate = {**entry, "kind": "file"}
     rejects("state-manifest", {**STATE_MANIFEST, "entries": [entry, duplicate]}, "duplicate")
+
+
+def test_mutable_link_manifest_accepts_only_safe_store_and_runtime_paths():
+    jsonio.check("mutable-link-manifest", MUTABLE_LINK_MANIFEST)
+    for field, path in (("source", "../auth"), ("target", "/absolute")):
+        entry = {**MUTABLE_LINK_MANIFEST["entries"][0], field: path}
+        rejects(
+            "mutable-link-manifest",
+            {**MUTABLE_LINK_MANIFEST, "entries": [entry]},
+            field,
+        )
+    entry = {**MUTABLE_LINK_MANIFEST["entries"][0], "source": "st/codex/auth.json"}
+    rejects(
+        "mutable-link-manifest",
+        {**MUTABLE_LINK_MANIFEST, "entries": [entry]},
+        "auth or plugins",
+    )
+
+
+def test_mutable_link_manifest_rejects_duplicate_sources_and_runtime_targets():
+    entry = MUTABLE_LINK_MANIFEST["entries"][0]
+    rejects(
+        "mutable-link-manifest",
+        {**MUTABLE_LINK_MANIFEST, "entries": [entry, {**entry, "target": "other.json"}]},
+        "duplicate source",
+    )
+    rejects(
+        "mutable-link-manifest",
+        {**MUTABLE_LINK_MANIFEST, "entries": [entry, {**entry, "source": "auth/codex/other.json"}]},
+        "duplicate target",
+    )
 
 
 def test_check_result_is_closed_and_covers_both_vendors():

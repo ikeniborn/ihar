@@ -147,6 +147,7 @@ ihar_install_transaction() { # <install|update>
   local active_store="$IHAR_STORE" active_nvm="$IHAR_NVM" active_npm="$IHAR_NPM_BIN"
   _IHAR_INSTALL_BACKUP_RETAIN=false
   ihar_asset_validate "$IHAR_ROOT/manifests/assets.json" || return 3
+  ihar_prepare_mutable_store "$active_store" || return 3
   store_parent="$(dirname "$active_store")"
   nvm_parent="$(dirname "$active_nvm")"
   mkdir -p "$store_parent" "$nvm_parent" || return 1
@@ -325,9 +326,8 @@ ihar_install_microvm() {
 # path a hook is loaded from.
 ihar_install_store() {
   ihar_asset_install "$IHAR_STORE" || return $?
-  mkdir -p "$IHAR_STORE"/{bin,auth/claude,auth/codex,plugins/claude,plugins/codex,verification,venv} \
+  mkdir -p "$IHAR_STORE"/{bin,verification,venv} \
     || ihar_die 1 "cannot create the store at $IHAR_STORE"
-  chmod 700 "$IHAR_STORE/auth"
 
   ihar_store_verify_hooks false
   ihar_info "store ready at $IHAR_STORE"

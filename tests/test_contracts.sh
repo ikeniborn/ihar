@@ -166,7 +166,8 @@ accept "a nested script path inside the hooks directory is accepted" hook-manife
 
 for kind in profile netpolicy hook-manifest mcp-registry capabilities session \
             launch-claim handoff daemon-record conformance home-marker lockfile \
-            install-receipt state-manifest asset-manifest test-inventory; do
+            install-receipt state-manifest asset-manifest mutable-link-manifest \
+            test-inventory; do
   assert_exit "contract kind '$kind' is registered" 0 py "
 import sys
 from ihar import jsonio
@@ -202,6 +203,26 @@ reject "an asset target is unique per vendor" asset-manifest \
 assert_exit "the tracked-asset manifest validates" 0 \
   py 'import sys; from ihar import jsonio; jsonio.read("asset-manifest", sys.argv[1])' \
   "$ROOT/manifests/assets.json"
+
+# --- mutable auth and plugin links are separate from tracked assets ---------------
+
+mutable_entry="{'vendor':'claude','source':'auth/claude/.credentials.json',
+                 'target':'.credentials.json','kind':'file'}"
+
+accept "a minimal mutable-link entry is accepted" mutable-link-manifest \
+  "{'schema':1,'entries':[$mutable_entry]}"
+reject "a mutable source cannot escape the store" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'source':'../credentials'}]}"
+reject "a mutable runtime target cannot escape its home" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'target':'../credentials'}]}"
+reject "persistent state is not a mutable auth or plugin link" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'source':'st/claude/history.jsonl'}]}"
+reject "a mutable runtime target is unique per vendor" mutable-link-manifest \
+  "{'schema':1,'entries':[$mutable_entry, {**$mutable_entry,'source':'auth/claude/other'}]}"
+
+assert_exit "the mutable-link manifest validates" 0 \
+  py 'import sys; from ihar import jsonio; jsonio.read("mutable-link-manifest", sys.argv[1])' \
+  "$ROOT/manifests/mutable-links.json"
 
 assert_exit "the tracked release lockfile validates" 0 \
   py 'import sys; from ihar import jsonio; jsonio.read("lockfile", sys.argv[1])' \
