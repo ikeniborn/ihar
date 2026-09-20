@@ -41,7 +41,7 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
     codex)  native_binary="$IHAR_CODEX_BIN" ;;
   esac
   local verify_receipt=true
-  if [[ "$IHAR_FLAG_DRY_RUN" == true || "${IHAR_ACP_MODE:-false}" == true ]]; then
+  if [[ "$IHAR_FLAG_DRY_RUN" == true ]]; then
     verify_receipt=false
   fi
   ihar_store_verify "$vendor" "$native_binary" "$verify_receipt"

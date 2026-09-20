@@ -76,6 +76,8 @@ PATH="$IHAR_TEST_TMP/barrier-bin:$PATH" IHAR_REAL_CP="$REAL_CP" \
 BG_PIDS+=("$!")
 assert_exit "protected render reaches the same state lock while standard is paused" 0 \
   wait_for_file "$IHAR_TEST_TMP/runtime-barrier/protected.attempting"
+assert_exit "protected cannot enter publication while standard owns the state lock" 1 \
+  test -e "$IHAR_TEST_TMP/runtime-barrier/protected.entered"
 assert_exit "protected cannot publish while standard owns the state lock" 1 \
   test -s "$IHAR_TEST_TMP/protected.runtime"
 touch "$IHAR_TEST_TMP/runtime-barrier/standard.release"
@@ -107,23 +109,26 @@ cat > "$IHAR_TEST_TMP/lock-worker.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 source "$IHAR_ROOT/lib/core/logging.sh"
+source "$IHAR_ROOT/lib/core/init.sh"
 source "$IHAR_ROOT/lib/core/lock.sh"
 id="$1"; root="$2"
+export IHAR_STORE="$3" IHAR_NVM="$3-nvm"
+source "$IHAR_ROOT/lib/store/install.sh"
 touch "$root/$id.attempting"
-inside() {
+_ihar_install_all() {
   printf '%s\n' "$id" >> "$root/order"
   touch "$root/$id.entered"
   while [[ ! -e "$root/$id.release" ]]; do sleep 0.01; done
 }
-ihar_with_lock --required "$root/store.lock" 10 inside
+ihar_cmd_install
 touch "$root/$id.done"
 SH
 chmod +x "$IHAR_TEST_TMP/lock-worker.sh"
 LOCK_BARRIER="$IHAR_TEST_TMP/store-barrier"
 mkdir -p "$LOCK_BARRIER"
-"$IHAR_TEST_TMP/lock-worker.sh" one "$LOCK_BARRIER" & BG_PIDS+=("$!")
+"$IHAR_TEST_TMP/lock-worker.sh" one "$LOCK_BARRIER" "$IHAR_STORE" & BG_PIDS+=("$!")
 assert_exit "first install enters the store lock" 0 wait_for_file "$LOCK_BARRIER/one.entered"
-"$IHAR_TEST_TMP/lock-worker.sh" two "$LOCK_BARRIER" & BG_PIDS+=("$!")
+"$IHAR_TEST_TMP/lock-worker.sh" two "$LOCK_BARRIER" "$IHAR_STORE" & BG_PIDS+=("$!")
 assert_exit "second install reaches the lock attempt" 0 wait_for_file "$LOCK_BARRIER/two.attempting"
 assert_exit "second install cannot enter while first holds the lock" 1 \
   test -e "$LOCK_BARRIER/two.entered"
@@ -186,7 +191,8 @@ assert_exit "first consumer release completes" 0 wait_for_file "$GATEWAY_BARRIER
 shared_dir="$IHAR_STATE_ROOT/gw/$shared_key"
 assert_exit "shared gateway remains live for second consumer" 0 kill -0 "$shared_pid"
 assert_exit "shared gateway pid remains published" 0 test -s "$shared_dir/pid"
-assert_exit "shared gateway endpoint remains published" 0 test -s "$shared_dir/port"
+assert_exit "shared gateway endpoint answers after the first release" 0 \
+  env PYTHONPATH="$ROOT/lib/python" python3 -m ihar.gateway.probe "$shared_port"
 
 touch "$GATEWAY_BARRIER/consumer-two.release"
 assert_exit "last consumer release completes" 0 wait_for_file "$GATEWAY_BARRIER/consumer-two.done"

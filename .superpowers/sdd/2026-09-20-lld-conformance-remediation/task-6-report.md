@@ -84,3 +84,46 @@ After the authorized narrow fixture and assertion repairs, final scoped diff fin
 - Daemon diagnosis found stale consumer assertions, not a production structured-check contract gap; production check-result code was not broadened.
 - User-owned `.iwiki.toml` remains untouched and unstaged.
 - No blockers remain.
+
+## Review round 1 remediation
+
+### RED and mutation evidence
+
+- `bash tests/test_acp.sh` — exit 1, `PASS=22 FAIL=6`: real ACP launches bypassed selected-native-executable receipt verification, so tampered and missing evidence still reached the adapter.
+- The first rewritten concurrency fixture failed before its assertion because `IHAR_NVM` was unset while sourcing the production installer. Supplying the real install entry point's required environment corrected the fixture; no production change was made for this setup error.
+- With the production state and store lock calls temporarily removed, `bash tests/test_concurrency.sh` — exit 1, `PASS=28 FAIL=3`: the second runtime crossed the post-lock publication marker, the first publication ordering assertion failed, and the second install entered `_ihar_install_all` before release. The exact production lock calls were restored immediately after this mutation check.
+- The expanded receipt matrix passed against existing helper behavior and proved the missing coverage rather than requiring a mapping change: both `protected` and `isolated` reject missing, malformed, and permission-unreadable evidence; all malformed/unreadable cases retain the public `missing receipt` state.
+
+### GREEN evidence
+
+- `bash tests/test_acp.sh` — exit 0, `PASS=28 FAIL=0`.
+- `bash tests/test_concurrency.sh` — exit 0, `PASS=31 FAIL=0`.
+- `bash tests/test_lockfile.sh` — exit 0, `PASS=30 FAIL=0`.
+- `bash tests/test_lifecycle.sh` — exit 0, `PASS=22 FAIL=0`.
+- `bash tests/test_adapters.sh` — exit 0, `PASS=47 FAIL=0`.
+- `bash tests/test_web.sh` — exit 0, `PASS=23 FAIL=0`.
+- `bash tests/test_gateway_explicit.sh` — exit 0, `PASS=20 FAIL=0`.
+- `bash tests/test_contracts.sh` — exit 0, `PASS=72 FAIL=0`.
+- `PYTHONPATH=lib/python python3 tests/test_jsonio.py` — exit 0, `PASS=24 FAIL=0`.
+- Changed-shell `bash -n`, Python `compileall`, `git diff --check`, test-inventory schema validation, and exact inventory/discovery comparison — exit 0.
+
+Final review-round executable fingerprint: `138833cb4dec2179a7ae9825868932febde8eade3f1ae142c90dd6ef3bc5ccce`.
+
+- `bash tests/run.sh` — exit 0, `files=27 failed=0`.
+- The full suite was run once on this stable review-round executable state.
+
+### Behavior and test corrections
+
+- Only dry-run skips selected-native-executable receipt verification. A real ACP launch verifies the native CLI that its adapter delegates to before adapter execution; adapter version/digest integrity remains the existing separate check with no invented receipt fields.
+- ACP regressions use a valid ACP-allowed non-standard fixture profile to prove tampered and missing receipt failures occur before its adapter start marker. Shipped `protected` and `isolated` profiles continue to refuse ACP at the earlier profile gate.
+- Install concurrency now calls production `ihar_cmd_install`; only `_ihar_install_all` is replaced with a deterministic barrier inside the real required store lock.
+- Runtime concurrency asserts that the second process cannot reach a marker placed inside the actual post-lock publication seam before release. Removing the state lock makes the test fail.
+- Shared-gateway retention is now proved by a live protocol probe after the first consumer releases, not by the persistent port file.
+- The LLD no longer claims ACP skips native receipt verification and documents the existing separate adapter-integrity boundary.
+
+### Round 1 scope and blockers
+
+- Final paths are limited to `lib/cli/commands.sh`, `lib/store/lockfile.sh`, `tests/test_acp.sh`, `tests/test_concurrency.sh`, `tests/test_lockfile.sh`, `docs/lld/unified-harness.md`, and this report.
+- The temporary lock mutations left no diff in `lib/store/install.sh` or `lib/state/runtime.sh`.
+- User-owned `.iwiki.toml` remains untouched and unstaged.
+- No blockers remain.

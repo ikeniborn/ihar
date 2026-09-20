@@ -160,6 +160,11 @@ assert_exit "protected rejects an absent receipt" 3 \
     IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
     IHAR_PROFILE=protected IHAR_VENDOR=claude IHAR_CLAUDE_BIN='$FAKE_CLAUDE' \
     ihar_store_verify_binaries true"
+assert_exit "isolated rejects an absent receipt" 3 \
+  bash -c "$LOAD
+    IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
+    IHAR_PROFILE=isolated IHAR_VENDOR=claude IHAR_CLAUDE_BIN='$FAKE_CLAUDE' \
+    ihar_store_verify_binaries true"
 
 printf 'not json\n' > "$IHAR_STORE/install-receipt.json"
 assert_eq "a malformed receipt has one public status" "missing receipt" \
@@ -169,6 +174,40 @@ assert_exit "protected rejects a malformed receipt" 3 \
     IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
     IHAR_PROFILE=protected IHAR_VENDOR=claude IHAR_CLAUDE_BIN='$FAKE_CLAUDE' \
     ihar_store_verify_binaries true"
+assert_exit "isolated rejects a malformed receipt" 3 \
+  bash -c "$LOAD
+    IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
+    IHAR_PROFILE=isolated IHAR_VENDOR=claude IHAR_CLAUDE_BIN='$FAKE_CLAUDE' \
+    ihar_store_verify_binaries true"
+
+as_receipt_reader() {
+  if (( EUID != 0 )); then
+    "$@"
+  elif command -v setpriv >/dev/null 2>&1; then
+    setpriv --reuid=65534 --regid=65534 --clear-groups "$@"
+  elif command -v runuser >/dev/null 2>&1; then
+    runuser -u nobody -- "$@"
+  else
+    return 125
+  fi
+}
+
+write_receipt
+chmod 755 "$IHAR_TEST_TMP" "$IHAR_STORE"
+chmod 644 "$IHAR_LOCKFILE"
+chmod 000 "$IHAR_STORE/install-receipt.json"
+assert_eq "an unreadable receipt has one public status" "missing receipt" \
+  "$(as_receipt_reader bash -c "$LOAD
+    IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
+    ihar_receipt_binary_status claude '$FAKE_CLAUDE'")"
+for profile in protected isolated; do
+  assert_exit "$profile rejects an unreadable receipt" 3 \
+    as_receipt_reader bash -c "$LOAD
+      IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
+      IHAR_PROFILE='$profile' IHAR_VENDOR=claude IHAR_CLAUDE_BIN='$FAKE_CLAUDE' \
+      ihar_store_verify_binaries true"
+done
+chmod 600 "$IHAR_STORE/install-receipt.json"
 
 rm -f "$IHAR_LOCKFILE" "$IHAR_STORE/install-receipt.json"
 no_lock_out="$(bash -c "$LOAD

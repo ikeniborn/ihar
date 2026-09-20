@@ -29,8 +29,9 @@ ihar_lockfile_get() {
 
 # ihar_store_verify [vendor binary verify-receipt] — lockfile drift, hook integrity,
 # native-binary receipt, and conformance. Exit 3 for an enforced receipt failure;
-# standard warns and returns zero so the vendor may still start. Dry-run and ACP pass
-# `false` because neither executes the native binary.
+# standard warns and returns zero so the vendor may still start. Dry-run passes
+# `false` because it executes neither the native binary nor an adapter that delegates
+# to it; a real ACP launch verifies the native executable selected for that vendor.
 ihar_store_verify() {
   local vendor="${1:-${IHAR_VENDOR:-}}" binary="${2:-}" verify_receipt="${3:-true}"
   local strict=true
