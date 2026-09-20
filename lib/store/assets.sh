@@ -22,28 +22,23 @@ ihar_mutable_inventory() {
     || { ihar_error "cannot read mutable-link inventory"; return 3; }
 }
 
+# ihar_mutable_preflight <store> [vendor|all] — reject every unsafe canonical
+# source before install or runtime code mutates the store or creates any link.
+ihar_mutable_preflight() {
+  local store="$1" vendor="${2:-all}"
+  ihar_python ihar.inventory mutable-preflight \
+    "$IHAR_ROOT/manifests/mutable-links.json" "$vendor" "$store" \
+    || { ihar_error "unsafe mutable-link source topology"; return 3; }
+}
+
 # ihar_prepare_mutable_store <store> — create canonical owners, never their file
 # payloads. Vendors create missing auth files through dangling runtime links.
 # Existing auth and plugin bytes are never copied, removed or replaced.
 ihar_prepare_mutable_store() {
-  local store="$1" inventory source target kind path
-  inventory="$(ihar_mutable_inventory all)" || return 3
-  while IFS=$'\t' read -r source target kind; do
-    [[ -n "$source" ]] || continue
-    path="$store/$source"
-    case "$kind" in
-      directory)
-        (umask 077; mkdir -p -- "$path") \
-          || { ihar_error "cannot create mutable store directory $path"; return 3; }
-        ;;
-      file)
-        (umask 077; mkdir -p -- "$(dirname "$path")") \
-          || { ihar_error "cannot create mutable store parent for $path"; return 3; }
-        ;;
-    esac
-  done <<< "$inventory"
-  [[ ! -d "$store/auth" ]] || chmod 700 "$store/auth" \
-    || { ihar_error "cannot protect mutable auth root $store/auth"; return 3; }
+  local store="$1" vendor="${2:-all}"
+  ihar_python ihar.inventory mutable-prepare \
+    "$IHAR_ROOT/manifests/mutable-links.json" "$vendor" "$store" \
+    || { ihar_error "cannot prepare mutable store without following links"; return 3; }
 }
 
 # ihar_asset_validate <manifest> — verify every required repository source exists

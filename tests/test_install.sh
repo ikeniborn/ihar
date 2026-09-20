@@ -199,6 +199,53 @@ assert_eq "a malformed mutable inventory preserves the active store" \
   "$malformed_mutable_before" \
   "$(sha256sum "$MALFORMED_MUTABLE_STORE/sentinel" | cut -d' ' -f1)"
 
+mutable_tree_fingerprint() { # <root>
+  local root="$1"
+  {
+    find "$root" -mindepth 1 -printf '%P\t%y\t%m\t%l\n' | sort
+    find "$root" -type f -print0 | sort -z | xargs -0 -r sha256sum
+  } | sha256sum | cut -d' ' -f1
+}
+
+assert_invalid_mutable_store_preserved() { # <topology>
+  local topology="$1" case_root store outside store_before outside_before status=0
+  case_root="$IHAR_TEST_TMP/install-mutable-$topology"
+  store="$case_root/store"
+  outside="$case_root/outside"
+  mkdir -p "$store" "$outside"
+  printf 'outside stays\n' > "$outside/sentinel"
+
+  case "$topology" in
+    auth-parent-symlink)
+      ln -s "$outside" "$store/auth"
+      ;;
+    auth-leaf-symlink)
+      mkdir -p "$store/auth/claude"
+      ln -s "$outside/sentinel" "$store/auth/claude/.credentials.json"
+      ;;
+    credentials-directory)
+      mkdir -p "$store/auth/claude/.credentials.json"
+      ;;
+    plugin-file)
+      mkdir -p "$store/plugins"
+      printf 'plugin file stays\n' > "$store/plugins/claude"
+      ;;
+  esac
+
+  store_before="$(mutable_tree_fingerprint "$store")"
+  outside_before="$(mutable_tree_fingerprint "$outside")"
+  ihar_prepare_mutable_store "$store" >/dev/null 2>&1 || status=$?
+  assert_eq "$topology mutable source is rejected before preparation" "3" "$status"
+  assert_eq "$topology rejection leaves the store unchanged" \
+    "$store_before" "$(mutable_tree_fingerprint "$store")"
+  assert_eq "$topology rejection leaves outside unchanged" \
+    "$outside_before" "$(mutable_tree_fingerprint "$outside")"
+}
+
+for topology in auth-parent-symlink auth-leaf-symlink credentials-directory plugin-file; do
+  assert_invalid_mutable_store_preserved "$topology"
+done
+
 pinned="$(python3 -c "
 import json,sys
 print(len(json.load(open(sys.argv[1])).get('hooks', {})))" "$IHAR_LOCKFILE")"

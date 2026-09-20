@@ -35,17 +35,12 @@ _ihar_reconcile_runtime_mutable_links() {
     fi
   done <<< "$inventory"
 
+  ihar_prepare_mutable_store "$IHAR_STORE" "$vendor" || return 3
+
   while IFS=$'\t' read -r source name kind; do
     [[ -n "$source" ]] || continue
     source="$IHAR_STORE/$source"
     target="$runtime/$name"
-    if [[ "$kind" == directory ]]; then
-      (umask 077; mkdir -p -- "$source") \
-        || ihar_die 3 "cannot create canonical mutable directory $source"
-    else
-      (umask 077; mkdir -p -- "$(dirname "$source")") \
-        || ihar_die 3 "cannot create canonical mutable parent for $source"
-    fi
     [[ -L "$target" ]] && continue
     mkdir -p -- "$(dirname "$target")" \
       || ihar_die 3 "cannot create runtime mutable parent for $target"
@@ -57,6 +52,7 @@ _ihar_reconcile_runtime_mutable_links() {
 ihar_verify_runtime_mutable_links() {
   local vendor="$1" runtime="$2" inventory
   inventory="$(ihar_mutable_inventory "$vendor")" || return 3
+  ihar_mutable_preflight "$IHAR_STORE" "$vendor" || return 3
   _ihar_reconcile_runtime_mutable_links "$vendor" "$runtime" "$inventory"
 }
 
@@ -190,6 +186,7 @@ ihar_link_runtime() {
 
   asset_inventory="$(ihar_asset_inventory "$vendor")" || return 3
   mutable_inventory="$(ihar_mutable_inventory "$vendor")" || return 3
+  ihar_mutable_preflight "$IHAR_STORE" "$vendor" || return 3
   while IFS=$'\t' read -r source name kind required runtime_link; do
     [[ "$runtime_link" == true ]] || continue
     source="$IHAR_STORE/$source"

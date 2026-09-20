@@ -350,6 +350,56 @@ assert_contains "an invalid mutable inventory is diagnosed" "$invalid_mutable_ou
 assert_eq "an invalid mutable inventory preserves runtime auth" "runtime auth stays" \
   "$(cat "$INVALID_MUTABLE_RUNTIME/auth.json")"
 
+runtime_mutable_tree_fingerprint() { # <root>
+  local root="$1"
+  {
+    find "$root" -mindepth 1 -printf '%P\t%y\t%m\t%l\n' | sort
+    find "$root" -type f -print0 | sort -z | xargs -0 -r sha256sum
+  } | sha256sum | cut -d' ' -f1
+}
+
+assert_runtime_rejects_invalid_mutable_source() { # <topology>
+  local topology="$1" case_root store outside runtime state outside_before status=0
+  case_root="$IHAR_TEST_TMP/runtime-mutable-$topology"
+  store="$case_root/store"
+  outside="$case_root/outside"
+  runtime="$case_root/runtime"
+  state="$case_root/state"
+  mkdir -p "$store" "$outside" "$runtime" "$state"
+  ihar_asset_install "$store" >/dev/null
+  printf 'outside stays\n' > "$outside/sentinel"
+
+  case "$topology" in
+    auth-parent-symlink)
+      ln -s "$outside" "$store/auth"
+      ;;
+    auth-leaf-symlink)
+      mkdir -p "$store/auth/claude"
+      ln -s "$outside/sentinel" "$store/auth/claude/.credentials.json"
+      ;;
+    credentials-directory)
+      mkdir -p "$store/auth/claude/.credentials.json"
+      ;;
+    plugin-file)
+      mkdir -p "$store/plugins"
+      printf 'plugin file stays\n' > "$store/plugins/claude"
+      ;;
+  esac
+
+  outside_before="$(runtime_mutable_tree_fingerprint "$outside")"
+  (IHAR_STORE="$store" ihar_link_runtime claude "$runtime" "$state") \
+    >/dev/null 2>&1 || status=$?
+  assert_eq "$topology mutable source aborts runtime linking" "3" "$status"
+  assert_eq "$topology failure creates no runtime link" "0" \
+    "$(find "$runtime" -mindepth 1 | wc -l)"
+  assert_eq "$topology runtime failure leaves outside unchanged" \
+    "$outside_before" "$(runtime_mutable_tree_fingerprint "$outside")"
+}
+
+for topology in auth-parent-symlink auth-leaf-symlink credentials-directory plugin-file; do
+  assert_runtime_rejects_invalid_mutable_source "$topology"
+done
+
 EXPECTED_RUNTIME_ASSETS="$(cat <<'ASSETS'
 claude	hooks	hooks	directory	true
 claude	skills	skills	directory	true
