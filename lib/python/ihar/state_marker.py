@@ -53,9 +53,25 @@ def read_root(path: str) -> int:
     return 0
 
 
+def record_migration(path: str, vendor: str, source: str) -> int:
+    """Record one successfully copied legacy home in the project marker."""
+    if vendor not in {"claude", "codex"} or not source:
+        return 2
+    try:
+        marker = jsonio.read("home-marker", path)
+        marker["migrated_from"][vendor] = source
+        jsonio.write("home-marker", path, marker)
+    except (jsonio.SchemaError, OSError) as error:
+        print(f"ihar: cannot record migration in {path}: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if len(argv) == 2 and argv[0] == "--read":
         return read_root(argv[1])
+    if len(argv) == 4 and argv[0] == "--record-migration":
+        return record_migration(argv[1], argv[2], argv[3])
     if len(argv) != 2:
         print(__doc__, file=sys.stderr)
         return 2

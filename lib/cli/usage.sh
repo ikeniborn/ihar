@@ -13,7 +13,8 @@ commands
   check                 print the effective profile and what is enforced
   install               install every pinned component under this user, no sudo
   update                re-install what the lockfile now pins, then re-prove the hooks
-  homes list | clean    project state directories
+  homes list | clean | migrate
+                        project state directories and legacy import
   daemon status | stop | restart
                         the managed Codex app-server daemon
   sessions list | resume <id> | name <id> <title>

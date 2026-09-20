@@ -277,7 +277,7 @@ Codex `config.toml` is likewise rendered whole from the template plus regions, u
 
 ### 4.5 Migration
 
-`ihar homes migrate` copies, never moves: for the current id it looks for `../iclaude/.claude-homes/*-<hash>` and `../icodex/.codex-homes/*-<hash>`, requires the iclaude marker's `project_root` to match (icodex has no marker, so the hash is accepted), `rsync -a` the vendor state into `st/<vendor>/`, drops legacy configuration files because they are re-rendered, and records `migrated_from`. Store contents move once under `ihar install --migrate-store`.
+`ihar homes migrate` copies, never moves: for the current id it looks for `../iclaude/.claude-homes/*-<hash>` and `../icodex/.codex-homes/*-<hash>`, requires the iclaude marker's `project_root` to match (icodex has no marker, so the hash is accepted), `rsync -a` the vendor state into `st/<vendor>/`, drops legacy configuration files because they are re-rendered, and records `migrated_from`. Updated `iclaude` and `icodex` wrappers hold a shared flock on `<legacy-home>.ihar-lifecycle.lock` from before home creation through vendor exit; migration holds both files exclusively through copy and marker publication. Failure to take any lock aborts without a force bypass. Process environment/open-descriptor probes remain a compatibility guard for old wrapper processes. For every vendor, content and metadata fingerprints of the source before copy, source after copy and staged tree must match; any mismatch discards the stage. SQLite WAL sidecars are copied with their databases so committed state is preserved after a clean stop. Symlinks, devices and special files are excluded. Store contents move once under `ihar install --migrate-store`.
 
 ## 5. Adapters (slices S2, S7, S8, S9)
 

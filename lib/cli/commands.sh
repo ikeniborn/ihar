@@ -51,9 +51,6 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
     ihar_launch_state_enter native
   fi
 
-  # 4b. seed vendor state from a legacy wrapper home, once
-  ihar_migrate_vendor "$vendor" "$state" "$root" >/dev/null || true
-
   # 5. enforcement points, before the render, because the gateway port is an input
   #    to the Codex provider region.
   case "${IHAR_PROFILE_GATEWAY:-off}" in
@@ -322,6 +319,49 @@ ihar_cmd_homes() {
   case "${IHAR_SUBCOMMAND:-list}" in
     list)  ihar_state_list ;;
     clean) ihar_state_clean_orphans >/dev/null ;;
-    *)     ihar_die 2 "unknown homes subcommand '$IHAR_SUBCOMMAND'; known are list, clean" ;;
+    migrate)
+      (( ${#IHAR_ARGS[@]} == 0 )) \
+        || ihar_die 2 "ihar homes migrate accepts no positional arguments"
+      ihar_state_setup "$IHAR_PROJECT_ROOT" >/dev/null
+      ihar_with_lock --required "$IHAR_STATE/.ihar.lock" 30 \
+        _ihar_homes_migrate_locked "$IHAR_STATE" "$IHAR_PROJECT_ROOT"
+      ;;
+    *)     ihar_die 2 "unknown homes subcommand '$IHAR_SUBCOMMAND'; known are list, clean, migrate" ;;
   esac
+}
+
+_ihar_homes_migrate_locked() {
+  local state="$1" root="$2" vendor source status=0
+  ihar_migration_acquire_locks "$root" || return $?
+  if ! ihar_migration_require_quiescent "$root"; then
+    ihar_migration_release_locks
+    return 1
+  fi
+  for vendor in claude codex; do
+    if ! source="$(ihar_migrate_vendor "$vendor" "$state" "$root" | tail -1)"; then
+      ihar_warn "$vendor legacy state was not migrated"
+      status=1
+      continue
+    fi
+    [[ -n "$source" ]] || continue
+    if ! ihar_python ihar.state_marker --record-migration \
+      "$state/home.json" "$vendor" "$source"; then
+      _ihar_homes_migration_rollback "$state" "$vendor" \
+        || ihar_die 1 "cannot roll back the unrecorded $vendor migration"
+      ihar_warn "cannot record the $vendor migration; copied state was rolled back"
+      status=1
+      continue
+    fi
+    printf '%s migrated from %s\n' "$vendor" "$source"
+  done
+  ihar_migration_release_locks
+  return "$status"
+}
+
+_ihar_homes_migration_rollback() {
+  local state="$1" vendor="$2"
+  local target="$state/st/$vendor" rollback="$state/st/.${vendor}-rollback-$$"
+  mv "$target" "$rollback" || return 1
+  mkdir -p "$target" || { mv "$rollback" "$target"; return 1; }
+  rm -rf "$rollback"
 }
