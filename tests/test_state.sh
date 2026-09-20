@@ -282,36 +282,105 @@ assert_exit "asset rejection happens before state link restoration" 1 test -L "$
 ln -s "$IHAR_STORE/hooks" "$rt2/hooks"
 ln -s "$STATE/st/claude/projects" "$rt2/projects"
 
+EXPECTED_RUNTIME_ASSETS="$(cat <<'ASSETS'
+claude	hooks	hooks	directory	true
+claude	skills	skills	directory	true
+claude	manifests/config/claude/CLAUDE.md	CLAUDE.md	file	true
+claude	manifests/config/claude/commands	commands	directory	false
+claude	manifests/config/claude/agents	agents	directory	false
+claude	manifests/config/claude/scripts	scripts	directory	false
+codex	hooks	hooks	directory	true
+codex	skills	skills	directory	true
+codex	manifests/config/codex/AGENTS.md	AGENTS.md	file	true
+codex	manifests/config/codex/rules	rules	directory	false
+codex	manifests/config/codex/agents	agents	directory	false
+codex	manifests/config/codex/profiles	profiles	directory	false
+ASSETS
+)"
+
+# The mutation matrix is a reviewed expectation, not output from the production
+# inventory query. Direct JSON comparison makes a manifest addition fail until its
+# reuse-tampering cases are added here.
+manifest_runtime_assets="$(python3 - "$ROOT/manifests/assets.json" <<'PY'
+import json, sys
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+for entry in document["entries"]:
+    if not entry["runtime"]:
+        continue
+    vendors = ("claude", "codex") if entry["vendor"] == "common" else (entry["vendor"],)
+    for vendor in vendors:
+        print("\t".join((vendor, entry["source"], entry["target"], entry["kind"],
+                         str(entry["required"]).lower())))
+PY
+)"
+assert_eq "the independent reuse matrix covers every runtime asset" \
+  "$(sort <<< "$EXPECTED_RUNTIME_ASSETS")" "$(sort <<< "$manifest_runtime_assets")"
+
+asset_codex_hash="$(ihar_config_hash asset reuse codex matrix a b c d)"
+asset_codex_runtime="$(ihar_runtime_materialise codex "$asset_codex_hash" "$RENDER")"
 WRONG_STORE_TARGET="$IHAR_TEST_TMP/wrong-store-target"
 mkdir -p "$WRONG_STORE_TARGET"
 printf 'store target stays intact\n' > "$WRONG_STORE_TARGET/sentinel"
-ln -sfn "$WRONG_STORE_TARGET" "$rt2/hooks"
-wrong_hook_status=0
-wrong_hook_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
-  || wrong_hook_status=$?
-assert_eq "runtime reuse rejects a wrong hooks link" "3" "$wrong_hook_status"
-assert_contains "wrong hooks diagnostics give an explicit recovery step" \
-  "$wrong_hook_out" "remove or recover the wrong link"
-assert_eq "a rejected hooks link keeps its wrong target" \
-  "$WRONG_STORE_TARGET" "$(readlink "$rt2/hooks")"
-assert_eq "rejecting a wrong hooks link preserves its referent" \
-  "store target stays intact" "$(cat "$WRONG_STORE_TARGET/sentinel")"
 
-rm "$rt2/hooks"
-mkdir "$rt2/hooks"
-printf 'materialised hooks stay intact\n' > "$rt2/hooks/sentinel"
-materialised_hook_status=0
-materialised_hook_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
-  || materialised_hook_status=$?
-assert_eq "runtime reuse rejects materialised hooks" "3" "$materialised_hook_status"
-assert_contains "materialised hooks diagnostics give an explicit recovery step" \
-  "$materialised_hook_out" "move it to a recovery location"
-assert_exit "rejected materialised hooks remain a directory" 0 test -d "$rt2/hooks"
-assert_exit "rejected materialised hooks are not replaced by a link" 1 test -L "$rt2/hooks"
-assert_eq "rejected materialised hooks stay byte-identical" \
-  "materialised hooks stay intact" "$(cat "$rt2/hooks/sentinel")"
-rm -rf "$rt2/hooks"
-ln -s "$IHAR_STORE/hooks" "$rt2/hooks"
+while IFS=$'\t' read -r asset_vendor asset_source asset_target asset_kind asset_required; do
+  [[ -n "$asset_vendor" ]] || continue
+  if [[ "$asset_vendor" == claude ]]; then
+    asset_runtime="$rt2"
+    asset_hash="$rt2_hash"
+  else
+    asset_runtime="$asset_codex_runtime"
+    asset_hash="$asset_codex_hash"
+  fi
+  asset_source_path="$IHAR_STORE/$asset_source"
+  asset_target_path="$asset_runtime/$asset_target"
+
+  if [[ "$asset_required" == false ]]; then
+    case "$asset_kind" in
+      directory) mkdir -p "$asset_source_path" ;;
+      file) mkdir -p "$(dirname "$asset_source_path")"; : > "$asset_source_path" ;;
+    esac
+    assert_exit "$asset_vendor optional $asset_target may be absent on reuse" 0 \
+      ihar_runtime_materialise "$asset_vendor" "$asset_hash" "$RENDER"
+  fi
+
+  rm -rf -- "$asset_target_path"
+  ln -s "$WRONG_STORE_TARGET" "$asset_target_path"
+  wrong_asset_status=0
+  wrong_asset_out="$(ihar_runtime_materialise "$asset_vendor" "$asset_hash" "$RENDER" 2>&1)" \
+    || wrong_asset_status=$?
+  assert_eq "$asset_vendor $asset_target wrong runtime asset link is rejected" \
+    "3" "$wrong_asset_status"
+  assert_contains "$asset_vendor $asset_target wrong-link diagnostic identifies target" \
+    "$wrong_asset_out" "$asset_target_path"
+  assert_eq "$asset_vendor $asset_target wrong link is preserved" \
+    "$WRONG_STORE_TARGET" "$(readlink "$asset_target_path")"
+  assert_eq "$asset_vendor $asset_target wrong-link referent is preserved" \
+    "store target stays intact" "$(cat "$WRONG_STORE_TARGET/sentinel")"
+
+  rm "$asset_target_path"
+  materialised_asset_text="materialised $asset_vendor $asset_target stays intact"
+  if [[ "$asset_kind" == directory ]]; then
+    mkdir "$asset_target_path"
+    materialised_asset_sentinel="$asset_target_path/sentinel"
+  else
+    materialised_asset_sentinel="$asset_target_path"
+  fi
+  printf '%s\n' "$materialised_asset_text" > "$materialised_asset_sentinel"
+  materialised_asset_status=0
+  materialised_asset_out="$(ihar_runtime_materialise "$asset_vendor" "$asset_hash" "$RENDER" 2>&1)" \
+    || materialised_asset_status=$?
+  assert_eq "$asset_vendor $asset_target materialised runtime asset is rejected" \
+    "3" "$materialised_asset_status"
+  assert_contains "$asset_vendor $asset_target materialised diagnostic identifies target" \
+    "$materialised_asset_out" "$asset_target_path"
+  assert_exit "$asset_vendor $asset_target materialised entry is not replaced" \
+    1 test -L "$asset_target_path"
+  assert_eq "$asset_vendor $asset_target materialised bytes are preserved" \
+    "$materialised_asset_text" "$(cat "$materialised_asset_sentinel")"
+
+  rm -rf -- "$asset_target_path"
+  ln -s "$asset_source_path" "$asset_target_path"
+done <<< "$EXPECTED_RUNTIME_ASSETS"
 
 mv "$IHAR_STORE/hooks" "$IHAR_STORE/hooks.saved"
 missing_hook_source_status=0
@@ -325,34 +394,15 @@ assert_eq "a dangling required hooks link is preserved" \
   "$IHAR_STORE/hooks" "$(readlink "$rt2/hooks")"
 mv "$IHAR_STORE/hooks.saved" "$IHAR_STORE/hooks"
 
-# Optional runtime entries may be absent even when their store source appears after
-# publication. If present, however, they must still be a correct store symlink.
-mkdir -p "$IHAR_STORE/manifests/config/claude/commands"
-assert_exit "runtime reuse permits an absent optional asset target" 0 \
-  ihar_runtime_materialise claude "$rt2_hash" "$RENDER"
-ln -s "$WRONG_STORE_TARGET" "$rt2/commands"
-wrong_optional_status=0
-wrong_optional_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
-  || wrong_optional_status=$?
-assert_eq "runtime reuse rejects a present wrong optional asset link" \
-  "3" "$wrong_optional_status"
-assert_contains "wrong optional asset diagnostics identify the target" \
-  "$wrong_optional_out" "$rt2/commands"
-assert_eq "a rejected optional link keeps its wrong target" \
-  "$WRONG_STORE_TARGET" "$(readlink "$rt2/commands")"
-rm "$rt2/commands"
-mkdir "$rt2/commands"
-printf 'optional copy stays intact\n' > "$rt2/commands/sentinel"
-materialised_optional_status=0
-materialised_optional_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
-  || materialised_optional_status=$?
-assert_eq "runtime reuse rejects a materialised optional asset" \
-  "3" "$materialised_optional_status"
-assert_contains "materialised optional diagnostics identify the target" \
-  "$materialised_optional_out" "$rt2/commands"
-assert_eq "a rejected optional copy stays byte-identical" \
-  "optional copy stays intact" "$(cat "$rt2/commands/sentinel")"
-rm -rf "$rt2/commands" "$IHAR_STORE/manifests/config/claude/commands"
+while IFS=$'\t' read -r asset_vendor asset_source asset_target asset_kind asset_required; do
+  [[ "$asset_required" == false ]] || continue
+  if [[ "$asset_vendor" == claude ]]; then
+    asset_runtime="$rt2"
+  else
+    asset_runtime="$asset_codex_runtime"
+  fi
+  rm -rf -- "$asset_runtime/$asset_target" "$IHAR_STORE/$asset_source"
+done <<< "$EXPECTED_RUNTIME_ASSETS"
 
 # A materialised copy where a link belongs means the entry stopped following the
 # store; the repair replaces it.
@@ -370,11 +420,11 @@ assert_eq "a wrong link is repointed" "$IHAR_STORE/hooks" "$(readlink "$rt2/hook
 mkdir -p "$IHAR_STORE/undeclared"
 printf 'not portable\n' > "$IHAR_STORE/undeclared/data"
 rt_assets="$(ihar_runtime_materialise codex "$(ihar_config_hash asset inventory runtime links a b c d)" "$RENDER")"
-while IFS=$'\t' read -r source target kind required runtime; do
-  [[ "$runtime" == true ]] || continue
-  [[ -e "$IHAR_STORE/$source" ]] || continue
-  assert_exit "runtime asset $target is linked" 0 test -L "$rt_assets/$target"
-done < <(ihar_asset_inventory codex)
+while IFS=$'\t' read -r asset_vendor asset_source asset_target asset_kind asset_required; do
+  [[ "$asset_vendor" == codex ]] || continue
+  [[ -e "$IHAR_STORE/$asset_source" ]] || continue
+  assert_exit "runtime asset $asset_target is linked" 0 test -L "$rt_assets/$asset_target"
+done <<< "$EXPECTED_RUNTIME_ASSETS"
 assert_exit "an undeclared store entry is never linked" 1 test -e "$rt_assets/undeclared"
 
 # The complete asset inventory is read and validated before the linker touches a
