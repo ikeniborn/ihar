@@ -193,6 +193,12 @@ ihar_install_transaction() { # <install|update>
   fi
 
   if (( status == 0 )); then
+    if [[ "${IHAR_FLAG_MIGRATE_STORE:-false}" == true ]]; then
+      _ihar_store_revalidate_staged_sources || status=$?
+    fi
+  fi
+
+  if (( status == 0 )); then
     _ihar_activate_generation "$store_stage" "$nvm_stage" "$backup" || status=$?
   fi
   rm -rf -- "$store_stage" "$nvm_stage"

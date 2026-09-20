@@ -553,6 +553,15 @@ generation_fingerprint() {
   } | sha256sum | cut -d' ' -f1
 }
 
+wait_for_install_barrier() { # <path>
+  local path="$1" attempt
+  for ((attempt=0; attempt<500; attempt++)); do
+    [[ -e "$path" ]] && return 0
+    sleep 0.01
+  done
+  return 1
+}
+
 run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activation|rollback> [install|update]
   local scenario="$1" operation="${2:-install}" migration_observation
   export IHAR_ACTIVE_TEST_STORE="$IHAR_STORE"
@@ -594,6 +603,11 @@ run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activati
     grep -q 'new hook' "$IHAR_STORE/hooks/security-pretool.py" || return 40
     grep -q 'new claude' "$IHAR_CLAUDE_BIN" || return 40
     grep -q 'new codex' "$IHAR_CODEX_BIN" || return 40
+    if [[ "$scenario" == migration-late-mutation ||
+          "$scenario" == migration-late-consumer ]]; then
+      : > "$IHAR_TEST_TMP/$scenario.conformance-entered"
+      wait_for_install_barrier "$IHAR_TEST_TMP/$scenario.conformance-release" || return 43
+    fi
     if [[ "$scenario" == paths ]]; then
       [[ "${1:-}" == "$IHAR_ACTIVE_TEST_STORE" ]] || return 41
       [[ "$IHAR_STORE" == */.ihar-store-stage-* ]] || return 42
@@ -657,6 +671,53 @@ for scenario in conformance receipt activation; do
   assert_exit "$scenario failure leaves Claude executable usable" 0 "$IHAR_CLAUDE_BIN"
   assert_exit "$scenario failure leaves Codex executable usable" 0 "$IHAR_CODEX_BIN"
 done
+
+reset_active_generation
+rm -f -- "$IHAR_TEST_TMP/migration-late-mutation.conformance-"{entered,release}
+late_mutation_generation="$(generation_fingerprint)"
+run_install_scenario migration-late-mutation \
+  >"$IHAR_TEST_TMP/migration-late-mutation.out" 2>&1 &
+late_mutation_pid=$!
+assert_exit "migrated install reaches paused conformance before late mutation" 0 \
+  wait_for_install_barrier "$IHAR_TEST_TMP/migration-late-mutation.conformance-entered"
+printf 'late mutation\n' >> "$COMMAND_LEGACY_STORE/hooks/security-pretool.py"
+touch "$IHAR_TEST_TMP/migration-late-mutation.conformance-release"
+late_mutation_status=0
+wait "$late_mutation_pid" || late_mutation_status=$?
+assert_eq "late legacy mutation aborts before activation" "3" "$late_mutation_status"
+assert_eq "late legacy mutation preserves prior active generation and receipt" \
+  "$late_mutation_generation" "$(generation_fingerprint)"
+assert_contains "late legacy mutation remains in copy-only source evidence" \
+  "$(cat "$COMMAND_LEGACY_STORE/hooks/security-pretool.py")" "late mutation"
+printf 'legacy hook\n' > "$COMMAND_LEGACY_STORE/hooks/security-pretool.py"
+
+reset_active_generation
+rm -f -- "$IHAR_TEST_TMP/migration-late-consumer.conformance-"{entered,release} \
+  "$IHAR_TEST_TMP/migration-late-consumer.consumer-"{ready,release}
+late_consumer_generation="$(generation_fingerprint)"
+run_install_scenario migration-late-consumer \
+  >"$IHAR_TEST_TMP/migration-late-consumer.out" 2>&1 &
+late_consumer_install_pid=$!
+assert_exit "migrated install reaches paused conformance before late consumer" 0 \
+  wait_for_install_barrier "$IHAR_TEST_TMP/migration-late-consumer.conformance-entered"
+bash -c 'exec 9>>"$1"; : > "$2"; while [[ ! -e "$3" ]]; do sleep 0.01; done' _ \
+  "$COMMAND_LEGACY_STORE/hooks/security-pretool.py" \
+  "$IHAR_TEST_TMP/migration-late-consumer.consumer-ready" \
+  "$IHAR_TEST_TMP/migration-late-consumer.consumer-release" &
+late_consumer_pid=$!
+assert_exit "late legacy consumer opens the staged source before activation" 0 \
+  wait_for_install_barrier "$IHAR_TEST_TMP/migration-late-consumer.consumer-ready"
+touch "$IHAR_TEST_TMP/migration-late-consumer.conformance-release"
+late_consumer_status=0
+wait "$late_consumer_install_pid" || late_consumer_status=$?
+touch "$IHAR_TEST_TMP/migration-late-consumer.consumer-release"
+wait "$late_consumer_pid"
+assert_eq "late legacy consumer aborts before activation" "3" "$late_consumer_status"
+assert_eq "late legacy consumer preserves prior active generation and receipt" \
+  "$late_consumer_generation" "$(generation_fingerprint)"
+assert_eq "late legacy consumer leaves source evidence byte-identical" \
+  "$command_legacy_before" \
+  "$(find "$COMMAND_LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
 
 for scenario in migration-conformance migration-receipt; do
   reset_active_generation

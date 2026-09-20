@@ -2,6 +2,10 @@
 # Copy eligible contract-owned data from legacy wrapper stores. Never delete source.
 
 IHAR_STORE_MIGRATION_LOCK_FDS=()
+IHAR_STORE_MIGRATION_SOURCES=()
+IHAR_STORE_MIGRATION_SOURCE_IDENTITIES=()
+IHAR_STORE_MIGRATION_SOURCE_FINGERPRINTS=()
+IHAR_STORE_MIGRATION_ENTRIES=()
 
 _ihar_store_legacy_sources() {
   if [[ -n "${IHAR_LEGACY_STORE:-}" ]]; then
@@ -48,12 +52,24 @@ _ihar_store_source_writer_pid() { # <source>
   printf '%s\n' "${pid%%/*}"
 }
 
+_ihar_store_source_identity() { # <source>
+  stat -Lc '%d:%i' -- "$1"
+}
+
+_ihar_store_reset_migration_evidence() {
+  IHAR_STORE_MIGRATION_SOURCES=()
+  IHAR_STORE_MIGRATION_SOURCE_IDENTITIES=()
+  IHAR_STORE_MIGRATION_SOURCE_FINGERPRINTS=()
+  IHAR_STORE_MIGRATION_ENTRIES=()
+}
+
 _ihar_store_release_source_locks() {
   local fd
   for fd in ${IHAR_STORE_MIGRATION_LOCK_FDS[@]+"${IHAR_STORE_MIGRATION_LOCK_FDS[@]}"}; do
     eval "exec ${fd}>&-" 2>/dev/null || true
   done
   IHAR_STORE_MIGRATION_LOCK_FDS=()
+  _ihar_store_reset_migration_evidence
 }
 
 _ihar_store_acquire_source_locks() { # sources...
@@ -120,8 +136,10 @@ _ihar_store_publish_stage() { # <stage>
 
 _ihar_store_stage_locked() { # <combined-stage>; caller releases source locks
   local combined="$1" source source_stage source_before source_after source_copy staged writer status=0 entry
+  local source_identity source_after_identity
   local source_path target_path
-  local -a sources=() entries=() source_stages=() source_fingerprints=()
+  local -a sources=() entries=() source_stages=() source_identities=() source_fingerprints=()
+  _ihar_store_reset_migration_evidence
   while IFS= read -r source; do [[ -n "$source" && -d "$source" ]] && sources+=("$source"); done \
     < <(_ihar_store_legacy_sources)
   (( ${#sources[@]} )) || return 0
@@ -135,8 +153,11 @@ _ihar_store_stage_locked() { # <combined-stage>; caller releases source locks
       status=3
       break
     fi
+    source_identity="$(_ihar_store_source_identity "$source")" \
+      || { status=3; break; }
     source_before="$(_ihar_store_full_fingerprint "$source" "${entries[@]}")" \
       || { status=3; break; }
+    source_identities+=("$source_identity")
     source_fingerprints+=("$source_before")
     source_stage="$(mktemp -d "$(dirname "$IHAR_STORE")/.ihar-store-source-stage-XXXXXX")" \
       || { status=1; break; }
@@ -156,11 +177,14 @@ _ihar_store_stage_locked() { # <combined-stage>; caller releases source locks
     done
     source_after="$(_ihar_store_full_fingerprint "$source" "${entries[@]}")" \
       || status=3
+    source_after_identity="$(_ihar_store_source_identity "$source")" \
+      || status=3
     source_copy="$(ihar_python ihar.migration_fingerprint "$source" "${entries[@]}")" \
       || status=3
     staged="$(ihar_python ihar.migration_fingerprint "$source_stage" "${entries[@]}")" \
       || status=3
-    if (( status != 0 )) || [[ "$source_before" != "$source_after" || "$source_copy" != "$staged" ]]; then
+    if (( status != 0 )) || [[ "$source_identity" != "$source_after_identity" ||
+          "$source_before" != "$source_after" || "$source_copy" != "$staged" ]]; then
       ihar_warn "legacy store $source changed during migration; staged copy discarded"
       status=3
       break
@@ -179,9 +203,12 @@ _ihar_store_stage_locked() { # <combined-stage>; caller releases source locks
     local index final_fingerprint
     for index in "${!sources[@]}"; do
       source="${sources[$index]}"
+      source_after_identity="$(_ihar_store_source_identity "$source")" \
+        || { status=3; break; }
       final_fingerprint="$(_ihar_store_full_fingerprint "$source" "${entries[@]}")" \
         || { status=3; break; }
-      if [[ "$final_fingerprint" != "${source_fingerprints[$index]}" ]]; then
+      if [[ "$source_after_identity" != "${source_identities[$index]}" ||
+            "$final_fingerprint" != "${source_fingerprints[$index]}" ]]; then
         ihar_warn "legacy store $source changed after staging; all staged copies discarded"
         status=3
         break
@@ -199,8 +226,33 @@ _ihar_store_stage_locked() { # <combined-stage>; caller releases source locks
         >/dev/null 2>&1 || { status=3; break; }
     done
   fi
+  if (( status == 0 )); then
+    IHAR_STORE_MIGRATION_SOURCES=("${sources[@]}")
+    IHAR_STORE_MIGRATION_SOURCE_IDENTITIES=("${source_identities[@]}")
+    IHAR_STORE_MIGRATION_SOURCE_FINGERPRINTS=("${source_fingerprints[@]}")
+    IHAR_STORE_MIGRATION_ENTRIES=("${entries[@]}")
+  fi
   rm -rf -- "${source_stages[@]}"
   return "$status"
+}
+
+_ihar_store_revalidate_staged_sources() {
+  local index source source_identity source_fingerprint writer
+  for index in "${!IHAR_STORE_MIGRATION_SOURCES[@]}"; do
+    source="${IHAR_STORE_MIGRATION_SOURCES[$index]}"
+    source_identity="$(_ihar_store_source_identity "$source")" || return 3
+    source_fingerprint="$(_ihar_store_full_fingerprint \
+      "$source" "${IHAR_STORE_MIGRATION_ENTRIES[@]}")" || return 3
+    if [[ "$source_identity" != "${IHAR_STORE_MIGRATION_SOURCE_IDENTITIES[$index]}" ||
+          "$source_fingerprint" != "${IHAR_STORE_MIGRATION_SOURCE_FINGERPRINTS[$index]}" ]]; then
+      ihar_warn "legacy store $source changed before activation; staged generation discarded"
+      return 3
+    fi
+    if writer="$(_ihar_store_source_writer_pid "$source")"; then
+      ihar_warn "legacy store $source became active in process $writer before activation; staged generation discarded"
+      return 3
+    fi
+  done
 }
 
 _ihar_store_migrate_locked() {
