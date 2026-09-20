@@ -2,8 +2,8 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 10 (receipt verification and executable test inventory implemented) |
-| Date | 2026-09-20 |
+| Status | revision 11 (final conformance, status and runtime-upgrade contracts implemented) |
+| Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 2 (commit `ec2df36`) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
 | Verified against | Claude Code 2.1.274, Codex CLI 0.154.0 (`--help`, `app-server generate-json-schema`, binary strings), iclaude and icodex checkouts on this machine |
@@ -97,12 +97,16 @@ Revision 3 of this document specified a readable id, `<sanitized-basename>-<sha2
 | `bin/uv`, `bin/rg`, `bin/tree`, `bin/firecracker`, `bin/vmlinux`, `bin/rootfs.ext4` | tools and microVM assets | `ihar install` |
 | `venv/` | `requests`, `presidio-analyzer`, `presidio-anonymizer`, optional spaCy models, optional `claude-agent-sdk` | `ihar install` |
 | `skills/`, `hooks/`, `manifests/` | copies of the tracked trees, sha256-pinned | `ihar install` |
-| `auth/claude/.credentials.json`, `auth/codex/auth.json` | shared vendor logins | vendors |
-| `plugins/claude/`, `plugins/codex/` | plugin caches | vendors |
+| `auth/claude/.credentials.json`, `auth/codex/auth.json` | globally shared mutable vendor logins | vendors through `manifests/mutable-links.json` |
+| `plugins/claude/`, `plugins/codex/` | globally shared mutable plugin state | vendors through `manifests/mutable-links.json` |
 | `verification/<vendor>-<version>.json` | live hook conformance records (§6.6) | `ihar install`, `ihar update` |
 | `acp/` | pinned ACP adapters | `ihar install --acp` |
 | `install-receipt.json` | atomic machine-local evidence: release-lock digest, installed versions and executable SHA-256 values | `ihar install`, `ihar update` |
 | `.ihar-store.lock`, `.last-lockfile-hash` | store lock and drift marker | store |
+
+Installer-owned generation paths and vendor-owned mutable paths are separate contracts. An install or update transaction replaces only the explicit installer-owned paths, the staged Node tree, `.last-lockfile-hash`, and `install-receipt.json`; it never snapshots or activates `auth/`, `plugins/`, or the store-lock inode. `manifests/mutable-links.json` is the closed schema-1 inventory for the four mutable runtime links: Claude and Codex auth files plus their vendor plugin directories. These entries are deliberately absent from `manifests/assets.json`, whose bytes are immutable release assets.
+
+Every mutable source and runtime target is a canonical safe relative path. Sources are unique, targets are unique per vendor, auth sources are regular files below `auth/<vendor>/`, and plugin sources are real directories exactly at `plugins/<vendor>`. Dot segments, repeated/trailing-separator aliases, symlinked ancestors or leaves, non-directory ancestors and wrong leaf types fail closed before store preparation or runtime linking. Preparation walks retained directory descriptors with `O_NOFOLLOW`, creates only missing parents or plugin directories, keeps the auth root mode `0700`, and never creates, copies, removes or replaces an auth-file payload or existing plugin bytes. A missing auth file may therefore remain the intentional target of a dangling runtime link until the vendor creates it.
 
 ### 2.4 Project state and runtime homes under `$IHAR_STATE_ROOT`
 
@@ -115,6 +119,8 @@ $IHAR_STATE_ROOT/<id>/
   handoff/pending/<token>.md    per-launch handoff packages (§11.5), 700
   handoff/<ihar_id>.json|.md
   daemons/codex.json            managed daemon record (§5.5)
+  recovery/runtime-state/<vendor>/<generation>-*/
+                                retained pre-upgrade runtime bytes and prior canonical tree
   st/claude/                    Claude state declared by manifests/state.json
   st/codex/                     Codex state declared by manifests/state.json
   r/<config-hash>/claude/       = CLAUDE_CONFIG_DIR
@@ -123,26 +129,29 @@ $IHAR_STATE_ROOT/<id>/
 
 `<id>` is `sha256(project_root)` truncated to eight characters. iclaude prefixes the sanitised basename (`resolve_claude_home_id`, `lib/config/isolated.sh:82-89`) and that reads better, but it does not fit the socket budget above. Eight hex is 32 bits, so two projects can in principle collide; the marker guard makes that an abort rather than a silent cross-attachment.
 
-**`<config-hash>` is the first 8 hex characters of `sha256` over everything that decides how the vendor behaves**: profile name, effective masking level, gateway mode, sandbox mode, MCP strictness, the rendered hook manifest digest, the registry digest, and the pinned vendor version. Two launches with the same effective configuration share a runtime home and race on nothing; two launches with different configurations get different directories, which is what removes the last-writer-wins window of revision 2. A runtime home is written once, under the state lock, and is thereafter **immutable**: a configuration change produces a new directory rather than a rewrite.
+**`<config-hash>` is the first 8 hex characters of `sha256` over everything that decides how the vendor behaves**: profile name, effective masking level, gateway mode, sandbox mode, MCP strictness, the rendered hook manifest digest, the registry digest, the pinned vendor version, and the stable semantic digest of the validated persistent-state manifest. The manifest identity is added to the eight explicit render inputs, so an inventory change selects a new generation instead of reusing an incompatible runtime. Two launches with the same effective configuration share a runtime home and race on nothing; two launches with different configurations get different directories, which is what removes the last-writer-wins window of revision 2. A runtime home is written once, under the state lock, and is thereafter **immutable**: a configuration change produces a new directory rather than a rewrite.
 
 A runtime home contains the rendered configuration plus symlinks:
 
 ```text
 r/<hash>/claude/
   settings.json  mcp/ihar.json                       rendered, read-only (444) under enforced profiles
-  hooks commands agents scripts plugins CLAUDE.md
-  .credentials.json router.json skills               → store
+  hooks commands agents scripts CLAUDE.md skills     → immutable store assets
+  .credentials.json plugins                          → mutable global store owners
   projects sessions session-env history.jsonl
   .claude.json                                       → ../../st/claude/*
 r/<hash>/codex/
   config.toml  hooks.json  AGENTS.md                 rendered, read-only under enforced profiles
-  hooks plugins auth.json rules agents profiles skills  → store
+  hooks rules agents profiles skills                 → immutable store assets
+  auth.json plugins                                  → mutable global store owners
   sessions history.jsonl session_index.jsonl shell_snapshots
   state_5.sqlite goals_1.sqlite memories_1.sqlite logs_2.sqlite
   app-server-control                                 → ../../st/codex/*
 ```
 
 `manifests/state.json` is the single inventory for these state links and for legacy migration. It declares each vendor-relative entry as a directory, file or SQLite family. A declared file link may initially be dangling so the vendor creates the canonical target under `st/`; an SQLite family includes its `-wal` and `-shm` sidecars. The inventory follows the pinned vendor versions, so a vendor upgrade must re-run conformance before changing it.
+
+Before an existing runtime is reused, ihar verifies the rendered files, every `runtime:true` tracked-asset link, every mutable auth/plugin link, and every state link in that order. A required tracked source or link that is missing, a wrong-target link, or a materialised tracked/mutable entry fails closed without repair or deletion. A missing optional tracked source may remain absent, but an optional target that is present and wrong still fails closed. Mutable links are preflighted against the canonical source topology before any link is created. Persistent-state entries materialised by a pre-manifest runtime are not treated as drift requiring manual copying: §4.5 migrates one unambiguous owner transactionally before canonical state links are reconciled.
 
 Vendor state therefore persists across profile switches while configuration does not leak between them. Under `standard` the rendered files stay mode 600 and writable, so a user can experiment in place; under enforced profiles they are 444 and the sandbox denies the directory (§9.2).
 
@@ -257,11 +266,13 @@ Schema 1 is iclaude's marker and schema 2 was revision 2's; both are upgraded in
 |----------|-----------|
 | `ihar_project_root` | `git rev-parse --show-toplevel` else `pwd -P` |
 | `ihar_state_setup root` | resolve `<id>`, create the state tree and `st/<vendor>/`, run `ihar_state_preflight`, write the marker; exports `IHAR_STATE` |
-| `ihar_runtime_materialise vendor hash` | under `ihar_with_lock --required "$IHAR_STATE/.ihar.lock" 30`: if `r/<hash>/<vendor>` exists, verify its rendered files against the fragments and abort on drift; else build it in a temporary directory, link the store and `st/` entries, write the rendered files, `chmod 444` under enforced profiles, then rename into place. Exports `IHAR_RUNTIME` |
-| `ihar_state_link_assets` | consumes `manifests/assets.json` and `manifests/state.json`; a correct link is untouched, a wrong link or materialised copy is replaced with a warning, a stale link is pruned, a missing required asset aborts and a missing optional asset is reported; the store and canonical state are never mutated through a runtime link |
+| `ihar_runtime_materialise vendor hash` | under `ihar_with_lock --required "$IHAR_STATE/.ihar.lock" 30`: if `r/<hash>/<vendor>` exists, verify rendered files, tracked-asset links and mutable links, run the automatic state upgrade, then reconcile state links; else run the upgrade before building, link all three inventories in a temporary directory, `chmod 444` only the rendered security files under enforced profiles, then rename into place. Exports `IHAR_RUNTIME` |
+| `ihar_link_runtime` | consumes `manifests/assets.json`, `manifests/mutable-links.json` and `manifests/state.json`; initial publication reports absent optional assets and creates canonical state/mutable owners without replacing existing vendor bytes |
+| `ihar_verify_runtime_asset_links` / `ihar_verify_runtime_mutable_links` / `ihar_verify_runtime_state_links` | reuse verifiers preserve wrong or materialised entries and fail closed; required asset links are never repaired in place, while missing state links are added only after the complete declared set passes validation |
+| `ihar_upgrade_runtime_state` | consumes the state inventory and migrates exactly one unambiguous pre-manifest materialised owner through the transaction in §4.5; no owner is a no-op |
 | `ihar_with_lock MODE lockfile timeout cmd…` | §4.3 |
 
-`manifests/assets.json` is the authoritative required/optional inventory for tracked store and runtime assets. It carries the Claude set (`skills`, `hooks`, `commands`, `agents`, `scripts`, `plugins`, `CLAUDE.md`, `router.json`, `.credentials.json`) and the Codex set (`skills`, `hooks`, `plugins`, `auth.json`, `rules`, `agents`, `profiles`) without hard-coding those lists in the linker. Authentication, generated settings, caches and vendor state are not tracked assets.
+`manifests/assets.json` is the authoritative required/optional inventory for repository-owned store and runtime assets. It carries common `hooks`, `manifests` and `skills`, Claude instructions and optional extension directories, and Codex instructions and optional rules/agent/profile directories without hard-coded linker lists. Authentication, plugins, generated settings, caches, transcripts and vendor state are forbidden tracked assets. `manifests/mutable-links.json` separately owns global auth/plugin links (§2.3); `manifests/state.json` owns project-scoped persistent state (§2.4). No inventory may absorb another inventory's ownership.
 
 ### 4.3 Locks have two modes
 
@@ -284,7 +295,15 @@ Codex `config.toml` is likewise rendered whole from the template plus regions, u
 
 `ihar homes migrate` copies, never moves: for the current id it looks for `../iclaude/.claude-homes/*-<hash>` and `../icodex/.codex-homes/*-<hash>`, requires the iclaude marker's `project_root` to match (icodex has no marker, so the hash is accepted), copies only entries declared by `manifests/state.json` into `st/<vendor>/`, drops legacy configuration files because they are re-rendered, and records `migrated_from`. Updated `iclaude` and `icodex` wrappers hold a shared flock on `<legacy-home>.ihar-lifecycle.lock` from before home creation through vendor exit; migration holds both files exclusively through copy and marker publication. Failure to take any lock aborts without a force bypass. Process environment/open-descriptor probes remain a compatibility guard for old wrapper processes. For every vendor, content and metadata fingerprints of the source before copy, source after copy and staged tree must match; any mismatch discards the stage. SQLite WAL and SHM sidecars are copied with their databases so committed state is preserved after a clean stop. Symlinks, devices and special files are excluded.
 
-`ihar install --migrate-store` uses the same fail-closed quiescence, source-before/source-after/stage fingerprints and atomic publication for eligible legacy store content. It copies and never deletes the legacy source.
+Runtime reuse and generation changes also invoke an automatic compatibility transaction for state that an older runtime materialised locally instead of linking into `st/`. The validated state inventory is expanded first, including SQLite `-wal` and `-shm` paths; duplicate, aliased or overlapping ownership is rejected before filesystem inspection. All state-root, `r/`, generation, vendor, entry, staging and recovery ancestry is opened through retained directory descriptors with `O_NOFOLLOW`. Symlinked ancestry, wrong-target state links, special entries, multiple materialised owners, or a canonical conflict fail closed while preserving both source and canonical bytes.
+
+The automatic transaction runs while the required project-state lock is held. Quiescence checks every same-UID process for readable `IHAR_RUNTIME`, `CODEX_HOME` and `CLAUDE_CONFIG_DIR` selectors and for cwd or open descriptors below any same-vendor runtime, the materialised owner or canonical state. Direct references always block. If evidence is unreadable or partial, it blocks only when executable or command-line evidence classifies the process as the current vendor, its ACP adapter, the ihar wrapper, or as referring to a protected root; unrelated opaque session daemons are not consumers. Only the exact migration process is excluded, so ancestors and detached candidates cannot bypass the gate.
+
+The single materialised owner is fingerprinted before and after copying into a mode-`0700` private stage below `st/`. The stage begins as a copy of the current canonical vendor root, then receives the materialised entries. A second quiescence gate and source fingerprint run immediately before publication. Linux `renameat2(RENAME_EXCHANGE)` atomically exchanges the complete staged and canonical vendor directories; missing atomic-exchange support fails before publication rather than creating an absence window. Published and source fingerprints are checked again before and after relinking. Original runtime entries move to `recovery/runtime-state/<vendor>/<generation>-*/`, canonical links replace them, and the prior canonical root is retained there as `.canonical-before`. Success therefore preserves both recoverable inputs; repeat materialisation is idempotent.
+
+Any failure before commit attempts to exchange the prior canonical tree back and restore moved runtime entries. An incomplete rollback fails closed and names the retained recovery or stage path; cleanup never deletes incomplete evidence. This is automatic recovery for ordinary pre-manifest materialised state, not an instruction to copy it manually. Ambiguous owners, wrong links and conflicting canonical bytes still require explicit human resolution because ihar cannot choose which data is authoritative without risking loss.
+
+`ihar install --migrate-store` applies the store analogue across the whole command, not as a separate pre-install publication. It takes required lifecycle locks for every eligible legacy source, rejects open writers, fingerprints content and metadata before/after copy and again immediately before activation, validates any staged receipt, and merges all eligible legacy content into the same install stage that receives the pinned binaries, assets, conformance records and new receipt. One activation publishes that combined generation. Any later install, conformance, receipt or activation failure leaves the previous active generation and receipt usable; incomplete activation rollback retains and reports its recovery backup. Source locks are held until the command finishes, and legacy sources are copy-only and never deleted.
 
 ## 5. Adapters (slices S2, S7, S8, S9)
 
@@ -519,17 +538,25 @@ Anything else aborts with exit 3 naming the hook and the observed state. Under `
 
 Rendered-output tests and stdin fixtures prove that ihar emits the right files and that a script decides correctly. They do not prove that the vendor loaded the hook, fired it, and honoured the decision. For a profile that declares `hooks: enforced`, that gap is the whole guarantee.
 
-`ihar.conformance.run` executes, against the pinned binaries, in a throwaway project:
+`ihar.conformance.run` first requires the binary's reported semantic version to equal the vendor pin in `.ihar-lockfile.json`; a mismatched binary cannot produce a record. Install/update run the staged binary and staged hook tree, but authentication is linked from the existing active store through `--auth-store`, and Claude's protected-root probes name the final active store through `--protected-store`. This topology proves the bytes being installed without pretending temporary credentials exist or proving denial only against the disposable stage.
 
-| Case | Assertion |
-|------|-----------|
-| PreToolUse deny | a `Bash` command that the hook denies does not execute; a sentinel file is absent |
-| PreToolUse rewrite | a write whose content carries a fake secret lands redacted on disk |
-| SessionStart | the hook ran and its `additionalContext` reached the model turn |
-| MCP matcher | a hook on an `mcp__*` tool fires for a stub MCP server |
-| Timeout | a hook exceeding its timeout is treated as the vendor documents, and the observed behaviour is recorded |
+Every required case drives a supported non-interactive vendor command through the rendered hook configuration. Direct execution of a hook script is never live evidence:
 
-The result is written to `$IHAR_STORE/verification/<vendor>-<version>.json` with the binary sha256, the manifest digest, per-case outcomes and a timestamp. `ihar install` and `ihar update` run it; step 3 of the lifecycle refuses an enforced-profile launch when the record for the installed version is missing, stale relative to the manifest digest, or failing:
+| Required for | Case | Assertion |
+|--------------|------|-----------|
+| Claude and Codex | `deny-blocks-the-tool` | an explicit `PreToolUse` deny fires and the target command does not execute |
+| Claude and Codex | `rewrite-reaches-the-tool` | the hook rewrite reaches the command; the unrewritten fake secret does not |
+| Claude and Codex | `session-start-context` | `SessionStart` fires and its `additionalContext` reaches the model turn |
+| Claude and Codex | `mcp-matcher-fires` | the `mcp__ihar-conformance__prove` matcher fires and the stub MCP tool runs |
+| Claude and Codex | `timeout-behaviour` | the vendor terminates the over-time hook within the bounded tolerance and records whether the tool ran |
+| Claude | `sandbox-direct-write` | a direct shell write to every protected root is denied |
+| Claude | `sandbox-child-write` | a child-process write to every protected root is denied |
+| Claude | `sandbox-workspace-write` | the positive workspace write succeeds |
+| Codex | `hook-is-loaded` | `hooks/list` reports the rendered hook file |
+| Codex | `trust-is-recordable` | exact-digest sealing produces a trusted hook |
+| Codex | `tampering-is-detected` | editing the sealed hook is detected |
+
+The result is written to `$IHAR_STORE/verification/<vendor>-<version>.json` with the binary SHA-256, manifest digest, per-case outcomes and timestamp. The closed record schema rejects an empty case map, any missing vendor-required case, and any required case reported as `skipped`; a failed required case makes the conformance command fail. `ihar install` and `ihar update` run the full vendor-specific set and do not activate a generation whose evidence is incomplete. Step 3 of the lifecycle refuses an enforced-profile launch when the record for the installed version is missing, stale relative to either digest, incomplete or failing:
 
 ```text
 hook enforcement unproven for <vendor> <version>; run ihar check --conformance
@@ -582,7 +609,7 @@ state       = $IHAR_STATE_ROOT/gw/<gateway_key>/{lock,pid,port,consumers/,mode}
 |----------|-----------|
 | `ihar_gateway_acquire <key>` | under `ihar_with_lock --required`: sweep dead consumers; attach to a live, healthy instance; otherwise start the supervisor and wait up to 15 s for the port file, a TCP connection and `/api/ihar-probe`; then register `consumers/<pid>.pid` |
 | `ihar_gateway_release <key>` | remove this consumer; the last consumer of that key stops its supervisor |
-| `ihar_gateway_status` | per key: mode, port, masking level, consumers, metrics, refusal counters |
+| `ihar_gateway_status` | read-only structured facts per key: explicit mode, nullable observed port/PID, live consumers, probe health, and available counters or an explicit unavailable state (§12.4) |
 
 ### 8.2 Two implementations, chosen by mode
 
@@ -790,7 +817,11 @@ Revision 2 allowed `ihar claude --mask-level standard` under `standard`, which s
 
 In order, each fail-closed: hook integrity and, for Codex, trust state through `hooks/list` (§6.5); conformance record for the pinned version (§6.6); gateway acquisition (§8.1); sandbox and network policy (§9); runtime home immutability (§4.2); daemon reconciliation (§5.5). `--web` for a vendor outside `remote` is exit 2; `acp` under `refuse` is exit 2.
 
-`ihar check` prints the profile, the guarantee text of §1.4 verbatim, the effective masking level, each enforcement point with its state, the vendor defaults in force under `vendor-default`, the dropped environment names, hook trust and conformance status, the gateway refusal counters, unmet registry `requires_env`, MCP entries Codex cannot express, adapter capabilities, and the known-gaps table. Per-vendor receipt state comes from the same `ihar_receipt_binary_status` helper used by launch and is exactly `verified`, `mismatched`, or `missing receipt`.
+`ihar check` collects one closed schema-1 object and both renderers consume that same validated object. It contains the profile and guarantee, masking floor/effective level/engine/dropped names, per-vendor receipt state, closed per-hook trust facts, conformance state, capabilities, asset diagnostics, MCP notes and known gaps. Per-vendor receipt state comes from the same `ihar_receipt_binary_status` helper used by launch and is exactly `verified`, `mismatched`, or `missing receipt`.
+
+Gateway and network status are structured rather than prose claims. Each discovered explicit gateway instance carries `{key, mode, port, pid, consumers, healthy, metrics}`. `key` is the 12-hex instance identity; `port` and `pid` are nullable observed integers; `consumers` is the count of live consumer records; `healthy` is the live local protocol-probe result. `metrics` carries `state: available|unavailable` and `masked`, `refused`, `relayed`, `uptime_seconds`. Available metrics require every non-negative integer; unavailable metrics require every counter to be `null`, so check never invents zeroes or claims opaque counters are known. Collection is read-only and fail-soft per instance.
+
+Network status is the closed triple `{state, scope, default}`. `state: enforced` requires `scope: guest-boundary`; `state: not enforced` requires `scope: none`. `default` reports the selected policy's allow/deny default without implying that a host profile enforces it. Consequently `standard` reports `not enforced / none / allow`, `protected` reports `not enforced / none / allow`, and only `isolated` reports `enforced / guest-boundary / deny`. Text output exposes the same typed facts and availability markers as JSON.
 
 ## 13. Web and ACP (slices S9, S11)
 
@@ -805,7 +836,7 @@ marks the daemon record `remote_control: true`, and execs the TUI with `--remote
 unix://<runtime>/app-server-control/app-server-control.sock`. Dry-run renders this
 final argv but performs none of the daemon or pairing side effects.
 
-**ACP**: `ihar acp <vendor>` execs the pinned adapter with the runtime environment. Every `hooks: enforced` profile refuses it, which is HLD §6.9's rule; under `standard` it runs and `ihar check` states that settings hooks may not fire (claude-agent-acp #144) and that codex-acp overrides sandbox and approval policy (#310, #477). ACP sessions are learned through the vendor listing path, since `session-register.py` may not run.
+**ACP**: `ihar acp <vendor>` execs the pinned adapter with the runtime environment. Every `hooks: enforced` profile refuses it at the profile gate, which is HLD §6.9's rule. Under `standard`, or another profile that explicitly allows ACP, a real ACP launch must then pass the same install-receipt check for the selected native Claude/Codex executable before the adapter starts; the adapter delegates to that binary, so ACP is not a receipt-verification carve-out. Adapter version/digest integrity remains a separate pinned-asset check. `ihar check` states that settings hooks may not fire (claude-agent-acp #144) and that codex-acp overrides sandbox and approval policy (#310, #477). ACP sessions are learned through the vendor listing path, since `session-register.py` may not run.
 
 ## 14. Install, update, verify
 
@@ -832,7 +863,9 @@ Release-lock drift warns that install evidence is stale. `ihar_receipt_binary_st
 
 ### 14.3 Commands
 
-`ihar install [--acp] [--microvm] [--migrate-store]` installs the Node tree and `claude`, the Codex tarball with icodex's tamper guard (`lib/binary/install.sh:184-259`), `uv` and the venv, shims, hooks, managed hooks and manifests into a staged store, runs the conformance suite, then atomically publishes the store evidence and receipt. There is no `--from-lockfile`: the release lockfile is the only source of installed versions. Install and update are one operation — each component compares its pinned version with the receipt, so bumping the lockfile upgrades and an unchanged lockfile makes the run a no-op. `--migrate-store` copies eligible legacy content under fail-closed quiescence and never removes its source. `ihar update [--claude] [--codex] [--all]` stops managed daemons (§5.5), replaces binaries, re-proves conformance, publishes a receipt, and restarts only daemons that were running.
+`ihar install [--acp] [--microvm] [--migrate-store]` validates tracked assets and mutable-source topology before building a generation, installs the Node tree and `claude`, the Codex tarball with icodex's tamper guard (`lib/binary/install.sh:184-259`), `uv` and the venv, shims, hooks, managed hooks and manifests into staged store/NVM trees, runs mandatory conformance, writes the new lock digest and receipt inside the stage, then activates the explicit installer-owned paths as one rollback-capable generation. Mutable auth/plugin owners remain outside activation and existing bytes are preserved. There is no `--from-lockfile`: the release lockfile is the only source of installed versions. Install and update are one operation — each component compares its pinned version with the receipt, so bumping the lockfile upgrades and an unchanged lockfile makes the run a no-op.
+
+With `--migrate-store`, eligible legacy content is copied into that same store stage before installation continues; it is not published early. Required legacy-source locks remain held through conformance, receipt creation and activation. A failure in any later step removes the stage and leaves the prior active generation and receipt paired; activation rollback attempts every previously moved path and retains/reports the backup if any restoration is incomplete. The legacy source remains byte-identical and is never deleted. `ihar update [--claude] [--codex] [--all]` stops managed daemons (§5.5), replaces binaries through the same generation transaction, re-proves conformance, publishes a receipt, and restarts only daemons that were running.
 
 `ihar check [--diff] [--conformance]` collects one structured result rendered as text or, with the global `--json`, validated JSON. `--diff` compares temporary desired renders for both vendors with active runtime homes and has no state-changing side effect. `--conformance` is the explicit live evidence path. A command that does not declare JSON output rejects `--json` with exit 2. `ihar homes clean [<id>]` removes only expired runtime homes for the current or exact named state and never removes `st/`. Store writes take `ihar_with_lock --required` on `$IHAR_STORE/.ihar-store.lock`.
 
@@ -848,6 +881,7 @@ Release-lock drift warns that install evidence is stale. `ihar_receipt_binary_st
 | MCP registry entry | §7.1 | `manifests/mcp/registry.json` |
 | Network policy | §9.2 | `manifests/netpolicy/*.json` |
 | Asset inventory | §4.2 | `manifests/assets.json` |
+| Mutable runtime-link inventory | §2.3, §4.2 | `manifests/mutable-links.json` |
 | Vendor state inventory | §2.4 | `manifests/state.json` |
 | Session index record | §10.1 | `$IHAR_STATE/sessions.jsonl` |
 | Launch claim | §10.3 | `$IHAR_STATE/launches/*.json` |
@@ -872,31 +906,32 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 |-------|------|-------|
 | S0 | `tests/test_contracts.sh` | every profile file validates; the guarantee text of §1.4 exists per profile; the manifest linter rejects two `updatedInput` hooks on one event; netpolicy files validate |
 | S0 | `tests/test_jsonio.py`, `tests/test_ids.py`, `tests/test_config.sh` | closed JSON contracts and atomic writes; UUID identities; parsed project configuration and output-mode grammar |
-| S1 | `tests/test_state.sh` | id derivation; marker schema 3 and upgrades from 1 and 2; `st/` and `r/` separation; **socket path preflight aborts when over the limit**; runtime home immutability (a second launch with the same hash reuses it, a drifted file aborts); different profiles produce different hashes; `chmod 444` under enforced profiles; link rules; migration by hash |
+| S1 | `tests/test_state.sh` | id derivation; marker schema 3 and upgrades from 1 and 2; `st/` and `r/` separation; **socket path preflight aborts when over the limit**; runtime home immutability and manifest-keyed generations; different profiles produce different hashes; rendered-file sealing; complete tracked-asset/mutable/state link creation and fail-closed reuse; migration by hash |
+| S1 | `tests/test_runtime_state_upgrade.py` | nofollow ancestry; SQLite-expanded ownership; unique materialised owner; canonical conflicts; candidate-aware quiescence across selectors/cwd/fds; source/stage/publication/relink fingerprints; required atomic exchange; recovery retention; rollback and idempotence |
 | S1 | `tests/test_locks.sh` | `--required` exits 3 without `flock` or on timeout; `--best-effort` warns and continues; every security call site uses `--required` |
 | S2 | `tests/test_adapters.sh` | dry-run argv and environment per vendor; **passthrough per vendor**, `--` for Claude and none for Codex; unknown flag exit 2; capabilities validate |
 | S2 | `tests/test_lifecycle.sh` | step order: profile before store verify, gateway before render, render before materialise, daemon reconcile before launch; the gateway port reaches the Codex provider region; enforced receipt failure occurs before the vendor start marker |
 | S3 | `tests/test_hooks.sh` | rendered outputs match golden files per profile; **matcher regex translation** and a real match against `mcp__iwiki-local__wiki_update_page`; `args` rendered outside the quoted path; `python3 -I` in the command; one decision per security hook on fixtures for both vendors; fail-closed against fail-open classes; `hookio` rejects disallowed keys; the store-write refusal has no exclusion for store hook paths |
 | S3 | `tests/test_hook_trust.sh` | `hooks/list` responses drive the decision: `untrusted`, `modified`, `source: project` and a hash mismatch each abort with exit 3 under `protected`; the same responses warn under `standard`; sealing makes only ihar's own hooks trusted and a project hook is never in the trust block; `bypass_hook_trust` appears in no render |
-| S3 | `tests/test_conformance.py` | the suite's own cases run against fakes; a missing or stale record aborts an enforced launch |
+| S3 | `tests/test_conformance.py` | required case sets are exact per vendor; fake native vendors drive deny, rewrite, SessionStart, MCP matcher and timeout through vendor command paths; Claude sandbox and Codex load/trust/tamper cases cannot be missing or skipped; release pins and active-auth/final-protected-store topology are enforced |
 | S4 | `tests/test_mcp.sh` | renders match golden files at the runtime path; `requires_env` skip; `${IHAR_PROJECT_ROOT}` expansion; an unexpanded reference in a Codex render is exit 3; the header limitation is a notice; MCP input masking; a non-allowlisted server is absent from the render |
 | S5a | `tests/test_gateway_explicit.sh`, `tests/test_gateway_routes.py` | masked bodies on every model route; **an unknown route is refused when masking is on and relayed when off**; **an unknown content block and an image block are refused under enforced profiles**; structural keys keep their values but a secret inside one is caught; unparseable 400; compressed 415; limits enforced; streaming relay; websocket transit; probe answered locally; **instance key separates two masking levels**; refcount acquire and release; an unhealthy gateway aborts with exit 3 |
 | S5a | `tests/test_gateway_routes.py` | a planted secret in a request body never appears in the log; the allowed field list is exactly §8.6 |
-| S5a | `tests/test_profiles.sh` | resolution precedence; **masking tighten-only**; **masking without a gateway is exit 2**; enforcement table per profile from `ihar check --json`; the guarantee text printed matches the profile |
+| S5a | `tests/test_profiles.sh` | resolution precedence; **masking tighten-only**; **masking without a gateway is exit 2**; closed text/JSON status parity including truthful host-versus-guest network enforcement; the guarantee text printed matches the profile |
 | S5a | `tests/test_profiles.sh`, `tests/test_hooks.sh` | `vendor-default` writes nothing; `vendor` writes the full triple plus the `.git` grant; `read-only` writes `read-only`; `default_permissions` never omitted; `--approval` changes only the approval policy; enforced profiles deny store and state writes through direct tools, Bash and child processes |
 | S5b | `tests/test_contracts.sh`, `tests/test_profiles.sh` plus the recorded measurement | transparent mode is absent from the schema and `remote-protected` is absent from manifests after the privileged-boundary no-go |
 | S7 | `tests/test_sessions.sh`, `tests/test_sessions_readers.py` | jsonl reader (title precedence, mangling, version guard, cache); app-server client over socket and stdio; sqlite fallback; **epoch seconds to ISO-8601**, and `Thread.source` and `modelProvider` never reaching the record; merge and supersede; deterministic ids for vendor-only sessions; **ephemeral ids excluded**; UUIDv7 ordering; partial hook records validate; **a hook with a stale `IHAR_LAUNCH_ID` still registers against the right session** |
 | S8 | `tests/test_handoff.sh`, `tests/test_handoff_build.py` | under 8 kB **on a repository with 500 changed files** with the truncation flags set; deterministic fields with the distiller off; heuristic decisions kept separate and absent for a Russian transcript; `masked: true` only after the engine ran; exit 3 without an engine; **two concurrent switches consume their own pending files**; forks recorded as ephemeral before running; one carrier per target |
 | S9 | manual protocol | Claude remote-control argv per gateway mode; the Codex daemon under the runtime home visible to `codex agents`; pairing code; LAN form uses `app-server --listen` |
 | S10 | `tests/test_microvm.sh` | both homes visible in the guest; policy bundle read-only; deny-by-default network with the gateway reachable and an arbitrary host not; Codex boots and answers `--version` |
-| S11 | `tests/test_acp.sh` | environment reaches the adapter; enforced profiles exit 2 with the issue list; `standard` proceeds and `ihar check` prints the gap |
+| S11 | `tests/test_acp.sh` | environment reaches the adapter; enforced profiles exit 2 with the issue list; every ACP-allowed real launch verifies the delegated native binary receipt before adapter start; `standard` proceeds and `ihar check` prints the gap |
 | daemon | `tests/test_daemon.sh` | a daemon on an older binary is restarted; a config-hash change restarts an ihar-started daemon and refuses against a foreign one; `ihar update` stops and restarts only what was running |
-| install | `tests/test_install.sh`, `tests/test_lockfile.sh` | transactional store activation and rollback; immutable release inputs; receipt-backed executable verification with standard warning and enforced exit 3 |
+| install | `tests/test_install.sh`, `tests/test_lockfile.sh` | transactional store activation and rollback; command-wide migrate-plus-install atomicity with source locks and retained recovery on incomplete rollback; mutable-owner preservation; mandatory conformance before receipt activation; receipt-backed executable verification with standard warning and enforced exit 3 |
 | web | `tests/test_web.sh` | native Claude and Codex web argv, profile gates, daemon attachment and LAN spelling |
 | workflow | `tests/test_workflow_gates.sh` | validated chain transitions, stale-hash rejection and bounded gate evidence |
-| concurrency | `tests/test_concurrency.sh` | a marker paused after state-lock acquisition proves a second profile cannot enter publication, then distinct homes publish and remain unchanged; different masking levels create different gateway instances; parallel `ihar_cmd_install` calls use a barrier-controlled `_ihar_install_all` to prove production store-lock serialisation; after one shared gateway consumer releases, a live protocol probe succeeds for the other |
+| concurrency | `tests/test_concurrency.sh` | real-`flock` acknowledgement precedes every blocked-entry assertion; a marker paused inside publication proves a second profile cannot enter, then distinct homes publish and remain unchanged; parallel `ihar_cmd_install` calls serialize through the production store lock; different masking levels create different gateway instances; after one shared consumer releases, a live protocol probe succeeds for the other |
 
-`manifests/tests.json` is the closed schema-1 inventory of every discovered test file named above. Paths are unique, repository-relative `tests/test_*.sh` or `tests/test_*.py` names. Before executing anything, `tests/run.sh` validates the manifest and fails with exit 3 for malformed, duplicate, unsafe, missing, unlisted-discovered, or listed-but-undiscovered paths. It then runs the inventory-equivalent discovered set and is the command each slice's verification names.
+`manifests/tests.json` is the closed schema-1 inventory of all 28 discovered test files named above, including `tests/test_runtime_state_upgrade.py`. Paths are unique, repository-relative `tests/test_*.sh` or `tests/test_*.py` names. Before executing anything, `tests/run.sh` validates the manifest and fails with exit 3 for malformed, duplicate, unsafe, missing, unlisted-discovered, or listed-but-undiscovered paths. It then runs the inventory-equivalent discovered set and is the command each slice's verification names.
 
 ## 17. Failure handling matrix
 
@@ -909,11 +944,13 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | state | socket path over the limit | usage | 2 |
 | store | hook or managed-hook sha256 mismatch | fail-closed | 3 |
 | store | executable receipt state is `mismatched` or `missing receipt`, `standard` / enforced | fail-soft / fail-closed | 0 / 3 |
-| store | conformance record missing, stale or failing, enforced profile | fail-closed | 3 |
+| store | conformance binary differs from the release pin; record is missing, stale, incomplete, skipped or failing under an enforced profile | fail-closed | 3 |
+| store | mutable-link manifest or canonical source topology is invalid | fail-closed | 3 |
 | hooks | Codex `hooks/list` reports untrusted, modified, project-sourced or hash-mismatched required hook | fail-closed | 3 |
 | lock | `--required` unavailable or timed out | fail-closed | 3 |
 | lock | `--best-effort` unavailable | fail-soft | 0 |
-| runtime | existing runtime home drifted from the render | fail-closed | 3 |
+| runtime | existing rendered file or tracked/mutable/state link is missing, wrong or materialised contrary to its contract | fail-closed | 3 |
+| runtime migration | ancestry is symlinked; ownership is ambiguous; canonical state conflicts; a candidate consumer is active/opaque; a fingerprint changes; atomic exchange or rollback cannot complete | fail-closed, preserve source and recovery evidence | 3 |
 | daemon | live daemon with a different binary or config hash, not ihar-started | fail-closed | 3 |
 | render | manifest or registry schema error | fail-closed | 3 |
 | render | Codex MCP entry with an unexpanded `${…}` | fail-closed | 3 |
@@ -936,7 +973,7 @@ The review is right that the original slice order puts feature work before the c
 | Slice | Deliverable | Verification |
 |-------|-------------|--------------|
 | S0 | Security contracts: R4 scope per profile, threat model, trusted-store boundary, network policy shape, runtime concurrency model, hook trust strategy | `tests/test_contracts.sh`; the guarantee text is what `ihar check` prints |
-| S1 | Three roots, project state, immutable runtime homes, socket preflight, two-mode locks, migration | `tests/test_state.sh`, `tests/test_locks.sh` |
+| S1 | Three roots, project state, immutable runtime homes, manifest-keyed generations, automatic transactional runtime-state upgrade, socket preflight and two-mode locks | `tests/test_state.sh`, `tests/test_runtime_state_upgrade.py`, `tests/test_locks.sh` |
 | S2 | Adapter contract, both adapters for launch, resume, fork and capabilities; lifecycle ordering | `tests/test_adapters.sh`, `tests/test_lifecycle.sh` |
 | S3 | Hook manifest, renderer, `hookio`, merged security hook, Codex managed-hook trust, live conformance suite | `tests/test_hooks.sh`, `tests/test_hook_trust.sh`, `tests/test_conformance.py` |
 | S4 | MCP registry, renderer, input policy | `tests/test_mcp.sh` |
@@ -968,10 +1005,7 @@ The review is right that the original slice order puts feature work before the c
 
 ## 20. Open implementation decisions
 
-- Claude `sandbox` settings key names for 2.1.274 (§9.1). Resolve in S5a.
-- Codex `auth.json` field names for auth-mode detection (§8.7). Resolve in S5a.
-- Whether `--append-system-prompt-file` works in 2.1.274 despite being absent from `--help` (§11.5). Resolve in S8.
-- Claude's documented behaviour when a hook exceeds its timeout, recorded rather than assumed by the conformance suite (§6.6).
+No unresolved decision remains from the final conformance-remediation scope. Vendor timeout behavior is an executable mandatory case in §6.6 rather than a prose assumption; future pinned-version changes must earn new evidence before activation.
 
 ## 21. Disposition of the architecture review
 
