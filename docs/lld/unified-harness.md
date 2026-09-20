@@ -96,7 +96,7 @@ Revision 3 of this document specified a readable id, `<sanitized-basename>-<sha2
 | `bin/codex`, `bin/codex-code-mode-host`, `bin/.codex-version` | pinned static Codex (icodex `lib/binary/install.sh:184-259`) | `ihar install` |
 | `bin/uv`, `bin/rg`, `bin/tree`, `bin/firecracker`, `bin/vmlinux`, `bin/rootfs.ext4` | tools and microVM assets | `ihar install` |
 | `venv/` | `requests`, `presidio-analyzer`, `presidio-anonymizer`, optional spaCy models, optional `claude-agent-sdk` | `ihar install` |
-| `skills/`, `hooks/`, `manifests/` | copies of the tracked trees, sha256-pinned | `ihar install` |
+| `skills/`, `hooks/`, `manifests/` | copies of declared tracked release content; inventory validates type and required presence, while only hook files named in the release lock carry SHA-256 pins | `ihar install` |
 | `auth/claude/.credentials.json`, `auth/codex/auth.json` | globally shared mutable vendor logins | vendors through `manifests/mutable-links.json` |
 | `plugins/claude/`, `plugins/codex/` | globally shared mutable plugin state | vendors through `manifests/mutable-links.json` |
 | `verification/<vendor>-<version>.json` | live hook conformance records (§6.6) | `ihar install`, `ihar update` |
@@ -104,7 +104,7 @@ Revision 3 of this document specified a readable id, `<sanitized-basename>-<sha2
 | `install-receipt.json` | atomic machine-local evidence: release-lock digest, installed versions and executable SHA-256 values | `ihar install`, `ihar update` |
 | `.ihar-store.lock`, `.last-lockfile-hash` | store lock and drift marker | store |
 
-Installer-owned generation paths and vendor-owned mutable paths are separate contracts. An install or update transaction replaces only the explicit installer-owned paths, the staged Node tree, `.last-lockfile-hash`, and `install-receipt.json`; it never snapshots or activates `auth/`, `plugins/`, or the store-lock inode. `manifests/mutable-links.json` is the closed schema-1 inventory for the four mutable runtime links: Claude and Codex auth files plus their vendor plugin directories. These entries are deliberately absent from `manifests/assets.json`, whose bytes are immutable release assets.
+Installer-owned generation paths and vendor-owned mutable paths are separate contracts. An install or update transaction replaces only the explicit installer-owned paths, the staged Node tree, `.last-lockfile-hash`, and `install-receipt.json`; it never snapshots or activates `auth/`, `plugins/`, or the store-lock inode. `manifests/assets.json` validates each declared source's type and required presence before copying tracked release content; it is not a whole-tree digest manifest. Release-lock SHA-256 pins cover only the hook files explicitly listed there. Runtime publication and reuse separately require exact links from declared runtime targets to their installed store sources. `manifests/mutable-links.json` is the closed schema-1 inventory for the four mutable runtime links: Claude and Codex auth files plus their vendor plugin directories. These entries are deliberately absent from `manifests/assets.json`, whose content is installer-owned release input.
 
 Every mutable source and runtime target is a canonical safe relative path. Sources are unique, targets are unique per vendor, auth sources are regular files below `auth/<vendor>/`, and plugin sources are real directories exactly at `plugins/<vendor>`. Dot segments, repeated/trailing-separator aliases, symlinked ancestors or leaves, non-directory ancestors and wrong leaf types fail closed before store preparation or runtime linking. Preparation walks retained directory descriptors with `O_NOFOLLOW`, creates only missing parents or plugin directories, keeps the auth root mode `0700`, and never creates, copies, removes or replaces an auth-file payload or existing plugin bytes. A missing auth file may therefore remain the intentional target of a dangling runtime link until the vendor creates it.
 
@@ -175,7 +175,7 @@ lib/
   handoff/    handoff.sh
   web/ acp/ check/
   python/ihar/
-    jsonio.py  toml_regions.py
+    jsonio.py  toml_regions.py  runtime_state_upgrade.py
     sessions/{claude,codex,index}.py
     handoff/{build,distill}.py
     mask/{engine,shapes,policy}.py
@@ -188,7 +188,7 @@ hooks/
   security-pretool.py chain-gate.py gwt-gate.py session-register.py handoff-inject.py
   claude-only/…
 manifests/
-  hooks.json  assets.json  state.json  tests.json
+  hooks.json  assets.json  mutable-links.json  state.json  tests.json
   mcp/registry.json  profiles/*.json  netpolicy/*.json
   config/claude/…  config/codex/…
 skills/  tests/  docs/
@@ -268,7 +268,7 @@ Schema 1 is iclaude's marker and schema 2 was revision 2's; both are upgraded in
 | `ihar_state_setup root` | resolve `<id>`, create the state tree and `st/<vendor>/`, run `ihar_state_preflight`, write the marker; exports `IHAR_STATE` |
 | `ihar_runtime_materialise vendor hash` | under `ihar_with_lock --required "$IHAR_STATE/.ihar.lock" 30`: if `r/<hash>/<vendor>` exists, verify rendered files, tracked-asset links and mutable links, run the automatic state upgrade, then reconcile state links; else run the upgrade before building, link all three inventories in a temporary directory, `chmod 444` only the rendered security files under enforced profiles, then rename into place. Exports `IHAR_RUNTIME` |
 | `ihar_link_runtime` | consumes `manifests/assets.json`, `manifests/mutable-links.json` and `manifests/state.json`; initial publication reports absent optional assets and creates canonical state/mutable owners without replacing existing vendor bytes |
-| `ihar_verify_runtime_asset_links` / `ihar_verify_runtime_mutable_links` / `ihar_verify_runtime_state_links` | reuse verifiers preserve wrong or materialised entries and fail closed; required asset links are never repaired in place, while missing state links are added only after the complete declared set passes validation |
+| `ihar_verify_runtime_asset_links` / `ihar_verify_runtime_mutable_links` / `ihar_verify_runtime_state_links` | reuse verifiers require each declared link to resolve to its exact source, preserve wrong or materialised entries and fail closed; required asset links are never repaired in place, while missing state links are added only after the complete declared set passes validation |
 | `ihar_upgrade_runtime_state` | consumes the state inventory and migrates exactly one unambiguous pre-manifest materialised owner through the transaction in §4.5; no owner is a no-op |
 | `ihar_with_lock MODE lockfile timeout cmd…` | §4.3 |
 
@@ -303,7 +303,7 @@ The single materialised owner is fingerprinted before and after copying into a m
 
 Any failure before commit attempts to exchange the prior canonical tree back and restore moved runtime entries. An incomplete rollback fails closed and names the retained recovery or stage path; cleanup never deletes incomplete evidence. This is automatic recovery for ordinary pre-manifest materialised state, not an instruction to copy it manually. Ambiguous owners, wrong links and conflicting canonical bytes still require explicit human resolution because ihar cannot choose which data is authoritative without risking loss.
 
-`ihar install --migrate-store` applies the store analogue across the whole command, not as a separate pre-install publication. It takes required lifecycle locks for every eligible legacy source, rejects open writers, fingerprints content and metadata before/after copy and again immediately before activation, validates any staged receipt, and merges all eligible legacy content into the same install stage that receives the pinned binaries, assets, conformance records and new receipt. One activation publishes that combined generation. Any later install, conformance, receipt or activation failure leaves the previous active generation and receipt usable; incomplete activation rollback retains and reports its recovery backup. Source locks are held until the command finishes, and legacy sources are copy-only and never deleted.
+`ihar install --migrate-store` applies the store analogue across the whole command, not as a separate pre-install publication. It takes required lifecycle locks for every eligible legacy source, rejects any process with an open descriptor at or below a source, fingerprints content and metadata before/after copy and again immediately before activation, validates any staged receipt, and merges all eligible legacy content into the same install stage that receives the pinned binaries, assets, conformance records and new receipt. One activation publishes that combined generation. Any later install, conformance, receipt or activation failure leaves the previous active generation and receipt usable; incomplete activation rollback retains and reports its recovery backup. Source locks are held until the command finishes, and legacy sources are copy-only and never deleted.
 
 ## 5. Adapters (slices S2, S7, S8, S9)
 
@@ -661,9 +661,9 @@ The logging contract is a fixed invariant with its own test. Never logged: `Auth
 | Mode | Claude | Codex |
 |------|--------|-------|
 | `off` | nothing | nothing |
-| `explicit` | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` | `model_provider = "ihar"` plus `[model_providers.ihar] base_url = "http://127.0.0.1:<port>/<prefix>" wire_api = "responses" requires_openai_auth = true`, where `<prefix>` is `backend-api/codex` under ChatGPT auth and `v1` under an API key |
+| `explicit` | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` | `model_provider = "ihar"` plus `[model_providers.ihar] base_url = "http://127.0.0.1:<port>/<prefix>" wire_api = "responses" requires_openai_auth = true` |
 
-`ihar_codex_auth_mode` reads `$IHAR_STORE/auth/codex/auth.json` and returns `chatgpt`, `apikey` or `none`; the field names are a VERIFY item for S5a and the file is only ever read.
+`ihar_codex_auth_prefix` is a narrow route selector, not an authentication-mode API. It reads but never writes `$IHAR_STORE/auth/codex/auth.json`: a readable regular file containing the literal `OPENAI_API_KEY` marker selects `v1`; absence or no marker selects `backend-api/codex`. It returns only that path segment.
 
 ## 9. Sandbox and network policy (slices S5a, S10)
 
@@ -863,7 +863,7 @@ Release-lock drift warns that install evidence is stale. `ihar_receipt_binary_st
 
 ### 14.3 Commands
 
-`ihar install [--acp] [--microvm] [--migrate-store]` validates tracked assets and mutable-source topology before building a generation, installs the Node tree and `claude`, the Codex tarball with icodex's tamper guard (`lib/binary/install.sh:184-259`), `uv` and the venv, shims, hooks, managed hooks and manifests into staged store/NVM trees, runs mandatory conformance, writes the new lock digest and receipt inside the stage, then activates the explicit installer-owned paths as one rollback-capable generation. Mutable auth/plugin owners remain outside activation and existing bytes are preserved. There is no `--from-lockfile`: the release lockfile is the only source of installed versions. Install and update are one operation — each component compares its pinned version with the receipt, so bumping the lockfile upgrades and an unchanged lockfile makes the run a no-op.
+`ihar install [--acp] [--microvm] [--migrate-store]` validates tracked assets and mutable-source topology before building a generation, installs the Node tree and `claude`, the Codex tarball with icodex's tamper guard (`lib/binary/install.sh:184-259`), `uv` and the venv, shims, hooks, managed hooks and manifests into staged store/NVM trees, runs mandatory conformance, writes the new lock digest and receipt inside the stage, then activates the explicit installer-owned paths as one rollback-capable generation. Mutable auth/plugin owners remain outside activation and existing bytes are preserved. There is no `--from-lockfile`: the release lockfile is the only source of installed versions. Install and update share this transaction. A matching component version stamp may skip downloading or reinstalling that vendor binary, but the command still recopies declared assets into the stage, reruns conformance, rebuilds the command-wide lock digest and receipt, and activates the staged generation. An unchanged lockfile therefore does not make the command a blanket no-op, and the receipt is not a per-component skip oracle.
 
 With `--migrate-store`, eligible legacy content is copied into that same store stage before installation continues; it is not published early. Required legacy-source locks remain held through conformance, receipt creation and activation. A failure in any later step removes the stage and leaves the prior active generation and receipt paired; activation rollback attempts every previously moved path and retains/reports the backup if any restoration is incomplete. The legacy source remains byte-identical and is never deleted. `ihar update [--claude] [--codex] [--all]` stops managed daemons (§5.5), replaces binaries through the same generation transaction, re-proves conformance, publishes a receipt, and restarts only daemons that were running.
 
@@ -1005,7 +1005,7 @@ The review is right that the original slice order puts feature work before the c
 
 ## 20. Open implementation decisions
 
-No unresolved decision remains from the final conformance-remediation scope. Vendor timeout behavior is an executable mandatory case in §6.6 rather than a prose assumption; future pinned-version changes must earn new evidence before activation.
+Revision 11 records only choices supported by the approved artifacts and reviewed implementation. Vendor timeout behavior is an executable mandatory case in §6.6 rather than a prose assumption; future pinned-version changes must earn new evidence before activation. Any question not supported by that evidence remains open rather than being closed by this reconciliation.
 
 ## 21. Disposition of the architecture review
 
