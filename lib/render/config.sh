@@ -17,13 +17,10 @@ ihar_render_config() {
 # --------------------------------------------------------------------------- #
 
 _ihar_render_claude_config() {
-  local render="$1" sandbox_json="null" base_url=""
-
-  case "$IHAR_PROFILE_SANDBOX" in
-    vendor-default) sandbox_json="null" ;;
-    read-only)      sandbox_json='{"enabled": true, "filesystem": "read-only"}' ;;
-    vendor|microvm) sandbox_json='{"enabled": true, "filesystem": "workspace-write"}' ;;
-  esac
+  local render="$1" protected_roots_json base_url=""
+  protected_roots_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' \
+    "$IHAR_STORE" "$IHAR_STATE_ROOT" "$render")" \
+    || ihar_die 3 "cannot encode the Claude protected roots"
 
   if [[ "${IHAR_GATEWAY_MODE:-off}" == "explicit" ]]; then
     local gateway_host=127.0.0.1
@@ -32,7 +29,7 @@ _ihar_render_claude_config() {
   fi
 
   ihar_python ihar.render.claude_settings \
-    "$render/settings.json" "$sandbox_json" "$base_url" \
+    "$render/settings.json" "$IHAR_PROFILE_SANDBOX" "$protected_roots_json" "$base_url" \
     || ihar_die 3 "cannot render the Claude managed settings"
 }
 

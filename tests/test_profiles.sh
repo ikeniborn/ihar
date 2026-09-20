@@ -86,6 +86,35 @@ render_codex() { # <sandbox> [approval]
   cat "$dir/config.toml"
 }
 
+render_claude() { # <sandbox> <store> <state-root> <runtime>
+  local sandbox="$1" store="$2" state_root="$3" runtime="$4"
+  mkdir -p "$runtime"
+  printf '{}\n' > "$runtime/settings.json"
+  IHAR_PROFILE_SANDBOX="$sandbox" IHAR_STORE="$store" \
+    IHAR_STATE_ROOT="$state_root" IHAR_GATEWAY_MODE=off \
+    _ihar_render_claude_config "$runtime"
+  cat "$runtime/settings.json"
+}
+
+settings="$(render_claude protected "$IHAR_STORE" "$IHAR_STATE_ROOT" "$PROJECT/runtime")"
+assert_eq "Claude disables unsandboxed retries" "False" \
+  "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["sandbox"]["allowUnsandboxedCommands"])' <<<"$settings")"
+assert_eq "Claude fails when sandbox is unavailable" "True" \
+  "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["sandbox"]["failIfUnavailable"])' <<<"$settings")"
+for protected in "$IHAR_STORE" "$IHAR_STATE_ROOT" "$PROJECT/runtime"; do
+  assert_contains "Claude denies $protected" "$settings" "$protected"
+done
+
+settings="$(render_claude vendor-default "$IHAR_STORE" "$IHAR_STATE_ROOT" "$PROJECT/runtime-standard")"
+assert_eq "standard omits the managed Claude sandbox" "False" \
+  "$(python3 -c 'import json,sys; print("sandbox" in json.load(sys.stdin))' <<<"$settings")"
+
+settings="$(render_claude protected "$PROJECT/../proj/store" "$PROJECT/store" "$PROJECT/runtime-dedup")"
+assert_eq "Claude protected paths are absolute" "True" \
+  "$(python3 -c 'import json,os,sys; roots=json.load(sys.stdin)["sandbox"]["filesystem"]["denyWrite"]; print(all(os.path.isabs(path) for path in roots))' <<<"$settings")"
+assert_eq "Claude protected paths are deduplicated" "2" \
+  "$(python3 -c 'import json,sys; roots=json.load(sys.stdin)["sandbox"]["filesystem"]["denyWrite"]; print(len(roots) if len(roots) == len(set(roots)) else -1)' <<<"$settings")"
+
 # The settings that must live at the document's top level. A key after a table header
 # belongs to that table — which is right for `".git/"` inside `[permissions.…]` and
 # fatal for these four, because Codex then finds no sandbox settings at all. It parsed

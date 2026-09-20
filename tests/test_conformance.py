@@ -88,6 +88,68 @@ def test_a_broken_hook_fails_the_suite():
             shutil.rmtree(directory, ignore_errors=True)
 
 
+def test_claude_run_probes_native_sandbox_writes():
+    store = _store()
+    binary = os.path.join(store, "claude")
+    with open(binary, "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\nexit 0\n")
+    os.chmod(binary, 0o755)
+
+    real_run = conformance.subprocess.run
+    seen = {"direct": set(), "child": set(), "workspace": set()}
+    sandbox_unavailable = [False]
+
+    def fake_vendor(argv, **kwargs):
+        if argv[0] != binary:
+            return real_run(argv, **kwargs)
+        if argv[1:] == ["--version"]:
+            return conformance.subprocess.CompletedProcess(argv, 0, "claude 2.1.274\n", "")
+        if "-p" not in argv:
+            return conformance.subprocess.CompletedProcess(argv, 2, "", "not non-interactive")
+        if sandbox_unavailable[0]:
+            return conformance.subprocess.CompletedProcess(argv, 3, "", "sandbox unavailable")
+
+        settings_path = os.path.join(kwargs["env"]["CLAUDE_CONFIG_DIR"], "settings.json")
+        with open(settings_path, "r", encoding="utf-8") as handle:
+            roots = json.load(handle)["sandbox"]["filesystem"]["denyWrite"]
+        invocation = " ".join(argv)
+
+        for kind in ("direct", "child"):
+            for root in roots:
+                target = os.path.join(root, f".ihar-conformance-{kind}-write")
+                if target in invocation:
+                    seen[kind].add(root)
+                    proof = os.path.join(kwargs["cwd"], f".ihar-conformance-{kind}-proof")
+                    with open(proof, "w", encoding="utf-8") as handle:
+                        handle.write("ihar-conformance\n")
+                    return conformance.subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        target = os.path.join(kwargs["cwd"], ".ihar-conformance-workspace-write")
+        if target in invocation:
+            seen["workspace"].add(target)
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write("ihar-conformance\n")
+            return conformance.subprocess.CompletedProcess(argv, 0, "{}", "")
+        return conformance.subprocess.CompletedProcess(argv, 2, "", "unknown probe")
+
+    conformance.subprocess.run = fake_vendor
+    try:
+        record = conformance.run("claude", binary, store, MANIFEST)
+        sandbox_unavailable[0] = True
+        unavailable_record = conformance.run("claude", binary, store, MANIFEST)
+    finally:
+        conformance.subprocess.run = real_run
+        shutil.rmtree(store, ignore_errors=True)
+
+    assert record["cases"]["sandbox-direct-write"]["status"] == "passed"
+    assert record["cases"]["sandbox-child-write"]["status"] == "passed"
+    assert record["cases"]["sandbox-workspace-write"]["status"] == "passed"
+    assert len(seen["direct"]) == 3, seen
+    assert len(seen["child"]) == 3, seen
+    assert len(seen["workspace"]) == 1, seen
+    assert unavailable_record["cases"]["sandbox-direct-write"]["status"] == "failed"
+
+
 def test_the_full_run_against_the_pinned_codex():
     if not os.access(CODEX, os.X_OK):
         print("SKIP: no Codex binary")

@@ -81,6 +81,16 @@ codex_bash='{"hook_event_name":"PreToolUse","tool_name":"Bash","session_id":"s",
 assert_eq "a harmless command is allowed on claude" "0" "$(hook_exit claude "$claude_bash")"
 assert_eq "a harmless command is allowed on codex" "0" "$(hook_exit codex "$codex_bash")"
 
+CLAUDE_CONFIG_DIR="$IHAR_TEST_TMP/claude-runtime"
+mkdir -p "$CLAUDE_CONFIG_DIR"
+printf '{"hooks":"enforced","masking_level":"off","protected_paths":["%s"]}\n' \
+  "$IHAR_STORE" > "$CLAUDE_CONFIG_DIR/ihar-policy.json"
+export CLAUDE_CONFIG_DIR
+claude_protected_shell="{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"session_id\":\"s\",\"tool_input\":{\"command\":\"printf x > $IHAR_STORE/from-shell\"}}"
+assert_eq "shell text is not treated as a protected-path parser" "0" \
+  "$(hook_exit claude "$claude_protected_shell")"
+unset CLAUDE_CONFIG_DIR
+
 # Reading a credential path is refused on both, through each vendor's own spelling.
 claude_read='{"hook_event_name":"PreToolUse","tool_name":"Read",
   "tool_input":{"file_path":"/home/u/.ssh/id_ed25519"}}'

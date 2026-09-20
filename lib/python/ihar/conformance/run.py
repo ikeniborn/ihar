@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,7 @@ import tempfile
 import time
 
 from .. import jsonio
+from ..render import claude_settings
 from ..render import hooks as render_hooks
 
 
@@ -43,7 +45,13 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _stage(store: str, manifest_path: str, vendor: str, home: str) -> None:
+def _stage(
+    store: str,
+    manifest_path: str,
+    vendor: str,
+    home: str,
+    protected_roots: list[str] | None = None,
+) -> None:
     """A throwaway vendor home carrying the rendered hooks and the scripts."""
     os.makedirs(os.path.join(home, "hooks"), exist_ok=True)
     manifest = jsonio.read("hook-manifest", manifest_path)
@@ -65,8 +73,14 @@ def _stage(store: str, manifest_path: str, vendor: str, home: str) -> None:
         with open(os.path.join(home, "config.toml"), "w", encoding="utf-8") as handle:
             handle.write("")
     else:
+        settings = {"hooks": block}
+        sandbox = claude_settings.render_sandbox(
+            "vendor", protected_roots or [store, home]
+        )
+        if sandbox is not None:
+            settings["sandbox"] = sandbox
         with open(os.path.join(home, "settings.json"), "w", encoding="utf-8") as handle:
-            json.dump({"hooks": block}, handle, indent=2, sort_keys=True)
+            json.dump(settings, handle, indent=2, sort_keys=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -178,12 +192,115 @@ def case_rewrite_is_emitted(vendor, binary, home, workdir):
     return "passed", "updatedInput carries the masked value"
 
 
+def _claude_protected_roots(home: str) -> list[str]:
+    with open(os.path.join(home, "settings.json"), "r", encoding="utf-8") as handle:
+        settings = json.load(handle)
+    roots = settings.get("sandbox", {}).get("filesystem", {}).get("denyWrite")
+    if not isinstance(roots, list) or not roots or not all(isinstance(root, str) for root in roots):
+        raise RuntimeError("Claude settings do not contain sandbox.filesystem.denyWrite")
+    return roots
+
+
+def _run_claude_shell(binary: str, home: str, workdir: str, command: str):
+    prompt = (
+        "Use the Bash tool exactly once to run this command verbatim. "
+        "Do not replace it with another tool or only describe it.\n"
+        f"<ihar-conformance-command>{command}</ihar-conformance-command>"
+    )
+    env = {**os.environ, "CLAUDE_CONFIG_DIR": home}
+    return subprocess.run(
+        [binary, "-p", "--output-format", "json", "--allowedTools", "Bash", prompt],
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def _remove_probe(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _case_sandbox_protected_write(vendor, binary, home, workdir, kind):
+    if vendor != "claude":
+        return "skipped", "native denyWrite probes are Claude-specific"
+
+    roots = _claude_protected_roots(home)
+    proof = os.path.join(workdir, f".ihar-conformance-{kind}-proof")
+    for root in roots:
+        target = os.path.join(root, f".ihar-conformance-{kind}-write")
+        _remove_probe(proof)
+        _remove_probe(target)
+        if kind == "direct":
+            command = (
+                f"printf 'ihar-conformance\\n' > {shlex.quote(proof)}; "
+                f"printf 'ihar-conformance\\n' > {shlex.quote(target)}"
+            )
+        else:
+            code = (
+                "from pathlib import Path; "
+                f"Path({proof!r}).write_text('ihar-conformance\\n'); "
+                f"Path({target!r}).write_text('ihar-conformance\\n')"
+            )
+            command = f"python3 -c {shlex.quote(code)}"
+
+        result = _run_claude_shell(binary, home, workdir, command)
+        if result.returncode != 0:
+            return "failed", f"Claude exited {result.returncode} while probing {root}"
+        if not os.path.isfile(proof):
+            return "failed", f"Claude did not execute the {kind} probe for {root}"
+        if os.path.exists(target):
+            return "failed", f"Claude wrote {target} despite denyWrite"
+
+    return "passed", f"{kind} writes blocked in {len(roots)} protected roots"
+
+
+def case_sandbox_direct_write(vendor, binary, home, workdir):
+    return _case_sandbox_protected_write(vendor, binary, home, workdir, "direct")
+
+
+def case_sandbox_child_write(vendor, binary, home, workdir):
+    return _case_sandbox_protected_write(vendor, binary, home, workdir, "child")
+
+
+def case_sandbox_workspace_write(vendor, binary, home, workdir):
+    if vendor != "claude":
+        return "skipped", "native sandbox probes are Claude-specific"
+    target = os.path.join(workdir, ".ihar-conformance-workspace-write")
+    _remove_probe(target)
+    command = f"printf 'ihar-conformance\\n' > {shlex.quote(target)}"
+    result = _run_claude_shell(binary, home, workdir, command)
+    if result.returncode != 0:
+        return "failed", f"Claude exited {result.returncode} during the workspace probe"
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            content = handle.read()
+    except OSError as error:
+        return "failed", f"Claude did not write the workspace probe: {error}"
+    if content != "ihar-conformance\n":
+        return "failed", "Claude wrote unexpected workspace probe content"
+    return "passed", "workspace write succeeded"
+
+
 CASES = {
     "hook-is-loaded": case_hook_is_loaded,
     "trust-is-recordable": case_trust_is_recordable,
     "tampering-is-detected": case_tampering_is_detected,
     "deny-blocks-the-tool": case_deny_blocks_the_tool,
     "rewrite-is-emitted": case_rewrite_is_emitted,
+    "sandbox-direct-write": case_sandbox_direct_write,
+    "sandbox-child-write": case_sandbox_child_write,
+    "sandbox-workspace-write": case_sandbox_workspace_write,
+}
+
+CLAUDE_ONLY_CASES = {
+    "sandbox-direct-write",
+    "sandbox-child-write",
+    "sandbox-workspace-write",
 }
 
 
@@ -222,9 +339,13 @@ def run(vendor: str, binary: str, store: str, manifest_path: str) -> dict:
 
     workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
     home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    state_root = tempfile.mkdtemp(prefix="ihar-conf-state-")
     try:
-        _stage(store, manifest_path, vendor, home)
+        protected_roots = [store, state_root, home] if vendor == "claude" else None
+        _stage(store, manifest_path, vendor, home, protected_roots)
         for name, case in CASES.items():
+            if name in CLAUDE_ONLY_CASES and vendor != "claude":
+                continue
             try:
                 status, detail = case(vendor, binary, home, workdir)
             except Exception as error:             # noqa: BLE001
@@ -233,6 +354,7 @@ def run(vendor: str, binary: str, store: str, manifest_path: str) -> dict:
     finally:
         shutil.rmtree(home, ignore_errors=True)
         shutil.rmtree(workdir, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
 
     return record
 
