@@ -37,6 +37,7 @@ printf 'standard\n' > "$IHAR_TEST_TMP/render-standard/settings.json"
 printf 'protected\n' > "$IHAR_TEST_TMP/render-protected/settings.json"
 
 REAL_CP="$(command -v cp)"
+REAL_FLOCK="$(command -v flock)"
 mkdir -p "$IHAR_TEST_TMP/barrier-bin" "$IHAR_TEST_TMP/runtime-barrier"
 cat > "$IHAR_TEST_TMP/barrier-bin/cp" <<'SH'
 #!/usr/bin/env bash
@@ -45,6 +46,12 @@ while [[ ! -e "$IHAR_BARRIER_ROOT/$IHAR_BARRIER_LABEL.release" ]]; do sleep 0.01
 exec "$IHAR_REAL_CP" "$@"
 SH
 chmod +x "$IHAR_TEST_TMP/barrier-bin/cp"
+cat > "$IHAR_TEST_TMP/barrier-bin/flock" <<'SH'
+#!/usr/bin/env bash
+touch "$IHAR_FLOCK_ACK"
+exec "$IHAR_REAL_FLOCK" "$@"
+SH
+chmod +x "$IHAR_TEST_TMP/barrier-bin/flock"
 
 cat > "$IHAR_TEST_TMP/runtime-worker.sh" <<'SH'
 #!/usr/bin/env bash
@@ -56,26 +63,29 @@ ihar_link_runtime() { :; }
 ihar_verify_runtime_state_links() { :; }
 source "$IHAR_ROOT/lib/state/runtime.sh"
 export IHAR_STATE="$1" IHAR_PROFILE="$2"
-touch "$IHAR_BARRIER_ROOT/$IHAR_BARRIER_LABEL.attempting"
 ihar_runtime_materialise claude "$3" "$4" writable > "$5"
 SH
 chmod +x "$IHAR_TEST_TMP/runtime-worker.sh"
 
-PATH="$IHAR_TEST_TMP/barrier-bin:$PATH" IHAR_REAL_CP="$REAL_CP" \
+PATH="$IHAR_TEST_TMP/barrier-bin:$PATH" IHAR_REAL_CP="$REAL_CP" IHAR_REAL_FLOCK="$REAL_FLOCK" \
+  IHAR_FLOCK_ACK="$IHAR_TEST_TMP/runtime-barrier/standard.flock" \
   IHAR_BARRIER_ROOT="$IHAR_TEST_TMP/runtime-barrier" IHAR_BARRIER_LABEL=standard \
   "$IHAR_TEST_TMP/runtime-worker.sh" "$RUNTIME_STATE" standard 11111111 \
     "$IHAR_TEST_TMP/render-standard" "$IHAR_TEST_TMP/standard.runtime" &
 BG_PIDS+=("$!")
+assert_exit "standard invokes the production state flock" 0 \
+  wait_for_file "$IHAR_TEST_TMP/runtime-barrier/standard.flock"
 assert_exit "standard render reaches its publication barrier" 0 \
   wait_for_file "$IHAR_TEST_TMP/runtime-barrier/standard.entered"
 
-PATH="$IHAR_TEST_TMP/barrier-bin:$PATH" IHAR_REAL_CP="$REAL_CP" \
+PATH="$IHAR_TEST_TMP/barrier-bin:$PATH" IHAR_REAL_CP="$REAL_CP" IHAR_REAL_FLOCK="$REAL_FLOCK" \
+  IHAR_FLOCK_ACK="$IHAR_TEST_TMP/runtime-barrier/protected.flock" \
   IHAR_BARRIER_ROOT="$IHAR_TEST_TMP/runtime-barrier" IHAR_BARRIER_LABEL=protected \
   "$IHAR_TEST_TMP/runtime-worker.sh" "$RUNTIME_STATE" protected 22222222 \
     "$IHAR_TEST_TMP/render-protected" "$IHAR_TEST_TMP/protected.runtime" &
 BG_PIDS+=("$!")
-assert_exit "protected render reaches the same state lock while standard is paused" 0 \
-  wait_for_file "$IHAR_TEST_TMP/runtime-barrier/protected.attempting"
+assert_exit "protected invokes the production state flock while standard is paused" 0 \
+  wait_for_file "$IHAR_TEST_TMP/runtime-barrier/protected.flock"
 assert_exit "protected cannot enter publication while standard owns the state lock" 1 \
   test -e "$IHAR_TEST_TMP/runtime-barrier/protected.entered"
 assert_exit "protected cannot publish while standard owns the state lock" 1 \
@@ -95,6 +105,8 @@ assert_exit "different profiles publish distinct runtime homes" 1 \
 standard_before="$(tree_hash "$standard_runtime")"
 protected_before="$(tree_hash "$protected_runtime")"
 PATH="$IHAR_TEST_TMP/barrier-bin:$PATH" IHAR_REAL_CP="$REAL_CP" \
+  IHAR_REAL_FLOCK="$REAL_FLOCK" \
+  IHAR_FLOCK_ACK="$IHAR_TEST_TMP/runtime-barrier/standard-reuse.flock" \
   IHAR_BARRIER_ROOT="$IHAR_TEST_TMP/runtime-barrier" IHAR_BARRIER_LABEL=standard \
   "$IHAR_TEST_TMP/runtime-worker.sh" "$RUNTIME_STATE" standard 11111111 \
     "$IHAR_TEST_TMP/render-standard" "$IHAR_TEST_TMP/standard-again.runtime"
@@ -114,7 +126,6 @@ source "$IHAR_ROOT/lib/core/lock.sh"
 id="$1"; root="$2"
 export IHAR_STORE="$3" IHAR_NVM="$3-nvm"
 source "$IHAR_ROOT/lib/store/install.sh"
-touch "$root/$id.attempting"
 _ihar_install_all() {
   printf '%s\n' "$id" >> "$root/order"
   touch "$root/$id.entered"
@@ -126,10 +137,17 @@ SH
 chmod +x "$IHAR_TEST_TMP/lock-worker.sh"
 LOCK_BARRIER="$IHAR_TEST_TMP/store-barrier"
 mkdir -p "$LOCK_BARRIER"
-"$IHAR_TEST_TMP/lock-worker.sh" one "$LOCK_BARRIER" "$IHAR_STORE" & BG_PIDS+=("$!")
+PATH="$IHAR_TEST_TMP/barrier-bin:$PATH" IHAR_REAL_FLOCK="$REAL_FLOCK" \
+  IHAR_FLOCK_ACK="$LOCK_BARRIER/one.flock" \
+  "$IHAR_TEST_TMP/lock-worker.sh" one "$LOCK_BARRIER" "$IHAR_STORE" & BG_PIDS+=("$!")
+assert_exit "first install invokes the production store flock" 0 \
+  wait_for_file "$LOCK_BARRIER/one.flock"
 assert_exit "first install enters the store lock" 0 wait_for_file "$LOCK_BARRIER/one.entered"
-"$IHAR_TEST_TMP/lock-worker.sh" two "$LOCK_BARRIER" "$IHAR_STORE" & BG_PIDS+=("$!")
-assert_exit "second install reaches the lock attempt" 0 wait_for_file "$LOCK_BARRIER/two.attempting"
+PATH="$IHAR_TEST_TMP/barrier-bin:$PATH" IHAR_REAL_FLOCK="$REAL_FLOCK" \
+  IHAR_FLOCK_ACK="$LOCK_BARRIER/two.flock" \
+  "$IHAR_TEST_TMP/lock-worker.sh" two "$LOCK_BARRIER" "$IHAR_STORE" & BG_PIDS+=("$!")
+assert_exit "second install invokes the production store flock while first is paused" 0 \
+  wait_for_file "$LOCK_BARRIER/two.flock"
 assert_exit "second install cannot enter while first holds the lock" 1 \
   test -e "$LOCK_BARRIER/two.entered"
 touch "$LOCK_BARRIER/one.release"

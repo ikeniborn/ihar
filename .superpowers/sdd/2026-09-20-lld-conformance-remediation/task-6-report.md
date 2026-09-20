@@ -127,3 +127,32 @@ Final review-round executable fingerprint: `138833cb4dec2179a7ae9825868932febde8
 - The temporary lock mutations left no diff in `lib/store/install.sh` or `lib/state/runtime.sh`.
 - User-owned `.iwiki.toml` remains untouched and unstaged.
 - No blockers remain.
+
+## Review round 2 remediation
+
+### Schedule-independent lock protocol
+
+- `tests/test_concurrency.sh` now puts a `flock` wrapper first on each worker's `PATH`. The wrapper writes that worker's unique acknowledgement immediately before `exec` delegates to the real system `flock`.
+- Runtime and install parents wait for the corresponding real-flock acknowledgement before asserting that the callback's post-lock `.entered` marker is absent. No worker writes an acknowledgement before calling the production function.
+- Runtime publication remains paused at the `cp` seam inside `_ihar_runtime_materialise`; install remains paused inside the barrier-controlled `_ihar_install_all` callback reached through production `ihar_cmd_install`.
+
+### RED and mutation evidence
+
+- With both exact production lock calls temporarily removed, `bash tests/test_concurrency.sh` — exit 1, `PASS=26 FAIL=7`.
+- Both state-flock acknowledgements and both store-flock acknowledgements were absent, proving the wrappers were reached only through production lock calls.
+- Despite the missing acknowledgements, the second runtime publication marker and second install callback marker were already present (`exit 0 want 1`), so each lock-removal mutation failed deterministically rather than relying on scheduler timing.
+- The exact lock calls were restored after the mutation run. `git diff --exit-code -- lib/state/runtime.sh lib/store/install.sh` then returned 0.
+
+### GREEN evidence
+
+- `bash tests/test_concurrency.sh` — exit 0, `PASS=33 FAIL=0`.
+- `bash -n tests/test_concurrency.sh` — exit 0.
+- `git diff --check` — exit 0.
+- Final review-round executable fingerprint: `4f2bf0ce8ef6b3b4cf0f43e77faf8dd0724b8740142c02f1d775bc16e658b478`.
+- `bash tests/run.sh` — exit 0, `files=27 failed=0`; run once on that stable executable state.
+
+### Round 2 scope and blockers
+
+- Final changes are limited to `tests/test_concurrency.sh` and this report.
+- User-owned `.iwiki.toml` remains untouched and unstaged.
+- No blockers remain.
