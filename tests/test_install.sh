@@ -222,57 +222,117 @@ done
 
 rm -f "$EXAMPLE"
 
-# --- the validated receipt is the final publication ---------------------------------
+# --- install stages one generation and rolls every failure back ----------------------
 
 write_lock '"node":{"version":"22.23.1"},"claude":{"version":"2.1.274"},
             "codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
-mkdir -p "$(dirname "$IHAR_CLAUDE_BIN")" "$(dirname "$IHAR_CODEX_BIN")"
-printf '#!/bin/sh\necho claude\n' > "$IHAR_CLAUDE_BIN"
-printf '#!/bin/sh\necho codex\n' > "$IHAR_CODEX_BIN"
-chmod +x "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
-printf '%s\n' '{"schema":1,"release_lock_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","installed_at":"2026-09-19T00:00:00Z","components":{}}' \
-  > "$IHAR_STORE/install-receipt.json"
+OLD_RECEIPT='{"schema":1,"release_lock_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","installed_at":"2026-09-19T00:00:00Z","components":{}}'
 
-stub_install_steps() {
-  ihar_install_store() { :; }
-  ihar_install_command() { :; }
-  ihar_install_example_config() { :; }
-  ihar_install_python() { :; }
-  ihar_install_codex() { :; }
-  ihar_install_claude() { :; }
-  ihar_install_conformance() { :; }
+reset_active_generation() {
+  mkdir -p "$IHAR_STORE/hooks" "$(dirname "$IHAR_CODEX_BIN")" "$(dirname "$IHAR_CLAUDE_BIN")"
+  printf 'old hook\n' > "$IHAR_STORE/hooks/security-pretool.py"
+  printf '#!/bin/sh\necho old claude\n' > "$IHAR_CLAUDE_BIN"
+  printf '#!/bin/sh\necho old codex\n' > "$IHAR_CODEX_BIN"
+  chmod +x "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
+  printf '%s\n' "$OLD_RECEIPT" > "$IHAR_STORE/install-receipt.json"
 }
 
-before_lock="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
-before_receipt="$(sha256sum "$IHAR_STORE/install-receipt.json" | cut -d' ' -f1)"
-assert_exit "a pre-publication failure aborts install" 37 bash -c "
-  source '$ROOT/lib/core/logging.sh'
-  source '$ROOT/lib/core/init.sh'
-  source '$ROOT/lib/store/lockfile.sh'
-  source '$ROOT/lib/store/install.sh'
-  stub_install_steps() {
-    ihar_install_store() { :; }; ihar_install_command() { :; }
-    ihar_install_example_config() { :; }; ihar_install_python() { :; }
-    ihar_install_codex() { :; }; ihar_install_claude() { :; }
-    ihar_install_conformance() { :; }
-  }
-  stub_install_steps
-  ihar_publish_install_receipt() { return 37; }
-  IHAR_ROOT='$ROOT' IHAR_STORE='$IHAR_STORE' IHAR_LOCKFILE='$IHAR_LOCKFILE' \
-  IHAR_CLAUDE_BIN='$IHAR_CLAUDE_BIN' IHAR_CODEX_BIN='$IHAR_CODEX_BIN' _ihar_install_all
-"
-assert_eq "install never rewrites release lock" "$before_lock" \
-  "$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
-assert_eq "failed install preserves receipt" "$before_receipt" \
-  "$(sha256sum "$IHAR_STORE/install-receipt.json" | cut -d' ' -f1)"
-assert_exit "receipt temp is not leaked" 1 compgen -G "$IHAR_STORE/.install-receipt-*"
-assert_exit "failed publication leaves Claude executable usable" 0 test -x "$IHAR_CLAUDE_BIN"
-assert_exit "failed publication leaves Codex executable usable" 0 test -x "$IHAR_CODEX_BIN"
+generation_fingerprint() {
+  {
+    find "$IHAR_STORE/hooks" -type f -print0 | sort -z | xargs -0 sha256sum
+    for path in "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN" \
+                "$IHAR_STORE/install-receipt.json"; do
+      sha256sum "$path" | cut -d' ' -f1
+    done
+  } | sha256sum | cut -d' ' -f1
+}
 
-(
-  stub_install_steps
-  _ihar_install_all
-) >/dev/null 2>&1
+run_install_scenario() ( # <success|conformance|receipt|activation> [install|update]
+  local scenario="$1" operation="${2:-install}"
+  export IHAR_ACTIVE_TEST_STORE="$IHAR_STORE"
+  ihar_install_command() { :; }
+  ihar_install_example_config() { :; }
+  ihar_install_store() {
+    mkdir -p "$IHAR_STORE/hooks"
+    printf 'new hook\n' > "$IHAR_STORE/hooks/security-pretool.py"
+  }
+  ihar_install_python() { :; }
+  ihar_install_codex() {
+    mkdir -p "$(dirname "$IHAR_CODEX_BIN")"
+    printf '#!/bin/sh\necho new codex\n' > "$IHAR_CODEX_BIN"
+    chmod +x "$IHAR_CODEX_BIN"
+  }
+  ihar_install_claude() {
+    mkdir -p "$(dirname "$IHAR_CLAUDE_BIN")"
+    printf '#!/bin/sh\necho new claude\n' > "$IHAR_CLAUDE_BIN"
+    chmod +x "$IHAR_CLAUDE_BIN"
+  }
+  ihar_install_conformance() {
+    [[ "$scenario" != conformance ]] || return 36
+    grep -q 'new hook' "$IHAR_STORE/hooks/security-pretool.py" || return 40
+    grep -q 'new claude' "$IHAR_CLAUDE_BIN" || return 40
+    grep -q 'new codex' "$IHAR_CODEX_BIN" || return 40
+  }
+  ihar_publish_install_receipt() {
+    [[ "$scenario" != receipt ]] || return 37
+    ihar_python ihar.install_receipt build "$IHAR_LOCKFILE" \
+      "$IHAR_STORE/install-receipt.json" "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
+  }
+  ihar_install_move() {
+    if [[ "$scenario" == activation && "$1" == */.ihar-store-stage-*/install-receipt.json &&
+          "$2" == "$IHAR_ACTIVE_TEST_STORE/install-receipt.json" ]]; then
+      return 39
+    fi
+    command mv "$@"
+  }
+  if [[ "$operation" == update ]]; then
+    ihar_codex_daemon_stop_all() { :; }
+    ihar_codex_daemon_start_pending() { :; }
+    _ihar_update_all
+  else
+    _ihar_install_all
+  fi
+)
+
+before_lock="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
+for scenario in conformance receipt activation; do
+  reset_active_generation
+  before_generation="$(generation_fingerprint)"
+  case "$scenario" in
+    conformance) expected_status=36 ;;
+    receipt) expected_status=37 ;;
+    activation) expected_status=39 ;;
+  esac
+  assert_exit "$scenario failure aborts install" "$expected_status" \
+    run_install_scenario "$scenario"
+  assert_eq "$scenario failure preserves exact active generation and receipt" \
+    "$before_generation" "$(generation_fingerprint)"
+  assert_exit "$scenario failure leaves Claude executable usable" 0 "$IHAR_CLAUDE_BIN"
+  assert_exit "$scenario failure leaves Codex executable usable" 0 "$IHAR_CODEX_BIN"
+done
+
+reset_active_generation
+before_generation="$(generation_fingerprint)"
+assert_exit "receipt failure aborts update" 37 run_install_scenario receipt update
+assert_eq "receipt failure preserves exact active generation across update" \
+  "$before_generation" "$(generation_fingerprint)"
+assert_eq "failed installs never rewrite release lock" "$before_lock" \
+  "$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
+assert_exit "failed installs leak no store stage" 1 \
+  compgen -G "$(dirname "$IHAR_STORE")/.ihar-store-stage-*"
+assert_exit "failed installs leak no NVM stage" 1 \
+  compgen -G "$(dirname "$IHAR_NVM")/.ihar-nvm-stage-*"
+assert_exit "failed installs leak no activation backup" 1 \
+  compgen -G "$(dirname "$IHAR_STORE")/.ihar-install-backup-*"
+
+reset_active_generation
+run_install_scenario success >/dev/null 2>&1
+assert_contains "successful install activates staged hook bytes" \
+  "$(cat "$IHAR_STORE/hooks/security-pretool.py")" "new hook"
+assert_contains "successful install activates staged Claude bytes" \
+  "$(cat "$IHAR_CLAUDE_BIN")" "new claude"
+assert_contains "successful install activates staged Codex bytes" \
+  "$(cat "$IHAR_CODEX_BIN")" "new codex"
 
 expected_lock_sha="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
 expected_claude_sha="$(sha256sum "$IHAR_CLAUDE_BIN" | cut -d' ' -f1)"

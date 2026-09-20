@@ -45,19 +45,133 @@ ihar_cmd_install() {
 }
 
 _ihar_install_all() {
-  ihar_install_store
-  ihar_install_command
-  ihar_install_example_config
-  ihar_install_python
-  ihar_install_codex
-  ihar_install_claude
-  ihar_install_conformance
-  if [[ "${IHAR_FLAG_ACP:-false}" == true ]]; then ihar_install_acp; fi
-  if [[ "${IHAR_FLAG_MICROVM:-false}" == true ]]; then ihar_install_microvm; fi
-
-  ihar_lockfile_hash > "$IHAR_STORE/.last-lockfile-hash"
-  ihar_publish_install_receipt || return $?
+  ihar_install_command || return $?
+  ihar_install_example_config || return $?
+  ihar_install_transaction install || return $?
   ihar_info "install complete; run 'ihar check' to see what is in force"
+}
+
+ihar_install_move() {
+  command mv -- "$@"
+}
+
+_ihar_build_generation() { # <install|update>
+  local mode="$1"
+  ihar_install_store || return $?
+  if [[ "$mode" == install ]]; then ihar_install_python || return $?; fi
+  ihar_install_codex || return $?
+  ihar_install_claude || return $?
+  ihar_install_conformance || return $?
+  if [[ "$mode" == install && "${IHAR_FLAG_ACP:-false}" == true ]]; then
+    ihar_install_acp || return $?
+  fi
+  if [[ "$mode" == install && "${IHAR_FLAG_MICROVM:-false}" == true ]]; then
+    ihar_install_microvm || return $?
+  fi
+  ihar_lockfile_hash > "$IHAR_STORE/.last-lockfile-hash" || return $?
+  ihar_publish_install_receipt || return $?
+}
+
+_ihar_activate_generation() { # <store-stage> <nvm-stage> <backup>
+  local store_stage="$1" nvm_stage="$2" backup="$3"
+  local source name target old index activation_status=0
+  local -a sources=() targets=() olds=() activated=() had_old=()
+  mkdir -p "$backup/store" || return 1
+
+  while IFS= read -r -d '' source; do
+    name="${source##*/}"
+    case "$name" in
+      .ihar-store.lock|.last-lockfile-hash|install-receipt.json) continue ;;
+    esac
+    sources+=("$source")
+    targets+=("$IHAR_STORE/$name")
+    olds+=("$backup/store/$name")
+  done < <(find "$store_stage" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+
+  sources+=("$nvm_stage" "$store_stage/.last-lockfile-hash" "$store_stage/install-receipt.json")
+  targets+=("$IHAR_NVM" "$IHAR_STORE/.last-lockfile-hash" "$IHAR_STORE/install-receipt.json")
+  olds+=("$backup/nvm" "$backup/last-lockfile-hash" "$backup/install-receipt.json")
+
+  for index in "${!sources[@]}"; do
+    source="${sources[$index]}"
+    target="${targets[$index]}"
+    old="${olds[$index]}"
+    had_old+=(0)
+    if [[ -e "$target" || -L "$target" ]]; then
+      ihar_install_move "$target" "$old" || {
+        activation_status=$?
+        break
+      }
+      had_old[index]=1
+    fi
+    activated+=("$index")
+    ihar_install_move "$source" "$target" || {
+      activation_status=$?
+      break
+    }
+  done
+
+  if (( activation_status != 0 )); then
+    for ((index=${#activated[@]} - 1; index >= 0; index--)); do
+      local activated_index="${activated[$index]}"
+      target="${targets[$activated_index]}"
+      old="${olds[$activated_index]}"
+      rm -rf -- "$target"
+      if [[ "${had_old[$activated_index]}" == 1 ]]; then
+        ihar_install_move "$old" "$target" || return 3
+      fi
+    done
+    return "$activation_status"
+  fi
+  return 0
+}
+
+ihar_install_transaction() { # <install|update>
+  local mode="$1" store_parent nvm_parent store_stage nvm_stage backup status=0
+  local active_store="$IHAR_STORE" active_nvm="$IHAR_NVM" active_npm="$IHAR_NPM_BIN"
+  store_parent="$(dirname "$active_store")"
+  nvm_parent="$(dirname "$active_nvm")"
+  mkdir -p "$store_parent" "$nvm_parent" || return 1
+  store_stage="$(mktemp -d "$store_parent/.ihar-store-stage-XXXXXX")" || return 1
+  nvm_stage="$(mktemp -d "$nvm_parent/.ihar-nvm-stage-XXXXXX")" || {
+    rm -rf -- "$store_stage"
+    return 1
+  }
+  backup="$(mktemp -d "$store_parent/.ihar-install-backup-XXXXXX")" || {
+    rm -rf -- "$store_stage" "$nvm_stage"
+    return 1
+  }
+
+  if [[ -d "$active_store" ]]; then
+    cp -a "$active_store/." "$store_stage/" || status=$?
+    rm -f -- "$store_stage/.ihar-store.lock"
+  fi
+  if (( status == 0 )) && [[ -d "$active_nvm" ]]; then
+    cp -a "$active_nvm/." "$nvm_stage/" || status=$?
+  fi
+
+  if (( status == 0 )); then
+    (
+      export IHAR_STORE="$store_stage" IHAR_NVM="$nvm_stage"
+      export IHAR_PY="$store_stage/venv/bin/python3"
+      export IHAR_CLAUDE_BIN="$nvm_stage/npm-global/bin/claude"
+      export IHAR_CODEX_BIN="$store_stage/bin/codex"
+      export IHAR_CLAUDE_ACP_BIN="$store_stage/acp/bin/claude-agent-acp"
+      export IHAR_CODEX_ACP_BIN="$store_stage/acp/bin/codex-acp"
+      if [[ "$active_npm" == "$active_nvm/bin/npm" ]]; then
+        export IHAR_NPM_BIN="$nvm_stage/bin/npm"
+      else
+        export IHAR_NPM_BIN="$active_npm"
+      fi
+      _ihar_build_generation "$mode"
+    ) || status=$?
+  fi
+
+  if (( status == 0 )); then
+    _ihar_activate_generation "$store_stage" "$nvm_stage" "$backup" || status=$?
+  fi
+  rm -rf -- "$store_stage" "$nvm_stage" "$backup"
+  return "$status"
 }
 
 ihar_publish_install_receipt() {
@@ -185,7 +299,7 @@ ihar_install_store() {
   local tree
   for tree in hooks manifests skills; do
     [[ -d "$IHAR_ROOT/$tree" ]] || continue
-    rm -rf "$IHAR_STORE/$tree"
+    rm -rf "${IHAR_STORE:?}/$tree"
     cp -R "$IHAR_ROOT/$tree" "$IHAR_STORE/$tree" \
       || ihar_die 1 "cannot copy $tree into the store"
   done
@@ -361,7 +475,7 @@ ihar_install_claude() {
     local spec="$IHAR_NPM_PACKAGE"
     [[ -n "$version" ]] && spec="$IHAR_NPM_PACKAGE@$version"
     PATH="$IHAR_NVM/bin:$PATH" npm install --silent --prefix "$IHAR_NVM/npm-global" -g "$spec" \
-      2>/dev/null || { ihar_warn "the Claude CLI was not installed"; return 0; }
+      2>/dev/null || { ihar_warn "the Claude CLI was not installed"; return 1; }
     mkdir -p "$IHAR_NVM/npm-global"
     printf '%s\n' "${version:-latest}" > "$stamp"
     ihar_info "claude ${version:-latest} installed"
@@ -371,14 +485,15 @@ ihar_install_claude() {
 # ihar_install_conformance — the evidence an enforced profile needs, recorded before
 # anyone can select one (LLD 6.6).
 ihar_install_conformance() {
-  local vendor binary
+  local vendor binary status=0
   for vendor in claude codex; do
     binary="$(eval echo "\$IHAR_${vendor^^}_BIN")"
     [[ -x "$binary" ]] || continue
     ihar_python ihar.conformance.run "$vendor" "$binary" "$IHAR_STORE" \
       "$IHAR_ROOT/manifests/hooks.json" >/dev/null \
-      || ihar_warn "hook conformance did not pass for $vendor; enforced profiles will refuse to launch"
+      || { ihar_warn "hook conformance did not pass for $vendor"; status=1; }
   done
+  return "$status"
 }
 
 # --------------------------------------------------------------------------- #
@@ -395,17 +510,14 @@ ihar_cmd_update() {
 }
 
 _ihar_update_all() {
-  ihar_install_store
   # A running daemon holds the binary about to be replaced, and it goes on serving
   # clients from the old one until something restarts it — the version-skew class
   # LLD 5.5 names. Stopped before the replacement, and only the ones that were
   # running are put back afterwards.
-  ihar_codex_daemon_stop_all
-  ihar_install_codex
-  ihar_install_claude
-  ihar_install_conformance
+  local status=0
+  ihar_codex_daemon_stop_all || return $?
+  ihar_install_transaction update || status=$?
   ihar_codex_daemon_start_pending
-  ihar_lockfile_hash > "$IHAR_STORE/.last-lockfile-hash"
-  ihar_publish_install_receipt || return $?
+  (( status == 0 )) || return "$status"
   ihar_info "update complete"
 }
