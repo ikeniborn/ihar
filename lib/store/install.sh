@@ -47,9 +47,6 @@ ihar_cmd_install() {
 }
 
 _ihar_install_all() {
-  if [[ "${IHAR_FLAG_MIGRATE_STORE:-false}" == true ]]; then
-    _ihar_store_migrate_locked || return $?
-  fi
   ihar_install_command || return $?
   ihar_install_example_config || return $?
   ihar_install_transaction install || return $?
@@ -173,6 +170,9 @@ ihar_install_transaction() { # <install|update>
   if (( status == 0 )) && [[ -d "$active_nvm" ]]; then
     cp -a "$active_nvm/." "$nvm_stage/" || status=$?
   fi
+  if (( status == 0 )) && [[ "${IHAR_FLAG_MIGRATE_STORE:-false}" == true ]]; then
+    _ihar_store_stage_locked "$store_stage" || status=$?
+  fi
 
   if (( status == 0 )); then
     (
@@ -195,6 +195,9 @@ ihar_install_transaction() { # <install|update>
     _ihar_activate_generation "$store_stage" "$nvm_stage" "$backup" || status=$?
   fi
   rm -rf -- "$store_stage" "$nvm_stage"
+  if [[ "${IHAR_FLAG_MIGRATE_STORE:-false}" == true ]]; then
+    _ihar_store_release_source_locks
+  fi
   if [[ "$_IHAR_INSTALL_BACKUP_RETAIN" == true ]]; then
     ihar_warn "install rollback incomplete; recovery backup retained at $backup"
   else

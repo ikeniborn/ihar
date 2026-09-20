@@ -360,6 +360,12 @@ rm -f "$EXAMPLE"
 write_lock '"node":{"version":"22.23.1"},"claude":{"version":"2.1.274"},
             "codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
 OLD_RECEIPT='{"schema":1,"release_lock_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","installed_at":"2026-09-19T00:00:00Z","components":{}}'
+COMMAND_LEGACY_STORE="$IHAR_TEST_TMP/legacy-command-store"
+mkdir -p "$COMMAND_LEGACY_STORE/hooks"
+printf 'legacy hook\n' > "$COMMAND_LEGACY_STORE/hooks/security-pretool.py"
+printf '{"schema":1,"release_lock_sha256":"%064d","installed_at":"2026-09-18T00:00:00Z","components":{}}\n' 0 \
+  > "$COMMAND_LEGACY_STORE/install-receipt.json"
+command_legacy_before="$(find "$COMMAND_LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
 
 reset_active_generation() {
   mkdir -p "$IHAR_STORE/hooks" "$(dirname "$IHAR_CODEX_BIN")" "$(dirname "$IHAR_CLAUDE_BIN")"
@@ -383,6 +389,12 @@ generation_fingerprint() {
 run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activation|rollback> [install|update]
   local scenario="$1" operation="${2:-install}"
   export IHAR_ACTIVE_TEST_STORE="$IHAR_STORE"
+  if [[ "$scenario" == migration-* ]]; then
+    export IHAR_FLAG_MIGRATE_STORE=true IHAR_LEGACY_STORE="$COMMAND_LEGACY_STORE"
+  else
+    export IHAR_FLAG_MIGRATE_STORE=false
+    unset IHAR_LEGACY_STORE
+  fi
   ihar_install_command() { :; }
   ihar_install_example_config() { :; }
   ihar_install_store() {
@@ -401,7 +413,7 @@ run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activati
     chmod +x "$IHAR_CLAUDE_BIN"
   }
   ihar_install_conformance() {
-    [[ "$scenario" != conformance ]] || return 36
+    [[ "$scenario" != *conformance ]] || return 36
     grep -q 'new hook' "$IHAR_STORE/hooks/security-pretool.py" || return 40
     grep -q 'new claude' "$IHAR_CLAUDE_BIN" || return 40
     grep -q 'new codex' "$IHAR_CODEX_BIN" || return 40
@@ -425,17 +437,19 @@ run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activati
     fi
   }
   ihar_publish_install_receipt() {
-    [[ "$scenario" != receipt ]] || return 37
+    [[ "$scenario" != *receipt ]] || return 37
     ihar_python ihar.install_receipt build "$IHAR_LOCKFILE" \
       "$IHAR_STORE/install-receipt.json" "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
   }
   ihar_install_move() {
-    if [[ ( "$scenario" == activation || "$scenario" == rollback ) &&
+    if [[ ( "$scenario" == activation || "$scenario" == rollback ||
+            "$scenario" == migration-rollback ) &&
           "$1" == */.ihar-store-stage-*/install-receipt.json &&
           "$2" == "$IHAR_ACTIVE_TEST_STORE/install-receipt.json" ]]; then
       return 39
     fi
-    if [[ "$scenario" == rollback && "$1" == */.ihar-install-backup-*/install-receipt.json &&
+    if [[ ( "$scenario" == rollback || "$scenario" == migration-rollback ) &&
+          "$1" == */.ihar-install-backup-*/install-receipt.json &&
           "$2" == "$IHAR_ACTIVE_TEST_STORE/install-receipt.json" ]]; then
       return 41
     fi
@@ -465,6 +479,24 @@ for scenario in conformance receipt activation; do
     "$before_generation" "$(generation_fingerprint)"
   assert_exit "$scenario failure leaves Claude executable usable" 0 "$IHAR_CLAUDE_BIN"
   assert_exit "$scenario failure leaves Codex executable usable" 0 "$IHAR_CODEX_BIN"
+done
+
+for scenario in migration-conformance migration-receipt; do
+  reset_active_generation
+  before_generation="$(generation_fingerprint)"
+  case "$scenario" in
+    migration-conformance) expected_status=36 ;;
+    migration-receipt) expected_status=37 ;;
+  esac
+  assert_exit "$scenario failure aborts install" "$expected_status" \
+    run_install_scenario "$scenario"
+  assert_eq "$scenario failure preserves prior active generation and receipt" \
+    "$before_generation" "$(generation_fingerprint)"
+  assert_exit "$scenario failure leaves prior Claude executable usable" 0 "$IHAR_CLAUDE_BIN"
+  assert_exit "$scenario failure leaves prior Codex executable usable" 0 "$IHAR_CODEX_BIN"
+  assert_eq "$scenario failure leaves legacy source byte-identical" \
+    "$command_legacy_before" \
+    "$(find "$COMMAND_LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
 done
 
 reset_active_generation
@@ -523,6 +555,26 @@ assert_contains "rollback continues restoring Claude after one restore failure" 
   "$(cat "$IHAR_CLAUDE_BIN")" "old claude"
 assert_contains "rollback continues restoring Codex after one restore failure" \
   "$(cat "$IHAR_CODEX_BIN")" "old codex"
+rm -rf -- "$recovery_backup"
+
+reset_active_generation
+migration_rollback_output="$(run_install_scenario migration-rollback 2>&1)"
+migration_rollback_status=$?
+assert_eq "migrated install with incomplete rollback is fail-closed" 3 \
+  "$migration_rollback_status"
+migration_recovery_backup="$(compgen -G "$(dirname "$IHAR_STORE")/.ihar-install-backup-*" | head -1)"
+assert_exit "migrated install retains one recovery backup" 0 \
+  test -n "$migration_recovery_backup"
+assert_contains "migrated install reports retained recovery backup" \
+  "$migration_rollback_output" ".ihar-install-backup-"
+assert_contains "migrated install recovery keeps pre-command receipt" \
+  "$(cat "$migration_recovery_backup/install-receipt.json")" \
+  '"release_lock_sha256":"aaaaaaaa'
+assert_contains "migrated install rollback restores pre-command hooks" \
+  "$(cat "$IHAR_STORE/hooks/security-pretool.py")" "old hook"
+assert_eq "incomplete migrated install leaves legacy source byte-identical" \
+  "$command_legacy_before" \
+  "$(find "$COMMAND_LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
 
 reset_active_generation
 run_install_scenario success >/dev/null 2>&1

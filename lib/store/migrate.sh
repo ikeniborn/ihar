@@ -118,8 +118,8 @@ _ihar_store_publish_stage() { # <stage>
   return "$status"
 }
 
-_ihar_store_migrate_locked() {
-  local source source_stage combined source_before source_after source_copy staged writer status=0 entry
+_ihar_store_stage_locked() { # <combined-stage>; caller releases source locks
+  local combined="$1" source source_stage source_before source_after source_copy staged writer status=0 entry
   local source_path target_path
   local -a sources=() entries=() source_stages=() source_fingerprints=()
   while IFS= read -r source; do [[ -n "$source" && -d "$source" ]] && sources+=("$source"); done \
@@ -128,8 +128,6 @@ _ihar_store_migrate_locked() {
   while IFS= read -r entry; do [[ -n "$entry" ]] && entries+=("$entry"); done \
     < <(_ihar_store_migration_entries)
   _ihar_store_acquire_source_locks "${sources[@]}" || return $?
-  combined="$(mktemp -d "$(dirname "$IHAR_STORE")/.ihar-store-migrate-stage-XXXXXX")" \
-    || status=1
   for source in "${sources[@]}"; do
     (( status == 0 )) || break
     if writer="$(_ihar_store_source_writer_pid "$source")"; then
@@ -201,10 +199,19 @@ _ihar_store_migrate_locked() {
         >/dev/null 2>&1 || { status=3; break; }
     done
   fi
+  rm -rf -- "${source_stages[@]}"
+  return "$status"
+}
+
+_ihar_store_migrate_locked() {
+  local stage status=0
+  stage="$(mktemp -d "$(dirname "$IHAR_STORE")/.ihar-store-migrate-stage-XXXXXX")" \
+    || return 1
+  _ihar_store_stage_locked "$stage" || status=$?
   if (( status == 0 )); then
-    _ihar_store_publish_stage "$combined" || status=$?
+    _ihar_store_publish_stage "$stage" || status=$?
   fi
-  rm -rf -- "${source_stages[@]}" ${combined:+"$combined"}
+  rm -rf -- "$stage"
   _ihar_store_release_source_locks
   return "$status"
 }
