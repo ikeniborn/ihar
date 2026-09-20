@@ -72,6 +72,7 @@ assert_contains "and it explains the asymmetry" "$out" "handoff would be sanitis
 source "$ROOT/lib/core/logging.sh"
 source "$ROOT/lib/core/init.sh"
 IHAR_ROOT="$ROOT"; export IHAR_ROOT
+source "$ROOT/lib/state/runtime.sh"
 source "$ROOT/lib/render/config.sh"
 
 render_codex() { # <sandbox> [approval]
@@ -92,7 +93,7 @@ render_claude() { # <sandbox> <store> <state-root> <runtime>
   printf '{}\n' > "$runtime/settings.json"
   IHAR_PROFILE_SANDBOX="$sandbox" IHAR_STORE="$store" \
     IHAR_STATE_ROOT="$state_root" IHAR_GATEWAY_MODE=off \
-    _ihar_render_claude_config "$runtime"
+    _ihar_render_claude_config "$runtime" "$runtime"
   cat "$runtime/settings.json"
 }
 
@@ -114,6 +115,22 @@ assert_eq "Claude protected paths are absolute" "True" \
   "$(python3 -c 'import json,os,sys; roots=json.load(sys.stdin)["sandbox"]["filesystem"]["denyWrite"]; print(all(os.path.isabs(path) for path in roots))' <<<"$settings")"
 assert_eq "Claude protected paths are deduplicated" "2" \
   "$(python3 -c 'import json,sys; roots=json.load(sys.stdin)["sandbox"]["filesystem"]["denyWrite"]; print(len(roots) if len(roots) == len(set(roots)) else -1)' <<<"$settings")"
+
+ihar_manifest_digest() { printf 'hooks-fixture\n'; }
+ihar_registry_digest() { printf 'registry-fixture\n'; }
+ihar_vendor_version() { printf 'claude-2.1.274\n'; }
+lifecycle_render="$PROJECT/render-lifecycle"
+mkdir -p "$lifecycle_render"
+printf '{}\n' > "$lifecycle_render/settings.json"
+IHAR_STATE="$PROJECT/state" IHAR_PROFILE=protected IHAR_PROFILE_MASKING_LEVEL=standard \
+  IHAR_PROFILE_GATEWAY=off IHAR_PROFILE_SANDBOX=vendor IHAR_PROFILE_MCP_STRICT=true \
+  IHAR_GATEWAY_MODE=off ihar_render_config claude "$lifecycle_render"
+settings="$(cat "$lifecycle_render/settings.json")"
+lifecycle_roots="$(python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["sandbox"]["filesystem"]["denyWrite"]))' <<<"$settings")"
+final_runtime="$PROJECT/state/r/ed832395/claude"
+assert_contains "Claude denies the final selected runtime" "$lifecycle_roots" "$final_runtime"
+assert_eq "Claude does not substitute the temporary render path" "0" \
+  "$(grep -cxF "$lifecycle_render" <<<"$lifecycle_roots")"
 
 # The settings that must live at the document's top level. A key after a table header
 # belongs to that table — which is right for `".git/"` inside `[permissions.…]` and

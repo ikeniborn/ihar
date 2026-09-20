@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 from .. import jsonio
 from ..render import claude_settings
@@ -230,33 +231,57 @@ def _case_sandbox_protected_write(vendor, binary, home, workdir, kind):
         return "skipped", "native denyWrite probes are Claude-specific"
 
     roots = _claude_protected_roots(home)
-    proof = os.path.join(workdir, f".ihar-conformance-{kind}-proof")
-    for root in roots:
-        target = os.path.join(root, f".ihar-conformance-{kind}-write")
-        _remove_probe(proof)
-        _remove_probe(target)
-        if kind == "direct":
-            command = (
-                f"printf 'ihar-conformance\\n' > {shlex.quote(proof)}; "
-                f"printf 'ihar-conformance\\n' > {shlex.quote(target)}"
-            )
-        else:
-            code = (
-                "from pathlib import Path; "
-                f"Path({proof!r}).write_text('ihar-conformance\\n'); "
-                f"Path({target!r}).write_text('ihar-conformance\\n')"
-            )
-            command = f"python3 -c {shlex.quote(code)}"
+    cleanup: list[str] = []
+    try:
+        for root in roots:
+            nonce = uuid.uuid4().hex
+            before = os.path.join(workdir, f".ihar-conformance-{kind}-before-{nonce}")
+            target = os.path.join(root, f".ihar-conformance-{kind}-write-{nonce}")
+            after = os.path.join(workdir, f".ihar-conformance-{kind}-after-{nonce}")
+            paths = (before, target, after)
+            if any(os.path.exists(path) for path in paths):
+                return "failed", "a unique sandbox probe path already exists"
+            cleanup.extend(paths)
 
-        result = _run_claude_shell(binary, home, workdir, command)
-        if result.returncode != 0:
-            return "failed", f"Claude exited {result.returncode} while probing {root}"
-        if not os.path.isfile(proof):
-            return "failed", f"Claude did not execute the {kind} probe for {root}"
-        if os.path.exists(target):
-            return "failed", f"Claude wrote {target} despite denyWrite"
+            if kind == "direct":
+                command = (
+                    f"printf 'ihar-conformance\\n' > {shlex.quote(before)}; "
+                    f"printf 'ihar-conformance\\n' > {shlex.quote(target)}; "
+                    "probe_status=$?; "
+                    f"printf '%s\\n' \"$probe_status\" > {shlex.quote(after)}"
+                )
+            else:
+                code = (
+                    "from pathlib import Path\n"
+                    f"Path({before!r}).write_text('ihar-conformance\\n')\n"
+                    "status = 0\n"
+                    "try:\n"
+                    f"    Path({target!r}).write_text('ihar-conformance\\n')\n"
+                    "except OSError:\n"
+                    "    status = 1\n"
+                    f"Path({after!r}).write_text(str(status) + '\\n')\n"
+                )
+                command = f"python3 -c {shlex.quote(code)}"
 
-    return "passed", f"{kind} writes blocked in {len(roots)} protected roots"
+            result = _run_claude_shell(binary, home, workdir, command)
+            if result.returncode != 0:
+                return "failed", f"Claude exited {result.returncode} while probing {root}"
+            if not os.path.isfile(before):
+                return "failed", f"Claude did not begin the {kind} probe for {root}"
+            try:
+                with open(after, "r", encoding="utf-8") as handle:
+                    status = int(handle.read().strip())
+            except (OSError, ValueError) as error:
+                return "failed", f"Claude did not finish the {kind} probe for {root}: {error}"
+            if status == 0:
+                return "failed", f"Claude reported that it wrote {target}"
+            if os.path.exists(target):
+                return "failed", f"Claude wrote {target} despite denyWrite"
+
+        return "passed", f"{kind} writes blocked in {len(roots)} protected roots"
+    finally:
+        for path in cleanup:
+            _remove_probe(path)
 
 
 def case_sandbox_direct_write(vendor, binary, home, workdir):
@@ -270,20 +295,24 @@ def case_sandbox_child_write(vendor, binary, home, workdir):
 def case_sandbox_workspace_write(vendor, binary, home, workdir):
     if vendor != "claude":
         return "skipped", "native sandbox probes are Claude-specific"
-    target = os.path.join(workdir, ".ihar-conformance-workspace-write")
-    _remove_probe(target)
-    command = f"printf 'ihar-conformance\\n' > {shlex.quote(target)}"
-    result = _run_claude_shell(binary, home, workdir, command)
-    if result.returncode != 0:
-        return "failed", f"Claude exited {result.returncode} during the workspace probe"
+    target = os.path.join(workdir, f".ihar-conformance-workspace-write-{uuid.uuid4().hex}")
+    if os.path.exists(target):
+        return "failed", "a unique workspace probe path already exists"
     try:
-        with open(target, "r", encoding="utf-8") as handle:
-            content = handle.read()
-    except OSError as error:
-        return "failed", f"Claude did not write the workspace probe: {error}"
-    if content != "ihar-conformance\n":
-        return "failed", "Claude wrote unexpected workspace probe content"
-    return "passed", "workspace write succeeded"
+        command = f"printf 'ihar-conformance\\n' > {shlex.quote(target)}"
+        result = _run_claude_shell(binary, home, workdir, command)
+        if result.returncode != 0:
+            return "failed", f"Claude exited {result.returncode} during the workspace probe"
+        try:
+            with open(target, "r", encoding="utf-8") as handle:
+                content = handle.read()
+        except OSError as error:
+            return "failed", f"Claude did not write the workspace probe: {error}"
+        if content != "ihar-conformance\n":
+            return "failed", "Claude wrote unexpected workspace probe content"
+        return "passed", "workspace write succeeded"
+    finally:
+        _remove_probe(target)
 
 
 CASES = {

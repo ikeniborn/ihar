@@ -8,6 +8,7 @@ fire it, and honour what it decided?
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -97,7 +98,22 @@ def test_claude_run_probes_native_sandbox_writes():
 
     real_run = conformance.subprocess.run
     seen = {"direct": set(), "child": set(), "workspace": set()}
-    sandbox_unavailable = [False]
+    attempted = {"direct": set(), "child": set()}
+    mode = ["protected"]
+    probe_paths = []
+    unsandboxed_targets = []
+
+    def probe_path(invocation, prefix):
+        match = re.search(re.escape(prefix) + r"[0-9a-f]+", invocation)
+        return match.group(0) if match else None
+
+    def fake_protected_write(target):
+        if mode[0] == "unsandboxed":
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write("ihar-conformance\n")
+            unsandboxed_targets.append(target)
+            return 0
+        raise PermissionError(target)
 
     def fake_vendor(argv, **kwargs):
         if argv[0] != binary:
@@ -106,7 +122,7 @@ def test_claude_run_probes_native_sandbox_writes():
             return conformance.subprocess.CompletedProcess(argv, 0, "claude 2.1.274\n", "")
         if "-p" not in argv:
             return conformance.subprocess.CompletedProcess(argv, 2, "", "not non-interactive")
-        if sandbox_unavailable[0]:
+        if mode[0] == "unavailable":
             return conformance.subprocess.CompletedProcess(argv, 3, "", "sandbox unavailable")
 
         settings_path = os.path.join(kwargs["env"]["CLAUDE_CONFIG_DIR"], "settings.json")
@@ -116,17 +132,41 @@ def test_claude_run_probes_native_sandbox_writes():
 
         for kind in ("direct", "child"):
             for root in roots:
-                target = os.path.join(root, f".ihar-conformance-{kind}-write")
-                if target in invocation:
+                target = probe_path(
+                    invocation, os.path.join(root, f".ihar-conformance-{kind}-write-")
+                )
+                if target:
+                    before = probe_path(
+                        invocation,
+                        os.path.join(kwargs["cwd"], f".ihar-conformance-{kind}-before-"),
+                    )
+                    after = probe_path(
+                        invocation,
+                        os.path.join(kwargs["cwd"], f".ihar-conformance-{kind}-after-"),
+                    )
+                    if not before or not after:
+                        return conformance.subprocess.CompletedProcess(
+                            argv, 2, "", "probe has no before/after markers"
+                        )
                     seen[kind].add(root)
-                    proof = os.path.join(kwargs["cwd"], f".ihar-conformance-{kind}-proof")
-                    with open(proof, "w", encoding="utf-8") as handle:
+                    probe_paths.extend((before, target, after))
+                    with open(before, "w", encoding="utf-8") as handle:
                         handle.write("ihar-conformance\n")
+                    attempted[kind].add(root)
+                    try:
+                        status = fake_protected_write(target)
+                    except PermissionError:
+                        status = 1
+                    with open(after, "w", encoding="utf-8") as handle:
+                        handle.write(f"{status}\n")
                     return conformance.subprocess.CompletedProcess(argv, 0, "{}", "")
 
-        target = os.path.join(kwargs["cwd"], ".ihar-conformance-workspace-write")
-        if target in invocation:
+        target = probe_path(
+            invocation, os.path.join(kwargs["cwd"], ".ihar-conformance-workspace-write-")
+        )
+        if target:
             seen["workspace"].add(target)
+            probe_paths.append(target)
             with open(target, "w", encoding="utf-8") as handle:
                 handle.write("ihar-conformance\n")
             return conformance.subprocess.CompletedProcess(argv, 0, "{}", "")
@@ -135,19 +175,31 @@ def test_claude_run_probes_native_sandbox_writes():
     conformance.subprocess.run = fake_vendor
     try:
         record = conformance.run("claude", binary, store, MANIFEST)
-        sandbox_unavailable[0] = True
+        protected_paths = tuple(probe_paths)
+        protected_seen = {kind: set(paths) for kind, paths in seen.items()}
+        protected_attempted = {kind: set(paths) for kind, paths in attempted.items()}
+        mode[0] = "unavailable"
         unavailable_record = conformance.run("claude", binary, store, MANIFEST)
+        mode[0] = "unsandboxed"
+        unsandboxed_record = conformance.run("claude", binary, store, MANIFEST)
     finally:
         conformance.subprocess.run = real_run
         shutil.rmtree(store, ignore_errors=True)
 
-    assert record["cases"]["sandbox-direct-write"]["status"] == "passed"
-    assert record["cases"]["sandbox-child-write"]["status"] == "passed"
-    assert record["cases"]["sandbox-workspace-write"]["status"] == "passed"
-    assert len(seen["direct"]) == 3, seen
-    assert len(seen["child"]) == 3, seen
-    assert len(seen["workspace"]) == 1, seen
+    assert record["cases"]["sandbox-direct-write"]["status"] == "passed", record["cases"]
+    assert record["cases"]["sandbox-child-write"]["status"] == "passed", record["cases"]
+    assert record["cases"]["sandbox-workspace-write"]["status"] == "passed", record["cases"]
+    assert len(protected_seen["direct"]) == 3, protected_seen
+    assert len(protected_seen["child"]) == 3, protected_seen
+    assert len(protected_seen["workspace"]) == 1, protected_seen
+    assert protected_attempted["direct"] == protected_seen["direct"], protected_attempted
+    assert protected_attempted["child"] == protected_seen["child"], protected_attempted
+    assert len(protected_paths) == len(set(protected_paths)), protected_paths
+    assert not any(os.path.exists(path) for path in protected_paths), protected_paths
     assert unavailable_record["cases"]["sandbox-direct-write"]["status"] == "failed"
+    assert unsandboxed_record["cases"]["sandbox-direct-write"]["status"] == "failed"
+    assert unsandboxed_targets, "the fake did not exercise an unsandboxed write"
+    assert not any(os.path.exists(path) for path in unsandboxed_targets), unsandboxed_targets
 
 
 def test_the_full_run_against_the_pinned_codex():
