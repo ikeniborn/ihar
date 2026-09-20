@@ -43,10 +43,12 @@ _ihar_runtime_materialise() {
 
   if [[ -d "$runtime" ]]; then
     _ihar_runtime_verify "$runtime" "$render"
+    # Verify immutable store links before state reconciliation. A bad security asset
+    # must fail without creating or repairing a persistent-state path.
+    ihar_verify_runtime_asset_links "$vendor" "$runtime" || return
     # State inventory may gain entries after this immutable render was published,
     # and runtime-local vendor writes may replace or remove a link. Verify rendered
-    # files first so configuration drift still fails closed, then run the state-only
-    # verifier: store links are outside this reuse contract.
+    # files first so configuration drift still fails closed, then reconcile state.
     ihar_verify_runtime_state_links "$vendor" "$runtime" "$IHAR_STATE" || return
     _ihar_runtime_touch_marker "$vendor" "$hash"
     return 0

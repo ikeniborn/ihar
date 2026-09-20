@@ -267,15 +267,92 @@ assert_exit "rejected runtime-fork content never reaches canonical state" 1 \
 rm -rf "$rt2/sessions"
 ln -s "$STATE/st/claude/sessions" "$rt2/sessions"
 
+# Runtime reuse verifies every manifest-derived store link before it reconciles
+# persistent state. Hooks are required security assets: absence, a wrong target, or
+# a materialised copy must abort without repairing either asset or state paths.
+rm "$rt2/hooks" "$rt2/projects"
+missing_hook_status=0
+missing_hook_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || missing_hook_status=$?
+assert_eq "runtime reuse rejects a missing required hooks link" "3" "$missing_hook_status"
+assert_contains "missing required hooks are diagnosed" "$missing_hook_out" \
+  "required runtime asset link is missing"
+assert_exit "a rejected missing hooks link is not repaired" 1 test -e "$rt2/hooks"
+assert_exit "asset rejection happens before state link restoration" 1 test -L "$rt2/projects"
+ln -s "$IHAR_STORE/hooks" "$rt2/hooks"
+ln -s "$STATE/st/claude/projects" "$rt2/projects"
+
 WRONG_STORE_TARGET="$IHAR_TEST_TMP/wrong-store-target"
 mkdir -p "$WRONG_STORE_TARGET"
 printf 'store target stays intact\n' > "$WRONG_STORE_TARGET/sentinel"
-ln -sfn "$WRONG_STORE_TARGET" "$rt2/skills"
-ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null 2>&1
-assert_eq "state verification leaves a wrong store link untouched" \
-  "$WRONG_STORE_TARGET" "$(readlink "$rt2/skills")"
-assert_eq "state verification leaves the wrong store target untouched" \
+ln -sfn "$WRONG_STORE_TARGET" "$rt2/hooks"
+wrong_hook_status=0
+wrong_hook_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || wrong_hook_status=$?
+assert_eq "runtime reuse rejects a wrong hooks link" "3" "$wrong_hook_status"
+assert_contains "wrong hooks diagnostics give an explicit recovery step" \
+  "$wrong_hook_out" "remove or recover the wrong link"
+assert_eq "a rejected hooks link keeps its wrong target" \
+  "$WRONG_STORE_TARGET" "$(readlink "$rt2/hooks")"
+assert_eq "rejecting a wrong hooks link preserves its referent" \
   "store target stays intact" "$(cat "$WRONG_STORE_TARGET/sentinel")"
+
+rm "$rt2/hooks"
+mkdir "$rt2/hooks"
+printf 'materialised hooks stay intact\n' > "$rt2/hooks/sentinel"
+materialised_hook_status=0
+materialised_hook_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || materialised_hook_status=$?
+assert_eq "runtime reuse rejects materialised hooks" "3" "$materialised_hook_status"
+assert_contains "materialised hooks diagnostics give an explicit recovery step" \
+  "$materialised_hook_out" "move it to a recovery location"
+assert_exit "rejected materialised hooks remain a directory" 0 test -d "$rt2/hooks"
+assert_exit "rejected materialised hooks are not replaced by a link" 1 test -L "$rt2/hooks"
+assert_eq "rejected materialised hooks stay byte-identical" \
+  "materialised hooks stay intact" "$(cat "$rt2/hooks/sentinel")"
+rm -rf "$rt2/hooks"
+ln -s "$IHAR_STORE/hooks" "$rt2/hooks"
+
+mv "$IHAR_STORE/hooks" "$IHAR_STORE/hooks.saved"
+missing_hook_source_status=0
+missing_hook_source_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || missing_hook_source_status=$?
+assert_eq "runtime reuse rejects a missing required hooks source" \
+  "3" "$missing_hook_source_status"
+assert_contains "missing required hooks source is diagnosed" \
+  "$missing_hook_source_out" "required runtime asset is missing from the store"
+assert_eq "a dangling required hooks link is preserved" \
+  "$IHAR_STORE/hooks" "$(readlink "$rt2/hooks")"
+mv "$IHAR_STORE/hooks.saved" "$IHAR_STORE/hooks"
+
+# Optional runtime entries may be absent even when their store source appears after
+# publication. If present, however, they must still be a correct store symlink.
+mkdir -p "$IHAR_STORE/manifests/config/claude/commands"
+assert_exit "runtime reuse permits an absent optional asset target" 0 \
+  ihar_runtime_materialise claude "$rt2_hash" "$RENDER"
+ln -s "$WRONG_STORE_TARGET" "$rt2/commands"
+wrong_optional_status=0
+wrong_optional_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || wrong_optional_status=$?
+assert_eq "runtime reuse rejects a present wrong optional asset link" \
+  "3" "$wrong_optional_status"
+assert_contains "wrong optional asset diagnostics identify the target" \
+  "$wrong_optional_out" "$rt2/commands"
+assert_eq "a rejected optional link keeps its wrong target" \
+  "$WRONG_STORE_TARGET" "$(readlink "$rt2/commands")"
+rm "$rt2/commands"
+mkdir "$rt2/commands"
+printf 'optional copy stays intact\n' > "$rt2/commands/sentinel"
+materialised_optional_status=0
+materialised_optional_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || materialised_optional_status=$?
+assert_eq "runtime reuse rejects a materialised optional asset" \
+  "3" "$materialised_optional_status"
+assert_contains "materialised optional diagnostics identify the target" \
+  "$materialised_optional_out" "$rt2/commands"
+assert_eq "a rejected optional copy stays byte-identical" \
+  "optional copy stays intact" "$(cat "$rt2/commands/sentinel")"
+rm -rf "$rt2/commands" "$IHAR_STORE/manifests/config/claude/commands"
 
 # A materialised copy where a link belongs means the entry stopped following the
 # store; the repair replaces it.
@@ -725,6 +802,10 @@ mkdir -p "$CURRENT_STATE/r/$CURRENT_OLD/claude" "$CURRENT_STATE/st/claude" \
   "$NAMED_STATE/r/$NAMED_OLD/codex" "$NAMED_STATE/st/codex" \
   "$CURRENT_STATE/r/$ACTIVE_OLD/claude" "$CURRENT_STATE/r/$RECENT_RUNTIME/codex" \
   "$CURRENT_STATE/r/$REUSE_RUNTIME/claude" "$ORPHAN_STATE/r/ffffffff/claude"
+# The reused fixture represents a published runtime, so it carries the required
+# manifest-derived links that reuse now verifies.
+ihar_link_runtime claude "$CURRENT_STATE/r/$REUSE_RUNTIME/claude" "$CURRENT_STATE" \
+  >/dev/null 2>&1
 touch -d '60 days ago' "$CURRENT_STATE/r/$RECENT_RUNTIME"
 python3 - "$CURRENT_STATE/home.json" "$NAMED_STATE/home.json" <<'PY'
 import json, sys
