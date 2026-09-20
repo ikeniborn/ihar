@@ -178,12 +178,40 @@ assert_exit "and leaves vendor-written state writable" 0 test -w "$sealed/logs_2
 # --- links -------------------------------------------------------------------------
 
 mkdir -p "$IHAR_STORE/skills" "$IHAR_STORE/hooks"
-rt2="$(ihar_runtime_materialise claude "$(ihar_config_hash a b c d e f g h)" "$RENDER")"
+rt2_hash="$(ihar_config_hash a b c d e f g h)"
+rt2="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER")"
 assert_exit "a present store entry is linked" 0 test -L "$rt2/skills"
 assert_exit "an absent store entry is skipped" 1 test -e "$rt2/router.json"
 assert_exit "vendor state is linked out of the runtime home" 0 test -L "$rt2/projects"
 assert_eq "vendor state resolves into st/" "$STATE/st/claude/projects" \
   "$(readlink "$rt2/projects")"
+
+# Reusing an already-published runtime verifies rendered files first, then repairs
+# every manifest-derived state link. Repair only replaces runtime entries; canonical
+# state is never populated from a materialised runtime fork.
+printf 'canonical directory\n' > "$STATE/st/claude/projects/canonical"
+rm "$rt2/projects"
+ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null
+assert_eq "runtime reuse restores a missing state directory link" \
+  "$STATE/st/claude/projects" "$(readlink "$rt2/projects")"
+
+printf 'canonical file\n' > "$STATE/st/claude/history.jsonl"
+ln -sfn /nowhere "$rt2/history.jsonl"
+ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null 2>&1
+assert_eq "runtime reuse repoints a wrong state file link" \
+  "$STATE/st/claude/history.jsonl" "$(readlink "$rt2/history.jsonl")"
+
+printf 'canonical session\n' > "$STATE/st/claude/sessions/canonical"
+rm "$rt2/sessions"
+mkdir "$rt2/sessions"
+printf 'forked runtime state\n' > "$rt2/sessions/forked"
+ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null 2>&1
+assert_eq "runtime reuse replaces materialised state with its canonical link" \
+  "$STATE/st/claude/sessions" "$(readlink "$rt2/sessions")"
+assert_eq "state-link repair preserves canonical content" "canonical session" \
+  "$(cat "$STATE/st/claude/sessions/canonical")"
+assert_exit "state-link repair never copies a runtime fork into canonical state" 1 \
+  test -e "$STATE/st/claude/sessions/forked"
 
 # A materialised copy where a link belongs means the entry stopped following the
 # store; the repair replaces it.
@@ -208,7 +236,7 @@ MANIFEST_MIGRATE_STATE="$IHAR_TEST_TMP/manifest-migrate-state"
 MANIFEST_RUNTIME="$IHAR_TEST_TMP/manifest-runtime"
 mkdir -p "$MANIFEST_ROOT/manifests" "$MANIFEST_LEGACY/data" \
   "$MANIFEST_LINK_STATE/st/codex" "$MANIFEST_MIGRATE_STATE/st/codex" \
-  "$MANIFEST_RUNTIME" "$MANIFEST_PROJECT"
+  "$MANIFEST_LINK_STATE/r" "$MANIFEST_RUNTIME" "$MANIFEST_PROJECT"
 ln -s "$ROOT/lib" "$MANIFEST_ROOT/lib"
 cat > "$MANIFEST_ROOT/manifests/state.json" <<'JSON'
 {
@@ -242,6 +270,18 @@ assert_exit "a SQLite base is linked" 0 test -L "$MANIFEST_RUNTIME/state.sqlite"
 assert_exit "a SQLite WAL is linked" 0 test -L "$MANIFEST_RUNTIME/state.sqlite-wal"
 assert_exit "a SQLite SHM is linked" 0 test -L "$MANIFEST_RUNTIME/state.sqlite-shm"
 
+SAVED_IHAR_STATE="$IHAR_STATE"
+SAVED_IHAR_RUNTIME="${IHAR_RUNTIME:-}"
+IHAR_STATE="$MANIFEST_LINK_STATE"
+manifest_runtime_hash="$(ihar_config_hash manifest reuse state links a b c d)"
+ihar_runtime_materialise codex "$manifest_runtime_hash" "$RENDER" >/dev/null
+MANIFEST_REUSE_RUNTIME="$IHAR_RUNTIME"
+rm "$MANIFEST_REUSE_RUNTIME/state.sqlite-wal"
+ihar_runtime_materialise codex "$manifest_runtime_hash" "$RENDER" >/dev/null
+assert_eq "runtime reuse restores a missing SQLite WAL link" \
+  "$MANIFEST_LINK_STATE/st/codex/state.sqlite-wal" \
+  "$(readlink "$MANIFEST_REUSE_RUNTIME/state.sqlite-wal")"
+
 ihar_migrate_vendor codex "$MANIFEST_MIGRATE_STATE" "$MANIFEST_PROJECT" >/dev/null
 assert_exit "migration copies a manifest directory" 0 \
   test -f "$MANIFEST_MIGRATE_STATE/st/codex/data/record"
@@ -268,11 +308,17 @@ mkdir -p "$MANIFEST_LINK_STATE_ADDED/st/codex" \
   "$MANIFEST_MIGRATE_STATE_ADDED/st/codex" "$MANIFEST_RUNTIME_ADDED"
 assert_eq "manifest additions reach linker and migration without Bash array edits" \
   "$(state_inventory codex)" "$(migration_inventory codex)"
+ihar_runtime_materialise codex "$manifest_runtime_hash" "$RENDER" >/dev/null
+assert_eq "runtime reuse links an entry added after publication" \
+  "$MANIFEST_LINK_STATE/st/codex/added.jsonl" \
+  "$(readlink "$MANIFEST_REUSE_RUNTIME/added.jsonl")"
 ihar_link_runtime codex "$MANIFEST_RUNTIME_ADDED" "$MANIFEST_LINK_STATE_ADDED" 2>/dev/null
 assert_exit "the added file is linked" 0 test -L "$MANIFEST_RUNTIME_ADDED/added.jsonl"
 ihar_migrate_vendor codex "$MANIFEST_MIGRATE_STATE_ADDED" "$MANIFEST_PROJECT" >/dev/null
 assert_exit "the added file is migrated" 0 \
   test -f "$MANIFEST_MIGRATE_STATE_ADDED/st/codex/added.jsonl"
+IHAR_STATE="$SAVED_IHAR_STATE"
+IHAR_RUNTIME="$SAVED_IHAR_RUNTIME"
 IHAR_ROOT="$SAVED_IHAR_ROOT"
 
 # --- migration from a legacy home ----------------------------------------------------

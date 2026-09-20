@@ -43,6 +43,11 @@ _ihar_runtime_materialise() {
 
   if [[ -d "$runtime" ]]; then
     _ihar_runtime_verify "$runtime" "$render"
+    # State inventory may gain entries after this immutable render was published,
+    # and runtime-local vendor writes may replace or remove a link. Verify rendered
+    # files first so configuration drift still fails closed, then repair only the
+    # links back to canonical st/ sources.
+    ihar_link_runtime "$vendor" "$runtime" "$IHAR_STATE" || return
     return 0
   fi
 
