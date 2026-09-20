@@ -12,7 +12,7 @@ The record is keyed by vendor, version, binary digest and manifest digest, so an
 upgrade of either invalidates it rather than inheriting a pass.
 
 Usage:
-    python3 -m ihar.conformance.run <vendor> <binary> <store> <manifest> [--json]
+    python3 -m ihar.conformance.run <vendor> <binary> <store> <manifest> [--protected-store <path>] [--json]
 """
 
 from __future__ import annotations
@@ -354,7 +354,15 @@ def vendor_version(vendor: str, binary: str) -> str:
     return (result.stdout or result.stderr).strip().splitlines()[0] if result.stdout or result.stderr else "unknown"
 
 
-def run(vendor: str, binary: str, store: str, manifest_path: str) -> dict:
+def run(
+    vendor: str,
+    binary: str,
+    store: str,
+    manifest_path: str,
+    *,
+    protected_store: str | None = None,
+) -> dict:
+    """Run staged hooks/binary while probing denial against the final store."""
     version = vendor_version(vendor, binary)
     record = {
         "schema": 1,
@@ -370,7 +378,8 @@ def run(vendor: str, binary: str, store: str, manifest_path: str) -> dict:
     home = tempfile.mkdtemp(prefix="ihar-conf-home-")
     state_root = tempfile.mkdtemp(prefix="ihar-conf-state-")
     try:
-        protected_roots = [store, state_root, home] if vendor == "claude" else None
+        protected_roots = [protected_store or store, state_root, home] \
+            if vendor == "claude" else None
         _stage(store, manifest_path, vendor, home, protected_roots)
         for name, case in CASES.items():
             if name in CLAUDE_ONLY_CASES and vendor != "claude":
@@ -393,8 +402,22 @@ def main(argv: list[str]) -> int:
         print(__doc__, file=sys.stderr)
         return 2
     vendor, binary, store, manifest_path = argv[:4]
+    options = argv[4:]
+    protected_store = None
+    if "--protected-store" in options:
+        index = options.index("--protected-store")
+        if index + 1 >= len(options):
+            print(__doc__, file=sys.stderr)
+            return 2
+        protected_store = options[index + 1]
+        del options[index:index + 2]
+    if any(option != "--json" for option in options):
+        print(__doc__, file=sys.stderr)
+        return 2
     try:
-        record = run(vendor, binary, store, manifest_path)
+        record = run(
+            vendor, binary, store, manifest_path, protected_store=protected_store
+        )
     except (RuntimeError, OSError, jsonio.SchemaError) as error:
         print(f"ihar: conformance could not run: {error}", file=sys.stderr)
         return 3
@@ -405,7 +428,7 @@ def main(argv: list[str]) -> int:
     jsonio.write("conformance", target, record, mode=0o644)
 
     failed = [name for name, case in record["cases"].items() if case["status"] == "failed"]
-    if "--json" in argv:
+    if "--json" in options:
         print(json.dumps(record, indent=2, sort_keys=True))
     else:
         for name, case in sorted(record["cases"].items()):

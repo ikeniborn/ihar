@@ -91,6 +91,7 @@ def test_a_broken_hook_fails_the_suite():
 
 def test_claude_run_probes_native_sandbox_writes():
     store = _store()
+    active_store = tempfile.mkdtemp(prefix="ihar-conf-active-store-")
     binary = os.path.join(store, "claude")
     with open(binary, "w", encoding="utf-8") as handle:
         handle.write("#!/bin/sh\nexit 0\n")
@@ -174,7 +175,9 @@ def test_claude_run_probes_native_sandbox_writes():
 
     conformance.subprocess.run = fake_vendor
     try:
-        record = conformance.run("claude", binary, store, MANIFEST)
+        record = conformance.run(
+            "claude", binary, store, MANIFEST, protected_store=active_store
+        )
         protected_paths = tuple(probe_paths)
         protected_seen = {kind: set(paths) for kind, paths in seen.items()}
         protected_attempted = {kind: set(paths) for kind, paths in attempted.items()}
@@ -185,6 +188,7 @@ def test_claude_run_probes_native_sandbox_writes():
     finally:
         conformance.subprocess.run = real_run
         shutil.rmtree(store, ignore_errors=True)
+        shutil.rmtree(active_store, ignore_errors=True)
 
     assert record["cases"]["sandbox-direct-write"]["status"] == "passed", record["cases"]
     assert record["cases"]["sandbox-child-write"]["status"] == "passed", record["cases"]
@@ -194,6 +198,10 @@ def test_claude_run_probes_native_sandbox_writes():
     assert len(protected_seen["workspace"]) == 1, protected_seen
     assert protected_attempted["direct"] == protected_seen["direct"], protected_attempted
     assert protected_attempted["child"] == protected_seen["child"], protected_attempted
+    assert active_store in protected_seen["direct"], protected_seen
+    assert active_store in protected_seen["child"], protected_seen
+    assert store not in protected_seen["direct"], protected_seen
+    assert store not in protected_seen["child"], protected_seen
     assert len(protected_paths) == len(set(protected_paths)), protected_paths
     assert not any(os.path.exists(path) for path in protected_paths), protected_paths
     assert unavailable_record["cases"]["sandbox-direct-write"]["status"] == "failed"

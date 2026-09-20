@@ -247,7 +247,7 @@ generation_fingerprint() {
   } | sha256sum | cut -d' ' -f1
 }
 
-run_install_scenario() ( # <success|conformance|receipt|activation> [install|update]
+run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activation|rollback> [install|update]
   local scenario="$1" operation="${2:-install}"
   export IHAR_ACTIVE_TEST_STORE="$IHAR_STORE"
   ihar_install_command() { :; }
@@ -272,6 +272,24 @@ run_install_scenario() ( # <success|conformance|receipt|activation> [install|upd
     grep -q 'new hook' "$IHAR_STORE/hooks/security-pretool.py" || return 40
     grep -q 'new claude' "$IHAR_CLAUDE_BIN" || return 40
     grep -q 'new codex' "$IHAR_CODEX_BIN" || return 40
+    if [[ "$scenario" == paths ]]; then
+      [[ "${1:-}" == "$IHAR_ACTIVE_TEST_STORE" ]] || return 41
+      [[ "$IHAR_STORE" == */.ihar-store-stage-* ]] || return 42
+      [[ "$IHAR_CLAUDE_BIN" == */.ihar-nvm-stage-*/npm-global/bin/claude ]] || return 42
+      [[ "$IHAR_CODEX_BIN" == */.ihar-store-stage-*/bin/codex ]] || return 42
+    fi
+    if [[ "$scenario" == ownership ]]; then
+      if [[ -e "$IHAR_STORE/auth/claude/concurrent" ||
+            -e "$IHAR_STORE/plugins/claude/concurrent" ||
+            -e "$IHAR_STORE/vendor-data/concurrent" ]]; then
+        printf 'copied\n' > "$IHAR_TEST_TMP/ownership-stage-observation"
+      else
+        printf 'clean\n' > "$IHAR_TEST_TMP/ownership-stage-observation"
+      fi
+      printf 'concurrent auth\n' > "$IHAR_ACTIVE_TEST_STORE/auth/claude/concurrent"
+      printf 'concurrent plugin\n' > "$IHAR_ACTIVE_TEST_STORE/plugins/claude/concurrent"
+      printf 'concurrent vendor data\n' > "$IHAR_ACTIVE_TEST_STORE/vendor-data/concurrent"
+    fi
   }
   ihar_publish_install_receipt() {
     [[ "$scenario" != receipt ]] || return 37
@@ -279,9 +297,14 @@ run_install_scenario() ( # <success|conformance|receipt|activation> [install|upd
       "$IHAR_STORE/install-receipt.json" "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
   }
   ihar_install_move() {
-    if [[ "$scenario" == activation && "$1" == */.ihar-store-stage-*/install-receipt.json &&
+    if [[ ( "$scenario" == activation || "$scenario" == rollback ) &&
+          "$1" == */.ihar-store-stage-*/install-receipt.json &&
           "$2" == "$IHAR_ACTIVE_TEST_STORE/install-receipt.json" ]]; then
       return 39
+    fi
+    if [[ "$scenario" == rollback && "$1" == */.ihar-install-backup-*/install-receipt.json &&
+          "$2" == "$IHAR_ACTIVE_TEST_STORE/install-receipt.json" ]]; then
+      return 41
     fi
     command mv "$@"
   }
@@ -312,6 +335,10 @@ for scenario in conformance receipt activation; do
 done
 
 reset_active_generation
+assert_exit "conformance loads staged hooks and binaries while protecting active store" 0 \
+  run_install_scenario paths
+
+reset_active_generation
 before_generation="$(generation_fingerprint)"
 assert_exit "receipt failure aborts update" 37 run_install_scenario receipt update
 assert_eq "receipt failure preserves exact active generation across update" \
@@ -324,6 +351,45 @@ assert_exit "failed installs leak no NVM stage" 1 \
   compgen -G "$(dirname "$IHAR_NVM")/.ihar-nvm-stage-*"
 assert_exit "failed installs leak no activation backup" 1 \
   compgen -G "$(dirname "$IHAR_STORE")/.ihar-install-backup-*"
+
+reset_active_generation
+mkdir -p "$IHAR_STORE/auth/claude" "$IHAR_STORE/plugins/claude" "$IHAR_STORE/vendor-data"
+printf 'initial auth\n' > "$IHAR_STORE/auth/claude/concurrent"
+printf 'initial plugin\n' > "$IHAR_STORE/plugins/claude/concurrent"
+printf 'initial vendor data\n' > "$IHAR_STORE/vendor-data/concurrent"
+printf 'stable lock\n' > "$IHAR_STORE/.ihar-store.lock"
+lock_inode="$(stat -c '%i' "$IHAR_STORE/.ihar-store.lock")"
+assert_exit "transaction stages only installer-owned store paths" 0 \
+  run_install_scenario ownership
+assert_eq "mutable store paths are not copied into the generation stage" "clean" \
+  "$(cat "$IHAR_TEST_TMP/ownership-stage-observation")"
+assert_eq "concurrent auth writes survive activation" "concurrent auth" \
+  "$(cat "$IHAR_STORE/auth/claude/concurrent")"
+assert_eq "concurrent plugin writes survive activation" "concurrent plugin" \
+  "$(cat "$IHAR_STORE/plugins/claude/concurrent")"
+assert_eq "concurrent vendor data writes survive activation" "concurrent vendor data" \
+  "$(cat "$IHAR_STORE/vendor-data/concurrent")"
+assert_eq "stable lock inode survives activation" "$lock_inode" \
+  "$(stat -c '%i' "$IHAR_STORE/.ihar-store.lock")"
+
+reset_active_generation
+rollback_output="$(run_install_scenario rollback 2>&1)"
+rollback_status=$?
+assert_eq "incomplete rollback reports recovery failure" 3 "$rollback_status"
+recovery_backup="$(compgen -G "$(dirname "$IHAR_STORE")/.ihar-install-backup-*" | head -1)"
+assert_exit "incomplete rollback retains recovery backup" 0 test -n "$recovery_backup"
+assert_contains "incomplete rollback reports retained backup path" "$rollback_output" \
+  ".ihar-install-backup-"
+assert_exit "incomplete rollback retains prior receipt for recovery" 0 \
+  test -f "$recovery_backup/install-receipt.json"
+assert_contains "retained recovery receipt has prior bytes" \
+  "$(cat "$recovery_backup/install-receipt.json")" '"release_lock_sha256":"aaaaaaaa'
+assert_contains "rollback continues restoring hooks after one restore failure" \
+  "$(cat "$IHAR_STORE/hooks/security-pretool.py")" "old hook"
+assert_contains "rollback continues restoring Claude after one restore failure" \
+  "$(cat "$IHAR_CLAUDE_BIN")" "old claude"
+assert_contains "rollback continues restoring Codex after one restore failure" \
+  "$(cat "$IHAR_CODEX_BIN")" "old codex"
 
 reset_active_generation
 run_install_scenario success >/dev/null 2>&1
