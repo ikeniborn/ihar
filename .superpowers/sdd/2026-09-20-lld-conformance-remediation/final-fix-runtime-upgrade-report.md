@@ -143,3 +143,38 @@ Focused evidence on the final executable state:
 - `unshare --map-user=1000 --map-group=1000 -pf --mount-proc bash tests/test_state.sh` — exit 0, `PASS=317 FAIL=0`. PID isolation prevents unrelated opaque host services from becoming intentional fail-closed quiescence blockers while retaining non-root permission behavior.
 - Python compile, Bash syntax, and `git diff --check` — exit 0.
 - Full suite intentionally not run per review-fix scope.
+
+## Escalation fix: candidate-consumer quiescence
+
+### RED evidence
+
+- `PYTHONPATH=lib/python python3 tests/test_runtime_state_upgrade.py` — exit 1 because an unrelated process with a partial environment was treated as a global quiescence uncertainty.
+- The direct live-`/proc` production-session fixture exited 1 because opaque same-UID `systemd`, `(sd-pam)`, and `ssh-agent` processes blocked migration despite having no runtime evidence.
+- The sibling-runtime cwd case exited 1 because cwd/fd inspection covered only the materialized owner and canonical root, allowing migration to start while a sibling runtime was active.
+- A partial environment containing a readable protected `CODEX_HOME` was initially ignored; the regression exited 1 until readable selectors were evaluated independently of environment completeness.
+- Review regressions exited 1 because duplicate selector entries could hide a protected value and because an absolute command-line root containing `=` was parsed as an assignment.
+- Mutation check: inserting `continue` after an unreadable environment made `test_unreadable_environment_still_reports_runtime_file_descriptor_consumer` exit 1 with `unreadable environment skipped runtime fd inspection`; removing the mutant restored exit 0.
+
+### Remediation
+
+- Every same-UID process is still checked for readable selectors and cwd/open-fd references under the materialized owner, every sibling runtime, and canonical state. Those direct references block regardless of process identity.
+- Opaque or partial process evidence becomes blocking uncertainty only after executable or command-line evidence classifies the process as the current vendor, its ACP adapter, the ihar wrapper, or as referring to a protected root. Unrelated opaque session daemons no longer block.
+- Classified candidates retain fail-closed handling for unreadable/partial environments and unavailable cwd/fd inspection. Only the exact migration PID is excluded; detached and ancestor processes receive the same checks.
+- Selector inspection considers every duplicate `IHAR_RUNTIME`, `CODEX_HOME`, and `CLAUDE_CONFIG_DIR` entry, including complete entries visible inside an otherwise partial environment.
+- Command-line root classification preserves complete absolute and `unix://` paths before considering assignment or option right-hand sides, including roots whose names contain `=`.
+- Tests cover Codex, Claude, both ACP executable names, `ihar`/`ihar.sh`, wrong-vendor exclusion, executable and command-line identity, command-line root references, independent cwd/fd uncertainty, and a direct production-session mix of unrelated opaque daemons plus readable and unreadable vendor candidates.
+
+### GREEN evidence
+
+- `python3 -m py_compile lib/python/ihar/runtime_state_upgrade.py tests/test_runtime_state_upgrade.py` — exit 0.
+- `PYTHONPATH=lib/python python3 tests/test_runtime_state_upgrade.py` — exit 0, `PASS=34 FAIL=0`.
+- `PYTHONPATH=lib/python python3 tests/test_jsonio.py` — exit 0, `PASS=29 FAIL=0`.
+- `bash tests/test_contracts.sh` — exit 0, `PASS=84 FAIL=0`.
+- `PYTHONPATH=lib/python python3 tests/test_sessions_readers.py` — exit 0.
+- `bash tests/test_config.sh` — exit 0, `PASS=20 FAIL=0`.
+- `bash tests/test_profiles.sh` — exit 0, `PASS=58 FAIL=0`.
+- `bash tests/test_concurrency.sh` — exit 0, `PASS=33 FAIL=0`.
+- `bash tests/test_state.sh` — exit 0, `PASS=317 FAIL=0`.
+- `git diff --check` — exit 0.
+- Independent escalation re-review found no Critical or Important findings. The pre-existing theoretical PID-reuse race during `/proc` traversal remains a non-blocking Minor; this narrow correction does not add process-lifetime pinning.
+- Full suite intentionally not run per escalation scope.

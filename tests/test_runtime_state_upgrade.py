@@ -29,6 +29,43 @@ def run_upgrade(module, manifest: Path, state: Path, vendor: str, *pids: int):
         return module.upgrade(manifest, state, vendor)
 
 
+def spawn_session_process(
+    identity: str,
+    *,
+    environment: dict[str, str] | None = None,
+    opaque: bool = False,
+    open_path: Path | None = None,
+    cwd: Path | None = None,
+) -> subprocess.Popen[str]:
+    script = "import sys; "
+    arguments = [identity, "-c"]
+    if open_path is not None:
+        script += "handle=open(sys.argv[1], 'rb'); "
+    if opaque:
+        script += "import ctypes; assert ctypes.CDLL(None).prctl(4,0,0,0,0) == 0; "
+    script += "print('ready', flush=True); sys.stdin.read()"
+    arguments.append(script)
+    if open_path is not None:
+        arguments.append(str(open_path))
+    process = subprocess.Popen(
+        arguments,
+        executable=sys.executable,
+        env=environment,
+        cwd=cwd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None and process.stdout.readline().strip() == "ready"
+    return process
+
+
+def stop_session_process(process: subprocess.Popen[str]) -> None:
+    assert process.stdin is not None
+    process.stdin.close()
+    process.wait(timeout=5)
+
+
 def fixture(root: Path, *runtime_hashes: str) -> tuple[Path, Path, list[Path]]:
     manifest = root / "state.json"
     manifest.write_text(json.dumps({
@@ -389,40 +426,379 @@ def test_unavailable_process_proof_fails_closed():
             raise AssertionError("missing process evidence was treated as quiescence")
 
 
-def test_unreadable_live_process_environment_fails_closed():
+def test_unreadable_environment_still_reports_runtime_file_descriptor_consumer():
     module = implementation()
     with tempfile.TemporaryDirectory() as tmp:
         manifest, state, (runtime,) = fixture(Path(tmp), "99999989")
         write_materialized(runtime)
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import ctypes,sys; "
-                    "assert ctypes.CDLL(None).prctl(4,0,0,0,0) == 0; "
-                    "print('ready', flush=True); sys.stdin.read()"
-                ),
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-        )
-        assert process.stdout is not None and process.stdout.readline().strip() == "ready"
+        target = runtime / "history.jsonl"
+        process = spawn_session_process("unrelated-worker", open_path=target)
+        real_read_bytes = module.Path.read_bytes
+
+        def unreadable_environment(path):
+            if path.name == "environ":
+                raise PermissionError("injected unreadable environment")
+            return real_read_bytes(path)
+
         try:
-            try:
-                run_upgrade(module, manifest, state, "codex", process.pid)
-            except module.UpgradeError as error:
-                assert "cannot prove" in str(error)
-                assert str(process.pid) in str(error)
-            else:
-                raise AssertionError("an unreadable live process was treated as irrelevant")
+            with mock.patch.object(module.Path, "read_bytes", new=unreadable_environment):
+                try:
+                    run_upgrade(module, manifest, state, "codex", process.pid)
+                except module.UpgradeError as error:
+                    message = str(error)
+                    assert "runtime-state open file consumer" in message
+                    assert str(target) in message
+                else:
+                    raise AssertionError("unreadable environment skipped runtime fd inspection")
         finally:
-            assert process.stdin is not None
-            process.stdin.close()
-            process.wait(timeout=5)
+            stop_session_process(process)
 
         assert_materialized(runtime)
+        assert not any((state / "st" / "codex").iterdir())
+
+
+def test_production_session_ignores_opaque_daemons_but_blocks_vendor_candidates():
+    module = implementation()
+    with tempfile.TemporaryDirectory() as tmp:
+        _manifest, state, runtimes = fixture(Path(tmp), "99999976", "99999977")
+        canonical = state / "st" / "codex"
+        daemons = []
+        readable = unreadable = None
+        try:
+            for identity in ("systemd", "(sd-pam)", "ssh-agent"):
+                daemons.append(spawn_session_process(identity, opaque=True))
+            with mock.patch.object(
+                module, "_proc_processes", return_value=[Path(f"/proc/{p.pid}") for p in daemons]
+            ):
+                module._require_quiescent(runtimes, canonical, runtimes[0])
+
+            readable = spawn_session_process(
+                "codex",
+                environment={**os.environ, "CODEX_HOME": str(runtimes[1])},
+            )
+            with mock.patch.object(
+                module,
+                "_proc_processes",
+                return_value=[*(Path(f"/proc/{p.pid}") for p in daemons), Path(f"/proc/{readable.pid}")],
+            ):
+                try:
+                    module._require_quiescent(runtimes, canonical, runtimes[0])
+                except module.UpgradeError as error:
+                    assert f"process {readable.pid}" in str(error)
+                    assert f"CODEX_HOME={runtimes[1]}" in str(error)
+                else:
+                    raise AssertionError("readable Codex runtime selector was ignored")
+            stop_session_process(readable)
+            readable = None
+
+            unreadable = spawn_session_process("codex", opaque=True)
+            with mock.patch.object(
+                module,
+                "_proc_processes",
+                return_value=[
+                    *(Path(f"/proc/{p.pid}") for p in daemons),
+                    Path(f"/proc/{unreadable.pid}"),
+                ],
+            ):
+                try:
+                    module._require_quiescent(runtimes, canonical, runtimes[0])
+                except module.UpgradeError as error:
+                    message = str(error)
+                    assert f"process {unreadable.pid}" in message
+                    assert "candidate command line 'codex'" in message
+                    assert all(f"process {daemon.pid}" not in message for daemon in daemons)
+                else:
+                    raise AssertionError("unreadable Codex candidate was ignored")
+        finally:
+            if readable is not None:
+                stop_session_process(readable)
+            if unreadable is not None:
+                stop_session_process(unreadable)
+            for daemon in daemons:
+                stop_session_process(daemon)
+
+
+def test_partial_environment_requires_independent_vendor_identity():
+    module = implementation()
+    unrelated = spawn_session_process("python-worker")
+    candidate = spawn_session_process("codex")
+    real_read_bytes = module.Path.read_bytes
+
+    def partial_environment(path):
+        if path.name == "environ":
+            return b"LANG=C"
+        return real_read_bytes(path)
+
+    try:
+        with mock.patch.object(module.Path, "read_bytes", new=partial_environment), \
+             mock.patch.object(
+                 module, "_proc_processes", return_value=[Path(f"/proc/{unrelated.pid}")]
+             ):
+            module._require_quiescent(
+                [Path("/state/r/generation/codex")],
+                Path("/state/st/codex"),
+                Path("/state/r/generation/codex"),
+            )
+
+        with mock.patch.object(module.Path, "read_bytes", new=partial_environment), \
+             mock.patch.object(
+                 module, "_proc_processes", return_value=[Path(f"/proc/{candidate.pid}")]
+             ):
+            try:
+                module._require_quiescent(
+                    [Path("/state/r/generation/codex")],
+                    Path("/state/st/codex"),
+                    Path("/state/r/generation/codex"),
+                )
+            except module.UpgradeError as error:
+                message = str(error)
+                assert "environment is incomplete" in message
+                assert "candidate command line 'codex'" in message
+            else:
+                raise AssertionError("partial Codex environment was accepted")
+    finally:
+        stop_session_process(candidate)
+        stop_session_process(unrelated)
+
+
+def test_partial_environment_blocks_a_readable_runtime_selector_without_identity():
+    module = implementation()
+    process = spawn_session_process("python-worker")
+    selected = Path("/state/r/sibling/codex")
+    real_read_bytes = module.Path.read_bytes
+
+    def partial_environment(path):
+        if path.name == "environ":
+            return os.fsencode(f"LANG=C\0CODEX_HOME={selected}")
+        return real_read_bytes(path)
+
+    try:
+        with mock.patch.object(module.Path, "read_bytes", new=partial_environment), \
+             mock.patch.object(
+                 module, "_proc_processes", return_value=[Path(f"/proc/{process.pid}")]
+             ):
+            try:
+                module._require_quiescent(
+                    [Path("/state/r/generation/codex"), selected],
+                    Path("/state/st/codex"),
+                    Path("/state/r/generation/codex"),
+                )
+            except module.UpgradeError as error:
+                assert f"CODEX_HOME={selected}" in str(error)
+            else:
+                raise AssertionError("readable selector in a partial environment was ignored")
+    finally:
+        stop_session_process(process)
+
+
+def test_duplicate_readable_selectors_cannot_hide_a_protected_runtime():
+    module = implementation()
+    process = spawn_session_process("python-worker")
+    selected = Path("/state/r/sibling/codex")
+    real_read_bytes = module.Path.read_bytes
+
+    def duplicate_environment(path):
+        if path.name == "environ":
+            return os.fsencode(f"CODEX_HOME=/outside\0CODEX_HOME={selected}\0")
+        return real_read_bytes(path)
+
+    try:
+        with mock.patch.object(module.Path, "read_bytes", new=duplicate_environment), \
+             mock.patch.object(
+                 module, "_proc_processes", return_value=[Path(f"/proc/{process.pid}")]
+             ):
+            try:
+                module._require_quiescent(
+                    [Path("/state/r/generation/codex"), selected],
+                    Path("/state/st/codex"),
+                    Path("/state/r/generation/codex"),
+                )
+            except module.UpgradeError as error:
+                assert f"CODEX_HOME={selected}" in str(error)
+            else:
+                raise AssertionError("a duplicate protected runtime selector was hidden")
+    finally:
+        stop_session_process(process)
+
+
+def test_command_line_root_reference_preserves_equals_in_absolute_path():
+    module = implementation()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "project=fixture"
+        root.mkdir()
+        _manifest, state, runtimes = fixture(root, "99999975")
+        target = runtimes[0] / "consumer-state"
+        target.write_text("consumer\n", encoding="utf-8")
+        process = spawn_session_process("python-worker", opaque=True, open_path=target)
+        try:
+            with mock.patch.object(
+                module, "_proc_processes", return_value=[Path(f"/proc/{process.pid}")]
+            ):
+                try:
+                    module._require_quiescent(runtimes, state / "st" / "codex", runtimes[0])
+                except module.UpgradeError as error:
+                    message = str(error)
+                    assert "candidate command-line root reference" in message
+                    assert str(target) in message
+                else:
+                    raise AssertionError("an opaque command-line root reference was ignored")
+        finally:
+            stop_session_process(process)
+
+
+def test_candidate_command_identities_are_vendor_specific_and_include_wrappers():
+    module = implementation()
+    cases = (
+        ("codex", "codex", True),
+        ("codex", "codex-acp", True),
+        ("codex", "ihar", True),
+        ("codex", "ihar.sh", True),
+        ("codex", "claude", False),
+        ("codex", "claude-agent-acp", False),
+        ("claude", "claude", True),
+        ("claude", "claude-agent-acp", True),
+        ("claude", "ihar", True),
+        ("claude", "ihar.sh", True),
+        ("claude", "codex", False),
+        ("claude", "codex-acp", False),
+    )
+    real_read_bytes = module.Path.read_bytes
+
+    def partial_environment(path):
+        if path.name == "environ":
+            return b"LANG=C"
+        return real_read_bytes(path)
+
+    for vendor, identity, should_block in cases:
+        process = spawn_session_process(identity)
+        owner = Path(f"/state/r/generation/{vendor}")
+        try:
+            with mock.patch.object(module.Path, "read_bytes", new=partial_environment), \
+                 mock.patch.object(
+                     module, "_proc_processes", return_value=[Path(f"/proc/{process.pid}")]
+                 ):
+                try:
+                    module._require_quiescent([owner], Path(f"/state/st/{vendor}"), owner)
+                except module.UpgradeError as error:
+                    if not should_block:
+                        raise AssertionError(
+                            f"wrong-vendor identity {identity!r} blocked {vendor}"
+                        ) from error
+                    assert f"candidate command line {identity!r}" in str(error)
+                else:
+                    if should_block:
+                        raise AssertionError(f"candidate identity {identity!r} was ignored")
+        finally:
+            stop_session_process(process)
+
+
+def test_candidate_executable_identity_fails_closed_on_unreadable_environment():
+    module = implementation()
+    process = spawn_session_process("python-worker")
+    real_read_bytes = module.Path.read_bytes
+    real_readlink = module.os.readlink
+
+    def unreadable_environment(path):
+        if path.name == "environ":
+            raise PermissionError("injected unreadable environment")
+        return real_read_bytes(path)
+
+    def codex_executable(path):
+        if Path(path).name == "exe":
+            return "/store/bin/codex"
+        return real_readlink(path)
+
+    try:
+        with mock.patch.object(module.Path, "read_bytes", new=unreadable_environment), \
+             mock.patch.object(module.os, "readlink", side_effect=codex_executable), \
+             mock.patch.object(
+                 module, "_proc_processes", return_value=[Path(f"/proc/{process.pid}")]
+             ):
+            try:
+                module._require_quiescent(
+                    [Path("/state/r/generation/codex")],
+                    Path("/state/st/codex"),
+                    Path("/state/r/generation/codex"),
+                )
+            except module.UpgradeError as error:
+                assert "candidate executable 'codex'" in str(error)
+            else:
+                raise AssertionError("Codex executable identity was ignored")
+    finally:
+        stop_session_process(process)
+
+
+def test_candidate_cwd_and_fd_uncertainty_blocks_with_complete_environment():
+    module = implementation()
+    real_readlink = module.os.readlink
+    real_iterdir = module.Path.iterdir
+
+    for unavailable in ("cwd", "fd"):
+        process = spawn_session_process("codex")
+
+        def selective_readlink(path):
+            if unavailable == "cwd" and Path(path).name == "cwd":
+                raise PermissionError("injected unreadable cwd")
+            return real_readlink(path)
+
+        def selective_iterdir(path):
+            if unavailable == "fd" and path.name == "fd":
+                raise PermissionError("injected unreadable file descriptors")
+            return real_iterdir(path)
+
+        try:
+            with mock.patch.object(module.os, "readlink", side_effect=selective_readlink), \
+                 mock.patch.object(module.Path, "iterdir", new=selective_iterdir), \
+                 mock.patch.object(
+                     module, "_proc_processes", return_value=[Path(f"/proc/{process.pid}")]
+                 ):
+                try:
+                    module._require_quiescent(
+                        [Path("/state/r/generation/codex")],
+                        Path("/state/st/codex"),
+                        Path("/state/r/generation/codex"),
+                    )
+                except module.UpgradeError as error:
+                    message = str(error)
+                    assert "candidate command line 'codex'" in message
+                    assert ("cwd:" if unavailable == "cwd" else "file descriptors:") in message
+                else:
+                    raise AssertionError(f"candidate {unavailable} uncertainty was ignored")
+        finally:
+            stop_session_process(process)
+
+
+def test_sibling_runtime_cwd_and_file_descriptor_consumers_block_migration():
+    module = implementation()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest, state, runtimes = fixture(Path(tmp), "99999978", "99999979")
+        write_materialized(runtimes[0])
+        sibling_file = runtimes[1] / "consumer-state"
+        sibling_file.write_text("sibling\n", encoding="utf-8")
+        cases = (
+            ("cwd", {"cwd": runtimes[1]}, "runtime-state cwd consumer", str(runtimes[1])),
+            (
+                "open file",
+                {"open_path": sibling_file},
+                "runtime-state open file consumer",
+                str(sibling_file),
+            ),
+        )
+        for evidence, process_options, diagnostic, target in cases:
+            process = spawn_session_process("unrelated-worker", **process_options)
+            try:
+                try:
+                    run_upgrade(module, manifest, state, "codex", process.pid)
+                except module.UpgradeError as error:
+                    assert diagnostic in str(error)
+                    assert target in str(error)
+                else:
+                    raise AssertionError(f"sibling runtime {evidence} consumer was ignored")
+            finally:
+                stop_session_process(process)
+
+        assert_materialized(runtimes[0])
+        assert sibling_file.read_text(encoding="utf-8") == "sibling\n"
         assert not any((state / "st" / "codex").iterdir())
 
 
@@ -465,35 +841,6 @@ def test_detached_unreadable_native_selector_and_runtime_fd_fail_closed():
 
         assert_materialized(runtimes[0])
         assert not any((state / "st" / "codex").iterdir())
-
-
-def test_partial_live_process_environment_fails_closed():
-    module = implementation()
-    process = subprocess.Popen(
-        [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    assert process.stdout is not None and process.stdout.readline().strip() == "ready"
-    try:
-        with mock.patch.object(module, "_proc_processes", return_value=[Path(f"/proc/{process.pid}")]), \
-             mock.patch.object(module.Path, "read_bytes", return_value=b"CODEX_HOME=/partial"):
-            try:
-                module._require_quiescent(
-                    [Path("/state/r/generation/codex")],
-                    Path("/state/st/codex"),
-                    Path("/state/r/generation/codex"),
-                )
-            except module.UpgradeError as error:
-                assert "incomplete" in str(error)
-                assert str(process.pid) in str(error)
-            else:
-                raise AssertionError("a partial live process environment was accepted")
-    finally:
-        assert process.stdin is not None
-        process.stdin.close()
-        process.wait(timeout=5)
 
 
 def test_detached_partial_environment_still_checks_runtime_file_descriptors():

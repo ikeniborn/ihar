@@ -22,6 +22,11 @@ class UpgradeError(RuntimeError):
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 _RENAME_EXCHANGE = 2
+_IHAR_PROCESS_NAMES = frozenset(("ihar", "ihar.sh"))
+_VENDOR_PROCESS_NAMES = {
+    "claude": frozenset(("claude", "claude-agent-acp")),
+    "codex": frozenset(("codex", "codex-acp")),
+}
 
 
 @dataclass
@@ -461,16 +466,66 @@ def _selected_runtime(
     resolved_roots = [Path(os.path.realpath(root)) for root in roots]
     for selector in ("IHAR_RUNTIME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"):
         prefix = os.fsencode(selector + "=")
-        value = next((item[len(prefix) :] for item in environment if item.startswith(prefix)), None)
-        if value is None:
-            continue
-        selected = Path(os.path.realpath(os.fsdecode(value)))
-        if any(
-            selected == root or _path_within(os.fspath(selected), root)
-            for root in resolved_roots
-        ):
-            return selector, selected
+        for item in environment:
+            if not item.startswith(prefix):
+                continue
+            selected = Path(os.path.realpath(os.fsdecode(item[len(prefix) :])))
+            if any(
+                selected == root or _path_within(os.fspath(selected), root)
+                for root in resolved_roots
+            ):
+                return selector, selected
     return None
+
+
+def _process_candidate_evidence(
+    process: Path, vendor: str, protected_roots: tuple[Path, ...]
+) -> list[str]:
+    names = _IHAR_PROCESS_NAMES | _VENDOR_PROCESS_NAMES.get(vendor, frozenset())
+    evidence: list[str] = []
+
+    try:
+        executable = os.readlink(process / "exe")
+    except OSError:
+        executable = None
+    if executable is not None:
+        executable_path = executable.removesuffix(" (deleted)")
+        executable_name = Path(executable_path).name
+        if executable_name in names:
+            evidence.append(f"candidate executable {executable_name!r}")
+        if os.path.isabs(executable_path):
+            resolved = os.path.realpath(executable_path)
+            if any(_path_within(resolved, root) for root in protected_roots):
+                evidence.append(f"candidate executable root reference {resolved!r}")
+
+    try:
+        command_line = (process / "cmdline").read_bytes()
+    except OSError:
+        command_line = b""
+    if command_line and command_line.endswith(b"\0"):
+        for raw_argument in command_line.split(b"\0")[:-1]:
+            argument = os.fsdecode(raw_argument)
+            argument_path = argument.removesuffix(" (deleted)")
+            argument_name = Path(argument_path).name
+            if argument_name in names:
+                evidence.append(f"candidate command line {argument_name!r}")
+            path_values = [argument_path]
+            if (
+                not argument_path.startswith("unix://")
+                and not os.path.isabs(argument_path)
+                and "=" in argument_path
+            ):
+                path_values.append(argument_path.split("=", 1)[1])
+            for path_value in path_values:
+                if path_value.startswith("unix://"):
+                    path_value = path_value[len("unix://") :]
+                if not os.path.isabs(path_value):
+                    continue
+                resolved = os.path.realpath(path_value)
+                if any(_path_within(resolved, root) for root in protected_roots):
+                    evidence.append(f"candidate command-line root reference {resolved!r}")
+
+    return list(dict.fromkeys(evidence))
 
 
 def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) -> None:
@@ -479,7 +534,8 @@ def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) 
         raise UpgradeError("cannot prove runtime-state quiescence: /proc is unavailable")
     ignored = {os.getpid()}
     current_uid = os.getuid()
-    protected_roots = (canonical, owner)
+    protected_roots = tuple(dict.fromkeys((*runtime_paths, canonical, owner)))
+    vendor = owner.name
     uncertainties: list[str] = []
     for process in _proc_processes(proc):
         if not process.name.isdigit() or int(process.name) in ignored:
@@ -496,30 +552,31 @@ def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) 
             continue
         if uid != current_uid:
             continue
+        candidate_evidence = _process_candidate_evidence(process, vendor, protected_roots)
+        process_uncertainties: list[str] = []
         try:
             environment_bytes = (process / "environ").read_bytes()
         except OSError as error:
             if not _process_exists(process):
                 continue
-            uncertainties.append(f"process {pid} environment: {error}")
+            process_uncertainties.append(f"environment: {error}")
             environment_bytes = None
         if environment_bytes is not None:
+            environment = environment_bytes.split(b"\0")
+            selected = _selected_runtime(environment, runtime_paths, canonical, owner)
+            if selected is not None:
+                selector, active_runtime = selected
+                raise UpgradeError(
+                    f"runtime state is active in process {pid}: {selector}={active_runtime}"
+                )
             if not environment_bytes or not environment_bytes.endswith(b"\0"):
-                uncertainties.append(f"process {pid} environment is incomplete")
-            else:
-                environment = environment_bytes.split(b"\0")
-                selected = _selected_runtime(environment, runtime_paths, canonical, owner)
-                if selected is not None:
-                    selector, active_runtime = selected
-                    raise UpgradeError(
-                        f"runtime state is active in process {pid}: {selector}={active_runtime}"
-                    )
+                process_uncertainties.append("environment is incomplete")
 
         try:
             cwd = os.readlink(process / "cwd")
         except OSError as error:
             if _process_exists(process):
-                uncertainties.append(f"process {pid} cwd: {error}")
+                process_uncertainties.append(f"cwd: {error}")
         else:
             if any(_path_within(cwd, root) for root in protected_roots):
                 raise UpgradeError(f"runtime-state cwd consumer is active in process {pid}: {cwd}")
@@ -528,7 +585,7 @@ def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) 
             file_descriptors = list((process / "fd").iterdir())
         except OSError as error:
             if _process_exists(process):
-                uncertainties.append(f"process {pid} file descriptors: {error}")
+                process_uncertainties.append(f"file descriptors: {error}")
             file_descriptors = []
         for link in file_descriptors:
             try:
@@ -538,12 +595,17 @@ def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) 
             except OSError as error:
                 if not _process_exists(process):
                     continue
-                uncertainties.append(f"process {pid} open file {link.name}: {error}")
+                process_uncertainties.append(f"open file {link.name}: {error}")
                 continue
             if any(_path_within(target, root) for root in protected_roots):
                 raise UpgradeError(
                     f"runtime-state open file consumer is active in process {pid}: {target}"
                 )
+        if candidate_evidence and process_uncertainties and _process_exists(process):
+            uncertainties.append(
+                f"process {pid} {', '.join(candidate_evidence)}: "
+                + "; ".join(process_uncertainties)
+            )
     if uncertainties:
         raise UpgradeError(
             "cannot prove that runtime-state consumers are quiescent: " + "; ".join(uncertainties)
