@@ -17,10 +17,10 @@ ihar_state_manifest_digest() {
 }
 
 # ihar_asset_manifest_identity — print the validated semantic identity of every
-# runtime-affecting asset plus its current repository-source presence.
+# runtime-affecting asset plus the store-source topology the linker will consume.
 ihar_asset_manifest_identity() {
   ihar_python ihar.inventory asset-identity \
-    "$IHAR_ROOT/manifests/assets.json" all "$IHAR_ROOT"
+    "$IHAR_ROOT/manifests/assets.json" all "$IHAR_STORE"
 }
 
 # ihar_upgrade_runtime_state <vendor> <state-dir> [candidate-generation] — migrate

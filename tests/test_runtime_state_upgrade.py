@@ -518,6 +518,48 @@ def test_production_session_ignores_opaque_daemons_but_blocks_vendor_candidates(
                 stop_session_process(daemon)
 
 
+def test_candidate_generation_requires_quiescence_without_materialized_state():
+    module = implementation()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest, state, (runtime,) = fixture(Path(tmp), "99999974")
+        config = runtime / "config.toml"
+        config.write_text("runtime config\n", encoding="utf-8")
+        generation_config = runtime.parent / "generation.config"
+        generation_config.write_text("generation config\n", encoding="utf-8")
+
+        cases = (
+            (
+                "generation open file",
+                spawn_session_process("unrelated-worker", open_path=generation_config),
+                "runtime-state open file consumer",
+            ),
+            (
+                "opaque candidate",
+                spawn_session_process("codex", opaque=True),
+                "cannot prove that runtime-state consumers are quiescent",
+            ),
+        )
+        try:
+            for description, process, diagnostic in cases:
+                with mock.patch.object(
+                    module, "_proc_processes", return_value=[Path(f"/proc/{process.pid}")]
+                ):
+                    try:
+                        module.upgrade(manifest, state, "codex", "99999974")
+                    except module.UpgradeError as error:
+                        assert diagnostic in str(error)
+                    else:
+                        raise AssertionError(
+                            f"link-only candidate ignored {description} consumer"
+                        )
+                assert config.read_text(encoding="utf-8") == "runtime config\n"
+                assert generation_config.read_text(encoding="utf-8") == "generation config\n"
+                assert not any((state / "st" / "codex").iterdir())
+        finally:
+            for _description, process, _diagnostic in cases:
+                stop_session_process(process)
+
+
 def test_partial_environment_requires_independent_vendor_identity():
     module = implementation()
     unrelated = spawn_session_process("python-worker")

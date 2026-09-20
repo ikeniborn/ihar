@@ -728,10 +728,18 @@ def upgrade(
     try:
         views = _runtime_views(state_path, state_fd, vendor, entries)
         owners = [view for view in views if view.materialized]
-        if candidate_generation is not None and not any(
-            view.generation == candidate_generation and view.materialized for view in views
-        ):
-            return None
+        if candidate_generation is not None:
+            candidates = [view for view in views if view.generation == candidate_generation]
+            if not candidates:
+                return None
+            candidate = candidates[0]
+            # Cleanup may delete a link-only runtime, so it must prove that exact
+            # generation quiescent before the materialized-state fast path can
+            # return. Reusing the full consumer scan covers selectors, cwd, open
+            # descriptors and opaque plausible vendor processes.
+            _require_quiescent([candidate.path.parent], candidate.path, candidate.path)
+            if not candidate.materialized:
+                return None
         if not owners:
             return None
         if len(owners) != 1:

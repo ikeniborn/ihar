@@ -122,34 +122,67 @@ h5="$(ihar_config_hash protected standard explicit vendor true aaa bbb 2.1.999)"
 assert_exit "a different vendor version yields a different hash" 1 test "$h1" = "$h5"
 
 ASSET_HASH_ROOT="$IHAR_TEST_TMP/asset-hash-root"
-mkdir -p "$ASSET_HASH_ROOT/manifests"
+ASSET_HASH_STORE="$IHAR_TEST_TMP/asset-hash-store"
+ASSET_HASH_STATE="$IHAR_TEST_TMP/asset-hash-state"
+mkdir -p "$ASSET_HASH_ROOT/manifests" "$ASSET_HASH_STORE" \
+  "$ASSET_HASH_STATE/r" "$ASSET_HASH_STATE/st/claude"
 ln -s "$ROOT/lib" "$ASSET_HASH_ROOT/lib"
 cp "$ROOT/manifests/state.json" "$ASSET_HASH_ROOT/manifests/state.json"
+printf '%s\n' '{"schema":1,"entries":[]}' \
+  > "$ASSET_HASH_ROOT/manifests/mutable-links.json"
 cat > "$ASSET_HASH_ROOT/manifests/assets.json" <<'JSON'
 {"schema":1,"entries":[{"vendor":"common","source":"optional/tools","target":"tools","kind":"directory","required":false,"runtime":true}]}
 JSON
-asset_hash_missing="$(IHAR_ROOT="$ASSET_HASH_ROOT" \
+asset_hash_missing="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
   ihar_config_hash asset identity optional source a b c d)"
+asset_runtime_missing="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_missing")"
+assert_exit "an absent optional store source is absent from its generation" 1 \
+  test -e "$asset_runtime_missing/tools"
+
+# A repository source appearing before install does not change the actual topology
+# the runtime linker sees. Publishing it into the store does, and must choose a new
+# generation rather than silently reuse the link-less one.
 mkdir -p "$ASSET_HASH_ROOT/optional/tools"
-asset_hash_present="$(IHAR_ROOT="$ASSET_HASH_ROOT" \
+asset_hash_before_install="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
   ihar_config_hash asset identity optional source a b c d)"
-assert_exit "an optional asset becoming available selects a new runtime generation" 1 \
+assert_eq "repository presence alone does not change runtime asset identity" \
+  "$asset_hash_missing" "$asset_hash_before_install"
+IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_asset_install "$ASSET_HASH_STORE" >/dev/null
+asset_hash_present="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_exit "an optional store asset becoming available selects a new generation" 1 \
   test "$asset_hash_missing" = "$asset_hash_present"
+asset_runtime_present="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_present")"
+assert_exit "the optional asset generation is distinct" 1 \
+  test "$asset_runtime_missing" = "$asset_runtime_present"
+assert_eq "the optional asset generation links the installed source" \
+  "$ASSET_HASH_STORE/optional/tools" "$(readlink "$asset_runtime_present/tools")"
 
 python3 - "$ASSET_HASH_ROOT/manifests/assets.json" <<'PY'
 import json, sys
 path = sys.argv[1]
 document = json.load(open(path, encoding="utf-8"))
 document["entries"].append({
-    "vendor": "codex", "source": "required/new.txt", "target": "new.txt",
+    "vendor": "claude", "source": "required/new.txt", "target": "new.txt",
     "kind": "file", "required": True, "runtime": True,
 })
 json.dump(document, open(path, "w", encoding="utf-8"))
 PY
-asset_hash_required_added="$(IHAR_ROOT="$ASSET_HASH_ROOT" \
+mkdir -p "$ASSET_HASH_ROOT/required"
+printf 'required\n' > "$ASSET_HASH_ROOT/required/new.txt"
+IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_asset_install "$ASSET_HASH_STORE" >/dev/null
+asset_hash_required_added="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
   ihar_config_hash asset identity optional source a b c d)"
 assert_exit "a required runtime asset addition selects a new generation" 1 \
   test "$asset_hash_present" = "$asset_hash_required_added"
+asset_runtime_required="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_required_added")"
+assert_eq "the required asset generation links the installed source" \
+  "$ASSET_HASH_STORE/required/new.txt" "$(readlink "$asset_runtime_required/new.txt")"
 
 assert_exit "a wrong input count is a usage error" 2 \
   bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/state/runtime.sh'
@@ -1220,6 +1253,30 @@ assert_eq "opaque active materialized history survives cleanup" "opaque owner" \
   "$(cat "$CLEAN_OPAQUE_STATE/r/$CLEAN_OPAQUE_HASH/codex/history.jsonl")"
 assert_exit "opaque cleanup failure publishes no canonical state" 1 \
   test -e "$CLEAN_OPAQUE_STATE/st/codex/history.jsonl"
+
+# Link-only runtimes still contain configuration bytes and can be selected by a
+# live vendor. Unreadable process evidence is uncertainty, not permission to delete.
+CLEAN_LINK_ONLY_PROJECT="$IHAR_TEST_TMP/clean-link-only-project"
+mkdir -p "$CLEAN_LINK_ONLY_PROJECT"
+CLEAN_LINK_ONLY_STATE="$(ihar_state_setup "$CLEAN_LINK_ONLY_PROJECT")"
+CLEAN_LINK_ONLY_ID="$(basename "$CLEAN_LINK_ONLY_STATE")"
+CLEAN_LINK_ONLY_HASH=16161616
+CLEAN_LINK_ONLY_RUNTIME="$CLEAN_LINK_ONLY_STATE/r/$CLEAN_LINK_ONLY_HASH/codex"
+mkdir -p "$CLEAN_LINK_ONLY_RUNTIME"
+printf 'runtime config stays\n' > "$CLEAN_LINK_ONLY_RUNTIME/config.toml"
+ihar_link_runtime codex "$CLEAN_LINK_ONLY_RUNTIME" "$CLEAN_LINK_ONLY_STATE" >/dev/null 2>&1
+record_expired_runtime "$CLEAN_LINK_ONLY_STATE/home.json" "$CLEAN_LINK_ONLY_HASH"
+link_only_ready="$IHAR_TEST_TMP/clean-link-only-ready"
+bash -c 'cd "$1" && exec -a codex python3 -c '\''import ctypes,pathlib,sys,time; assert ctypes.CDLL(None).prctl(4,0,0,0,0) == 0; pathlib.Path(sys.argv[1]).touch(); time.sleep(30)'\'' "$2"' _ \
+  "$CLEAN_LINK_ONLY_RUNTIME" "$link_only_ready" &
+link_only_pid=$!
+while [[ ! -e "$link_only_ready" ]]; do :; done
+assert_exit "cleanup fails closed on an opaque active link-only runtime" 3 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$CLEAN_LINK_ONLY_ID'"
+kill "$link_only_pid" 2>/dev/null || true
+wait "$link_only_pid" 2>/dev/null || true
+assert_eq "opaque active link-only runtime bytes survive cleanup" "runtime config stays" \
+  "$(cat "$CLEAN_LINK_ONLY_RUNTIME/config.toml")"
 
 LOCKED_PROJECT="$IHAR_TEST_TMP/locked-clean-project"
 mkdir -p "$LOCKED_PROJECT"

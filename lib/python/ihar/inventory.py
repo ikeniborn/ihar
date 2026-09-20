@@ -45,8 +45,8 @@ def asset_manifest_identity(
     """Return canonical identity for runtime-affecting asset topology.
 
     Asset bytes live behind store links and therefore do not select a runtime
-    generation. The validated entry semantics do, as does source presence: an
-    optional source becoming available changes which links the next runtime owns.
+    generation. The validated entry semantics do, as does store-source presence:
+    an optional installed source changes which links the next runtime owns.
     """
     document = jsonio.read("asset-manifest", manifest)
     root_path = os.path.abspath(os.fspath(root))
