@@ -43,12 +43,13 @@ chmod +x "$IHAR_TEST_TMP/fetch"
 export IHAR_DOWNLOAD="$IHAR_TEST_TMP/fetch"
 
 write_lock() {
-  printf '{"schema":1,"installedAt":"2026-09-18T10:00:00Z",%s}\n' "$1" > "$IHAR_LOCKFILE"
+  printf '{"schema":1,%s}\n' "$1" > "$IHAR_LOCKFILE"
 }
 
 # --- the store is built, and the tracked trees are pinned --------------------------------
 
-write_lock '"codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
+cp "$ROOT/.ihar-lockfile.json" "$IHAR_LOCKFILE"
+before_lock="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
 ihar_install_store >/dev/null 2>&1
 assert_exit "the store tree is created" 0 test -d "$IHAR_STORE/hooks/_shared"
 assert_exit "manifests are copied in" 0 test -f "$IHAR_STORE/manifests/hooks.json"
@@ -58,6 +59,8 @@ pinned="$(python3 -c "
 import json,sys
 print(len(json.load(open(sys.argv[1])).get('hooks', {})))" "$IHAR_LOCKFILE")"
 assert_exit "every hook file is pinned, not a curated list" 0 test "$pinned" -ge 5
+assert_eq "install never rewrites release lock" "$before_lock" \
+  "$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
 
 # The store is copied, never linked: a link would put the agent's writable checkout
 # back on the path a hook is loaded from.
@@ -97,6 +100,7 @@ assert_eq "no install step invokes sudo" "0" \
 
 # --- a Codex release is verified before it is trusted -------------------------------------------
 
+write_lock '"codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
 ihar_install_codex >/dev/null 2>&1
 assert_exit "the release is extracted" 0 test -x "$IHAR_STORE/bin/codex"
 assert_eq "and the version is stamped" "rust-v0.154.0" "$(cat "$IHAR_STORE/bin/.codex-version")"
@@ -217,5 +221,95 @@ for key in "${_IHAR_CONFIG_KEYS[@]}"; do
 done
 
 rm -f "$EXAMPLE"
+
+# --- the validated receipt is the final publication ---------------------------------
+
+write_lock '"node":{"version":"22.23.1"},"claude":{"version":"2.1.274"},
+            "codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
+mkdir -p "$(dirname "$IHAR_CLAUDE_BIN")" "$(dirname "$IHAR_CODEX_BIN")"
+printf '#!/bin/sh\necho claude\n' > "$IHAR_CLAUDE_BIN"
+printf '#!/bin/sh\necho codex\n' > "$IHAR_CODEX_BIN"
+chmod +x "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
+printf '%s\n' '{"schema":1,"release_lock_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","installed_at":"2026-09-19T00:00:00Z","components":{}}' \
+  > "$IHAR_STORE/install-receipt.json"
+
+stub_install_steps() {
+  ihar_install_store() { :; }
+  ihar_install_command() { :; }
+  ihar_install_example_config() { :; }
+  ihar_install_python() { :; }
+  ihar_install_codex() { :; }
+  ihar_install_claude() { :; }
+  ihar_install_conformance() { :; }
+}
+
+before_lock="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
+before_receipt="$(sha256sum "$IHAR_STORE/install-receipt.json" | cut -d' ' -f1)"
+assert_exit "a pre-publication failure aborts install" 37 bash -c "
+  source '$ROOT/lib/core/logging.sh'
+  source '$ROOT/lib/core/init.sh'
+  source '$ROOT/lib/store/lockfile.sh'
+  source '$ROOT/lib/store/install.sh'
+  stub_install_steps() {
+    ihar_install_store() { :; }; ihar_install_command() { :; }
+    ihar_install_example_config() { :; }; ihar_install_python() { :; }
+    ihar_install_codex() { :; }; ihar_install_claude() { :; }
+    ihar_install_conformance() { :; }
+  }
+  stub_install_steps
+  ihar_publish_install_receipt() { return 37; }
+  IHAR_ROOT='$ROOT' IHAR_STORE='$IHAR_STORE' IHAR_LOCKFILE='$IHAR_LOCKFILE' \
+  IHAR_CLAUDE_BIN='$IHAR_CLAUDE_BIN' IHAR_CODEX_BIN='$IHAR_CODEX_BIN' _ihar_install_all
+"
+assert_eq "install never rewrites release lock" "$before_lock" \
+  "$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
+assert_eq "failed install preserves receipt" "$before_receipt" \
+  "$(sha256sum "$IHAR_STORE/install-receipt.json" | cut -d' ' -f1)"
+assert_exit "receipt temp is not leaked" 1 compgen -G "$IHAR_STORE/.install-receipt-*"
+assert_exit "failed publication leaves Claude executable usable" 0 test -x "$IHAR_CLAUDE_BIN"
+assert_exit "failed publication leaves Codex executable usable" 0 test -x "$IHAR_CODEX_BIN"
+
+(
+  stub_install_steps
+  _ihar_install_all
+) >/dev/null 2>&1
+
+expected_lock_sha="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
+expected_claude_sha="$(sha256sum "$IHAR_CLAUDE_BIN" | cut -d' ' -f1)"
+expected_codex_sha="$(sha256sum "$IHAR_CODEX_BIN" | cut -d' ' -f1)"
+receipt_values="$(python3 - "$IHAR_STORE/install-receipt.json" <<'PY'
+import sys
+from ihar.install_receipt import read_receipt
+
+receipt = read_receipt(sys.argv[1])
+print(receipt["release_lock_sha256"])
+print(receipt["components"]["claude"]["version"])
+print(receipt["components"]["claude"]["binary_sha256"])
+print(receipt["components"]["codex"]["version"])
+print(receipt["components"]["codex"]["binary_sha256"])
+PY
+)"
+assert_eq "receipt records release and executable evidence" \
+  "$expected_lock_sha
+2.1.274
+$expected_claude_sha
+rust-v0.154.0
+$expected_codex_sha" "$receipt_values"
+assert_eq "receipt is owner-only" "600" "$(stat -c '%a' "$IHAR_STORE/install-receipt.json")"
+assert_eq "successful install preserves release lock" "$before_lock" \
+  "$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
+assert_exit "successful publication leaves no temp" 1 compgen -G "$IHAR_STORE/.install-receipt-*"
+
+chmod -x "$IHAR_CODEX_BIN"
+ihar_publish_install_receipt
+receipt_vendors="$(python3 - "$IHAR_STORE/install-receipt.json" <<'PY'
+import json
+import sys
+
+print(" ".join(sorted(json.load(open(sys.argv[1], encoding="utf-8"))["components"])))
+PY
+)"
+assert_eq "receipt hashes only executables that exist" "claude" "$receipt_vendors"
+chmod +x "$IHAR_CODEX_BIN"
 
 finish

@@ -32,14 +32,13 @@ REAL_HOOK_SHA="$(sha256sum "$IHAR_STORE/hooks/security-pretool.py" | cut -c1-64)
 
 # --- reading -----------------------------------------------------------------------
 
-write_lock "{\"schema\":1,\"installedAt\":\"2026-09-18T10:00:00Z\",
-             \"claude\":{\"version\":\"2.1.274\",\"binarySha256\":\"$SHA_A\"}}"
+write_lock '{"schema":1,"claude":{"version":"2.1.274"}}'
 assert_eq "a pinned value is read" "2.1.274" "$(ihar_lockfile_get claude.version)"
 assert_eq "an absent path reads empty" "" "$(ihar_lockfile_get codex.version)"
 
 # Schema 1 shipped an optional transparent-gateway pin. S11 drops that feature, but
 # update must still be able to read an installed lockfile before replacing it.
-write_lock '{"schema":1,"installedAt":"2026-09-18T10:00:00Z","mitmproxy":{"version":"12.1.1"}}'
+write_lock '{"schema":1,"mitmproxy":{"version":"12.1.1"}}'
 assert_exit "a legacy mitmproxy pin remains readable for migration" 0 \
   bash -c "$LOAD
            IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
@@ -47,7 +46,7 @@ assert_exit "a legacy mitmproxy pin remains readable for migration" 0 \
 
 # An invalid lockfile must not read as an empty one: a caller would take the silence
 # for "nothing is pinned" and skip every check. Reading one aborts fail-closed.
-write_lock '{"schema":1,"installedAt":"not-a-timestamp"}'
+write_lock '{"schema":1,"hooks":{"hooks/security-pretool.py":"short"}}'
 assert_exit "an invalid lockfile is fail-closed, not silently empty" 3 \
   bash -c "$LOAD
            IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
@@ -55,14 +54,14 @@ assert_exit "an invalid lockfile is fail-closed, not silently empty" 3 \
 
 # --- hook integrity is fail-closed in every profile ---------------------------------
 
-write_lock "{\"schema\":1,\"installedAt\":\"2026-09-18T10:00:00Z\",
+write_lock "{\"schema\":1,
              \"hooks\":{\"hooks/security-pretool.py\":\"$REAL_HOOK_SHA\"}}"
 assert_exit "a matching hook digest passes" 0 \
   bash -c "$LOAD
            IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
            ihar_store_verify_hooks false"
 
-write_lock "{\"schema\":1,\"installedAt\":\"2026-09-18T10:00:00Z\",
+write_lock "{\"schema\":1,
              \"hooks\":{\"hooks/security-pretool.py\":\"$SHA_B\"}}"
 for profile in standard protected; do
   assert_exit "a changed hook is fail-closed under $profile" 3 \
@@ -72,32 +71,25 @@ for profile in standard protected; do
 done
 
 # A pinned hook that is missing is not a hook that passed.
-write_lock "{\"schema\":1,\"installedAt\":\"2026-09-18T10:00:00Z\",
+write_lock "{\"schema\":1,
              \"hooks\":{\"hooks/absent.py\":\"$SHA_A\"}}"
 assert_exit "a pinned hook that is absent is fail-closed" 3 \
   bash -c "$LOAD
            IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
            ihar_store_verify_hooks false"
 
-# --- a binary mismatch takes its severity from the profile ---------------------------
+# --- release input has no mutation commands ------------------------------------------
 
-mkdir -p "$(dirname "$IHAR_TEST_TMP/bin/claude")"
-mkdir -p "$IHAR_TEST_TMP/bin"
-printf 'pretend binary\n' > "$IHAR_TEST_TMP/bin/claude"
-write_lock "{\"schema\":1,\"installedAt\":\"2026-09-18T10:00:00Z\",
-             \"claude\":{\"version\":\"2.1.274\",\"binarySha256\":\"$SHA_B\"}}"
-
-assert_exit "a changed binary only warns under standard" 0 \
-  bash -c "$LOAD
-           IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
-           IHAR_CLAUDE_BIN='$IHAR_TEST_TMP/bin/claude' IHAR_CODEX_BIN=/nowhere \
-           ihar_store_verify_binaries false"
-
-assert_exit "a changed binary is fail-closed elsewhere" 3 \
-  bash -c "$LOAD
-           IHAR_ROOT='$ROOT' IHAR_LOCKFILE='$IHAR_LOCKFILE' IHAR_STORE='$IHAR_STORE' \
-           IHAR_PROFILE=protected IHAR_CLAUDE_BIN='$IHAR_TEST_TMP/bin/claude' \
-           IHAR_CODEX_BIN=/nowhere ihar_store_verify_binaries true"
+write_lock '{"schema":1,"claude":{"version":"2.1.274"}}'
+before="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
+assert_exit "a release value cannot be changed through the lockfile CLI" 2 \
+  env PYTHONPATH="$ROOT/lib/python" python3 -m ihar.lockfile \
+  --set claude.version 9.9.9 "$IHAR_LOCKFILE"
+assert_exit "a store tree cannot be pinned during installation" 2 \
+  env PYTHONPATH="$ROOT/lib/python" python3 -m ihar.lockfile \
+  --pin-tree hooks "$IHAR_LOCKFILE" "$IHAR_STORE"
+assert_eq "rejected mutation commands preserve the release lock" "$before" \
+  "$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
 
 # --- an absent lockfile is not a neutral state under an enforced profile --------------
 

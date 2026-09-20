@@ -26,7 +26,7 @@ import hashlib, json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 digest = lambda name: hashlib.sha256((root / name).read_bytes()).hexdigest()
 pathlib.Path(sys.argv[2]).write_text(json.dumps({
-    "schema": 1, "installedAt": "2026-09-19T00:00:00Z",
+    "schema": 1,
     "microvm": {"firecracker": digest("firecracker"), "kernel": digest("vmlinux"), "rootfs": digest("rootfs.ext4")}
 }))
 PY

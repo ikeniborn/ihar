@@ -165,12 +165,37 @@ accept "a nested script path inside the hooks directory is accepted" hook-manife
 # --- every JSON contract the LLD specifies has a registered kind ------------------
 
 for kind in profile netpolicy hook-manifest mcp-registry capabilities session \
-            launch-claim handoff daemon-record conformance home-marker lockfile; do
+            launch-claim handoff daemon-record conformance home-marker lockfile \
+            install-receipt; do
   assert_exit "contract kind '$kind' is registered" 0 py "
 import sys
 from ihar import jsonio
 sys.exit(0 if sys.argv[1] in jsonio.KINDS else 1)
 " "$kind"
 done
+
+assert_exit "the tracked release lockfile validates" 0 \
+  py 'import sys; from ihar import jsonio; jsonio.read("lockfile", sys.argv[1])' \
+  "$ROOT/.ihar-lockfile.json"
+
+assert_exit "every shipped hook has exactly one reviewed release pin" 0 \
+  py '
+import pathlib, sys
+from ihar import jsonio
+root = pathlib.Path(sys.argv[1])
+lock = jsonio.read("lockfile", root / ".ihar-lockfile.json")
+hooks = {
+    path.relative_to(root).as_posix()
+    for path in (root / "hooks").rglob("*")
+    if path.is_file() and "__pycache__" not in path.parts
+}
+managed_root = root / "managed-hooks"
+managed = {
+    path.relative_to(root).as_posix()
+    for path in managed_root.rglob("*")
+    if path.is_file()
+} if managed_root.is_dir() else set()
+sys.exit(0 if set(lock["hooks"]) == hooks and set(lock["managedHooks"]) == managed else 1)
+' "$ROOT"
 
 finish

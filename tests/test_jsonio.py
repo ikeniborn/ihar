@@ -13,7 +13,7 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "python"))
 
-from ihar import jsonio  # noqa: E402
+from ihar import install_receipt, jsonio  # noqa: E402
 
 PROFILE = {
     "schema": 1,
@@ -29,6 +29,21 @@ PROFILE = {
     "acp": "allow",
     "env_passthrough": [],
     "handoff": {"system_prompt": False},
+}
+
+LOCKFILE = {
+    "schema": 1,
+    "node": {"version": "22.23.1"},
+    "claude": {"version": "2.1.274"},
+}
+
+RECEIPT = {
+    "schema": 1,
+    "release_lock_sha256": "a" * 64,
+    "installed_at": "2026-09-20T00:00:00Z",
+    "components": {
+        "claude": {"version": "2.1.274", "binary_sha256": "b" * 64},
+    },
 }
 
 
@@ -185,6 +200,56 @@ def test_integrity_pins_are_length_checked():
     record["binary_sha256"] = "a" * 64
     jsonio.check("daemon-record", record)
     rejects("daemon-record", {**record, "config_hash": "abc"}, "config_hash")
+
+
+def test_release_lockfile_rejects_machine_local_evidence():
+    jsonio.check("lockfile", LOCKFILE)
+    rejects("lockfile", {**LOCKFILE, "installedAt": "2026-09-20T00:00:00Z"}, "installedAt")
+    rejects(
+        "lockfile",
+        {**LOCKFILE, "claude": {"version": "2.1.274", "binarySha256": "b" * 64}},
+        "binarySha256",
+    )
+
+
+def test_install_receipt_has_a_closed_component_shape():
+    jsonio.check("install-receipt", RECEIPT)
+    rejects("install-receipt", {key: value for key, value in RECEIPT.items() if key != "installed_at"})
+    rejects("install-receipt", {**RECEIPT, "extra": True}, "unknown key")
+    rejects(
+        "install-receipt",
+        {**RECEIPT, "components": {"gemini": RECEIPT["components"]["claude"]}},
+        "gemini",
+    )
+    rejects(
+        "install-receipt",
+        {**RECEIPT, "components": {"claude": {**RECEIPT["components"]["claude"], "extra": 1}}},
+        "unknown key",
+    )
+
+
+def test_install_receipt_requires_complete_sha256_digests():
+    rejects("install-receipt", {**RECEIPT, "release_lock_sha256": "ab"}, "release_lock_sha256")
+    rejects(
+        "install-receipt",
+        {**RECEIPT, "components": {"claude": {"version": "2.1.274", "binary_sha256": "cd"}}},
+        "binary_sha256",
+    )
+
+
+def test_invalid_install_receipt_preserves_previous_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "install-receipt.json")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("previous\n")
+        try:
+            install_receipt.write_receipt(target, {**RECEIPT, "release_lock_sha256": "short"})
+        except jsonio.SchemaError:
+            pass
+        else:
+            raise AssertionError("write_receipt accepted invalid evidence")
+        assert open(target, encoding="utf-8").read() == "previous\n"
+        assert not [name for name in os.listdir(tmp) if name.startswith(".install-receipt-")]
 
 
 if __name__ == "__main__":

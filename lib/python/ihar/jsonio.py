@@ -576,23 +576,13 @@ KINDS: dict[str, dict[str, Any]] = {
     "lockfile": {
         "fields": {
             "schema": {"type": int, "const": 1},
-            "installedAt": {"type": str, "pattern": _TS},
         },
         "optional": {
             "node": {"type": dict, "fields": {"version": {"type": str, "min_len": 1}}},
-            # The digest is of the installed binary, not of a published artefact, so
-            # it cannot be known before the install that produces it — requiring it
-            # made pinning a Claude version impossible, because no lockfile that
-            # named one could validate. Codex's `sha256` stays required: it is the
-            # release archive's digest, published with the release and checked
-            # before extraction.
             "claude": {
                 "type": dict,
                 "fields": {
                     "version": {"type": str, "min_len": 1},
-                },
-                "optional": {
-                    "binarySha256": {"type": str, "pattern": _SHA256},
                 },
             },
             "codex": {
@@ -612,6 +602,29 @@ KINDS: dict[str, dict[str, Any]] = {
             "managedHooks": {"type": dict, "values": {"type": str, "pattern": _SHA256}},
             "acp": {"type": dict, "values": {"type": str, "min_len": 1}},
             "microvm": {"type": dict, "values": {"type": str, "pattern": _SHA256}},
+        },
+        "rules": [],
+    },
+    # LLD 14.1: unlike the release lock above, this evidence is local to one store.
+    "install-receipt": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "release_lock_sha256": {"type": str, "pattern": _SHA256},
+            "installed_at": {"type": str, "pattern": _TS},
+            "components": {
+                "type": dict,
+                "fields": {},
+                "optional": {
+                    vendor: {
+                        "type": dict,
+                        "fields": {
+                            "version": {"type": str, "min_len": 1},
+                            "binary_sha256": {"type": str, "pattern": _SHA256},
+                        },
+                    }
+                    for vendor in _VENDOR
+                },
+            },
         },
         "rules": [],
     },

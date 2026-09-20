@@ -56,7 +56,14 @@ _ihar_install_all() {
   if [[ "${IHAR_FLAG_MICROVM:-false}" == true ]]; then ihar_install_microvm; fi
 
   ihar_lockfile_hash > "$IHAR_STORE/.last-lockfile-hash"
+  ihar_publish_install_receipt || return $?
   ihar_info "install complete; run 'ihar check' to see what is in force"
+}
+
+ihar_publish_install_receipt() {
+  ihar_python ihar.install_receipt build "$IHAR_LOCKFILE" \
+    "$IHAR_STORE/install-receipt.json" \
+    "${IHAR_CLAUDE_BIN:--}" "${IHAR_CODEX_BIN:--}"
 }
 
 # ihar_install_acp — install both exact lockfile pins into one staged npm prefix.
@@ -165,7 +172,7 @@ ihar_install_microvm() {
 # The store
 # --------------------------------------------------------------------------- #
 
-# ihar_install_store — the tracked trees, copied and pinned.
+# ihar_install_store — copy the tracked trees and verify their immutable release pins.
 #
 # Copied rather than symlinked into the checkout: the store is the trusted side of
 # the boundary, and a link would put an agent's writable working tree back on the
@@ -183,8 +190,7 @@ ihar_install_store() {
       || ihar_die 1 "cannot copy $tree into the store"
   done
 
-  ihar_python ihar.lockfile --pin-tree hooks "$IHAR_LOCKFILE" "$IHAR_STORE" \
-    || ihar_die 1 "cannot pin the hook scripts"
+  ihar_store_verify_hooks false
   ihar_info "store ready at $IHAR_STORE"
 }
 
@@ -360,11 +366,6 @@ ihar_install_claude() {
     printf '%s\n' "${version:-latest}" > "$stamp"
     ihar_info "claude ${version:-latest} installed"
   fi
-
-  if [[ -x "$IHAR_CLAUDE_BIN" ]]; then
-    ihar_python ihar.lockfile --set claude.binarySha256 "$(ihar_sha256 "$IHAR_CLAUDE_BIN")" \
-      "$IHAR_LOCKFILE" || ihar_warn "cannot record the claude binary digest"
-  fi
 }
 
 # ihar_install_conformance — the evidence an enforced profile needs, recorded before
@@ -405,5 +406,6 @@ _ihar_update_all() {
   ihar_install_conformance
   ihar_codex_daemon_start_pending
   ihar_lockfile_hash > "$IHAR_STORE/.last-lockfile-hash"
+  ihar_publish_install_receipt || return $?
   ihar_info "update complete"
 }
