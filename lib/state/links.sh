@@ -37,6 +37,67 @@ ihar_state_inventory() {
   ihar_python ihar.inventory state "$IHAR_ROOT/manifests/state.json" "$1"
 }
 
+# ihar_verify_runtime_state_links <vendor> <runtime-dir> <state-dir> — reconcile
+# state links when reusing a published runtime. Unlike the publication linker, this
+# never inspects store assets and never removes a materialised runtime entry: that
+# entry may contain the only copy of vendor state from an older runtime.
+ihar_verify_runtime_state_links() {
+  local vendor="$1" runtime="$2" state="$3"
+  local name kind suffix inventory entry source target
+  local -a entries=()
+
+  inventory="$(ihar_state_inventory "$vendor")" \
+    || ihar_die 3 "cannot read $vendor state inventory"
+  while IFS=$'\t' read -r name kind; do
+    [[ -n "$name" ]] || continue
+    if [[ "$kind" == sqlite-family ]]; then
+      for suffix in '' -wal -shm; do entries+=("$name$suffix"$'\t'file); done
+    else
+      entries+=("$name"$'\t'"$kind")
+    fi
+  done <<< "$inventory"
+
+  # Validate the complete set before repairing anything. A fail-closed result must
+  # not leave half the runtime relinked while a materialised state entry remains.
+  for entry in "${entries[@]}"; do
+    name="${entry%%$'\t'*}"
+    target="$runtime/$name"
+    if [[ -e "$target" && ! -L "$target" ]]; then
+      source="$state/st/$vendor/$name"
+      ihar_die 3 "runtime state entry $target is materialised and was preserved; move it to a recovery location, then retry so ihar can link $source"
+    fi
+  done
+
+  for entry in "${entries[@]}"; do
+    name="${entry%%$'\t'*}"
+    kind="${entry#*$'\t'}"
+    source="$state/st/$vendor/$name"
+    target="$runtime/$name"
+
+    if [[ -L "$target" ]]; then
+      [[ "$(readlink "$target")" == "$source" ]] && continue
+      rm -f "$target" \
+        || ihar_die 3 "cannot remove wrong state link $target"
+    elif [[ -e "$target" ]]; then
+      # Recheck after validation: a vendor may have materialised the entry while
+      # this runtime was active. Preserve it and fail exactly as in the first pass.
+      ihar_die 3 "runtime state entry $target is materialised and was preserved; move it to a recovery location, then retry so ihar can link $source"
+    fi
+
+    if [[ "$kind" == directory ]]; then
+      mkdir -p "$source" \
+        || ihar_die 3 "cannot create canonical state directory $source"
+    else
+      mkdir -p "$(dirname "$source")" \
+        || ihar_die 3 "cannot create canonical state parent for $source"
+    fi
+    mkdir -p "$(dirname "$target")" \
+      || ihar_die 3 "cannot create runtime state parent for $target"
+    ln -s "$source" "$target" \
+      || ihar_die 3 "cannot link runtime state $target -> $source"
+  done
+}
+
 # _ihar_link <source> <target> — idempotent, self-repairing.
 _ihar_link() {
   local source="$1" target="$2" allow_missing="${3:-false}"

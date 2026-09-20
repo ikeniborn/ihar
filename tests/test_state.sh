@@ -196,22 +196,68 @@ assert_eq "runtime reuse restores a missing state directory link" \
   "$STATE/st/claude/projects" "$(readlink "$rt2/projects")"
 
 printf 'canonical file\n' > "$STATE/st/claude/history.jsonl"
-ln -sfn /nowhere "$rt2/history.jsonl"
+WRONG_STATE_TARGET="$IHAR_TEST_TMP/wrong-state-target"
+printf 'wrong target stays intact\n' > "$WRONG_STATE_TARGET"
+ln -sfn "$WRONG_STATE_TARGET" "$rt2/history.jsonl"
 ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null 2>&1
 assert_eq "runtime reuse repoints a wrong state file link" \
   "$STATE/st/claude/history.jsonl" "$(readlink "$rt2/history.jsonl")"
+assert_eq "repointing a wrong state link preserves its target" "wrong target stays intact" \
+  "$(cat "$WRONG_STATE_TARGET")"
+
+printf 'canonical dotfile\n' > "$STATE/st/claude/.claude.json"
+rm "$rt2/.claude.json"
+printf 'materialised runtime file\n' > "$rt2/.claude.json"
+materialised_file_before="$(sha256sum "$rt2/.claude.json" | cut -d' ' -f1)"
+materialised_file_status=0
+materialised_file_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || materialised_file_status=$?
+assert_eq "runtime reuse rejects a materialised state file" "3" "$materialised_file_status"
+assert_contains "materialised state diagnostics give an explicit recovery step" \
+  "$materialised_file_out" "move it to a recovery location"
+assert_exit "a rejected materialised state file remains a regular file" 0 \
+  test -f "$rt2/.claude.json"
+assert_exit "a rejected materialised state file is not replaced by a link" 1 \
+  test -L "$rt2/.claude.json"
+assert_eq "a rejected materialised state file stays byte-identical" \
+  "$materialised_file_before" "$(sha256sum "$rt2/.claude.json" 2>/dev/null | cut -d' ' -f1)"
+assert_eq "materialised-file rejection preserves canonical state" "canonical dotfile" \
+  "$(cat "$STATE/st/claude/.claude.json")"
+rm -f "$rt2/.claude.json"
+ln -s "$STATE/st/claude/.claude.json" "$rt2/.claude.json"
 
 printf 'canonical session\n' > "$STATE/st/claude/sessions/canonical"
 rm "$rt2/sessions"
 mkdir "$rt2/sessions"
 printf 'forked runtime state\n' > "$rt2/sessions/forked"
-ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null 2>&1
-assert_eq "runtime reuse replaces materialised state with its canonical link" \
-  "$STATE/st/claude/sessions" "$(readlink "$rt2/sessions")"
-assert_eq "state-link repair preserves canonical content" "canonical session" \
+materialised_dir_status=0
+materialised_dir_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || materialised_dir_status=$?
+assert_eq "runtime reuse rejects a materialised state directory" "3" "$materialised_dir_status"
+assert_contains "materialised directory diagnostics identify the preserved entry" \
+  "$materialised_dir_out" "$rt2/sessions"
+assert_exit "a rejected materialised state directory remains a directory" 0 \
+  test -d "$rt2/sessions"
+assert_exit "a rejected materialised state directory is not replaced by a link" 1 \
+  test -L "$rt2/sessions"
+assert_eq "a rejected materialised state directory stays byte-identical" \
+  "forked runtime state" "$(cat "$rt2/sessions/forked")"
+assert_eq "materialised-directory rejection preserves canonical content" "canonical session" \
   "$(cat "$STATE/st/claude/sessions/canonical")"
-assert_exit "state-link repair never copies a runtime fork into canonical state" 1 \
+assert_exit "rejected runtime-fork content never reaches canonical state" 1 \
   test -e "$STATE/st/claude/sessions/forked"
+rm -rf "$rt2/sessions"
+ln -s "$STATE/st/claude/sessions" "$rt2/sessions"
+
+WRONG_STORE_TARGET="$IHAR_TEST_TMP/wrong-store-target"
+mkdir -p "$WRONG_STORE_TARGET"
+printf 'store target stays intact\n' > "$WRONG_STORE_TARGET/sentinel"
+ln -sfn "$WRONG_STORE_TARGET" "$rt2/skills"
+ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null 2>&1
+assert_eq "state verification leaves a wrong store link untouched" \
+  "$WRONG_STORE_TARGET" "$(readlink "$rt2/skills")"
+assert_eq "state verification leaves the wrong store target untouched" \
+  "store target stays intact" "$(cat "$WRONG_STORE_TARGET/sentinel")"
 
 # A materialised copy where a link belongs means the entry stopped following the
 # store; the repair replaces it.
