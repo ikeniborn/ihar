@@ -80,7 +80,7 @@ _ihar_runtime_is_active() {
 }
 
 _ihar_state_clean_runtimes_locked() {
-  local days="$1" state="$2" hash runtime expired removed=0
+  local days="$1" state="$2" hash runtime vendor expired removed=0
   local -a removed_hashes=()
   expired="$(ihar_python ihar.state_marker --expired-runtimes "$state/home.json" "$days")" \
     || ihar_die 3 "cannot determine expired runtimes for $state"
@@ -92,6 +92,14 @@ _ihar_state_clean_runtimes_locked() {
     if [[ -d "$runtime" ]] && _ihar_runtime_is_active "$runtime"; then
       continue
     fi
+    # A pre-manifest runtime may still own the only vendor history or SQLite
+    # bytes. The target-scoped transactional upgrade is a no-op for link-only
+    # generations; materialized, ambiguous, changing or active state either moves
+    # losslessly to st/ or aborts before rm sees the runtime.
+    for vendor in claude codex; do
+      [[ -d "$runtime/$vendor" ]] || continue
+      ihar_upgrade_runtime_state "$vendor" "$state" "$hash" || return
+    done
     if [[ -e "$runtime" ]] && ! rm -rf -- "$runtime"; then
       ihar_die 3 "cannot remove expired runtime $hash"
     fi

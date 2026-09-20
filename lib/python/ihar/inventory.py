@@ -39,6 +39,45 @@ def asset_entries(
             yield entry["source"], entry["target"], entry["kind"], entry["required"], entry["runtime"]
 
 
+def asset_manifest_identity(
+    manifest: str | os.PathLike[str], vendor: str, root: str | os.PathLike[str]
+) -> str:
+    """Return canonical identity for runtime-affecting asset topology.
+
+    Asset bytes live behind store links and therefore do not select a runtime
+    generation. The validated entry semantics do, as does source presence: an
+    optional source becoming available changes which links the next runtime owns.
+    """
+    document = jsonio.read("asset-manifest", manifest)
+    root_path = os.path.abspath(os.fspath(root))
+    entries = []
+    for entry in document["entries"]:
+        if not entry["runtime"]:
+            continue
+        if vendor != "all" and entry["vendor"] not in ("common", vendor):
+            continue
+        source = os.path.join(root_path, entry["source"])
+        present = os.path.isdir(source) if entry["kind"] == "directory" else os.path.isfile(source)
+        entries.append({**entry, "present": present})
+    entries.sort(
+        key=lambda entry: (
+            entry["vendor"],
+            entry["target"],
+            entry["source"],
+            entry["kind"],
+            entry["required"],
+            entry["runtime"],
+        )
+    )
+    encoded = json.dumps(
+        {"schema": document["schema"], "entries": entries},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def mutable_link_entries(
     manifest: str | os.PathLike[str], vendor: str
 ) -> Iterator[tuple[str, str, str]]:
@@ -186,10 +225,13 @@ def prepare_mutable_sources(
 def main(argv: list[str]) -> int:
     query_commands = ("state", "state-digest", "assets", "mutable-links")
     mutable_commands = ("mutable-preflight", "mutable-prepare")
-    if len(argv) not in (3, 4) or argv[0] not in (*query_commands, *mutable_commands):
+    commands = (*query_commands, "asset-identity", *mutable_commands)
+    if len(argv) not in (3, 4) or argv[0] not in commands:
         return 2
     command, manifest, vendor = argv[:3]
     if command in query_commands and len(argv) != 3:
+        return 2
+    if command == "asset-identity" and len(argv) != 4:
         return 2
     if command in mutable_commands and len(argv) != 4:
         return 2
@@ -202,6 +244,8 @@ def main(argv: list[str]) -> int:
         elif command == "assets":
             for source, target, kind, required, runtime in asset_entries(manifest, vendor):
                 print(f"{source}\t{target}\t{kind}\t{str(required).lower()}\t{str(runtime).lower()}")
+        elif command == "asset-identity":
+            print(asset_manifest_identity(manifest, vendor, argv[3]))
         elif command == "mutable-links":
             for source, target, kind in mutable_link_entries(manifest, vendor):
                 print(f"{source}\t{target}\t{kind}")

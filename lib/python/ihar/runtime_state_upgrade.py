@@ -702,6 +702,7 @@ def upgrade(
     manifest: str | os.PathLike[str],
     state: str | os.PathLike[str],
     vendor: str,
+    candidate_generation: str | None = None,
 ) -> Path | None:
     """Migrate one unambiguous materialized runtime owner into canonical state.
 
@@ -727,6 +728,10 @@ def upgrade(
     try:
         views = _runtime_views(state_path, state_fd, vendor, entries)
         owners = [view for view in views if view.materialized]
+        if candidate_generation is not None and not any(
+            view.generation == candidate_generation and view.materialized for view in views
+        ):
+            return None
         if not owners:
             return None
         if len(owners) != 1:
@@ -917,10 +922,10 @@ def upgrade(
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
+    if len(argv) not in (3, 4):
         return 2
     try:
-        upgrade(argv[0], argv[1], argv[2])
+        upgrade(argv[0], argv[1], argv[2], argv[3] if len(argv) == 4 else None)
     except (OSError, UpgradeError) as error:
         print(f"ihar: runtime state upgrade failed: {error}", file=sys.stderr)
         return 1

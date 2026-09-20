@@ -16,25 +16,37 @@ ihar_state_manifest_digest() {
   ihar_python ihar.inventory state-digest "$IHAR_ROOT/manifests/state.json" all
 }
 
-# ihar_upgrade_runtime_state <vendor> <state-dir> — migrate one unambiguous
-# pre-manifest runtime owner. The caller holds the required project-state lock.
+# ihar_asset_manifest_identity — print the validated semantic identity of every
+# runtime-affecting asset plus its current repository-source presence.
+ihar_asset_manifest_identity() {
+  ihar_python ihar.inventory asset-identity \
+    "$IHAR_ROOT/manifests/assets.json" all "$IHAR_ROOT"
+}
+
+# ihar_upgrade_runtime_state <vendor> <state-dir> [candidate-generation] — migrate
+# one unambiguous pre-manifest runtime owner. With a candidate, do nothing unless
+# that generation itself owns materialized state. The caller holds the state lock.
 ihar_upgrade_runtime_state() {
-  ihar_python ihar.runtime_state_upgrade \
-    "$IHAR_ROOT/manifests/state.json" "$2" "$1" \
+  local -a arguments=("$IHAR_ROOT/manifests/state.json" "$2" "$1")
+  [[ -z "${3:-}" ]] || arguments+=("$3")
+  ihar_python ihar.runtime_state_upgrade "${arguments[@]}" \
     || ihar_die 3 "cannot migrate materialized $1 runtime state"
 }
 
 # ihar_config_hash <profile> <masking> <gateway> <sandbox> <mcp-strict>
 #                  <hooks-digest> <registry-digest> <vendor-version>
-# The eight explicit inputs plus the validated persistent-state manifest decide how
-# the vendor behaves. Folding the manifest identity into the generation prevents a
-# runtime built for an older link inventory from being reused after an upgrade.
+# The eight explicit inputs plus validated persistent-state and tracked-asset
+# identities decide how the vendor behaves. Folding both link inventories into the
+# generation prevents a runtime built for older topology from being reused.
 ihar_config_hash() {
   (( $# == 8 )) || ihar_die 2 "ihar_config_hash: expected 8 inputs, got $#"
-  local state_manifest_digest
+  local state_manifest_digest asset_manifest_identity
   state_manifest_digest="$(ihar_state_manifest_digest)" \
     || ihar_die 3 "cannot digest persistent-state manifest"
-  printf '%s\n' "$@" "$state_manifest_digest" | sha256sum | cut -c1-8
+  asset_manifest_identity="$(ihar_asset_manifest_identity)" \
+    || ihar_die 3 "cannot identify tracked-asset manifest"
+  printf '%s\n' "$@" "$state_manifest_digest" "$asset_manifest_identity" \
+    | sha256sum | cut -c1-8
 }
 
 # ihar_runtime_materialise <vendor> <hash> <render-dir> [immutable|writable]

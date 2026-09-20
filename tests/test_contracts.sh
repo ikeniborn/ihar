@@ -204,6 +204,58 @@ assert_exit "the tracked-asset manifest validates" 0 \
   py 'import sys; from ihar import jsonio; jsonio.read("asset-manifest", sys.argv[1])' \
   "$ROOT/manifests/assets.json"
 
+# Runtime generation identity is a semantic projection of the validated asset
+# inventory, not the manifest's byte layout. Optional source presence is part of
+# that projection because it changes which runtime links can be materialised.
+ASSET_IDENTITY_ROOT="$IHAR_TEST_TMP/asset-identity"
+mkdir -p "$ASSET_IDENTITY_ROOT/required"
+printf 'required\n' > "$ASSET_IDENTITY_ROOT/required/instructions.md"
+cat > "$ASSET_IDENTITY_ROOT/first.json" <<'JSON'
+{"schema":1,"entries":[
+  {"vendor":"common","source":"optional/tools","target":"tools","kind":"directory","required":false,"runtime":true},
+  {"vendor":"claude","source":"required/instructions.md","target":"CLAUDE.md","kind":"file","required":true,"runtime":true}
+]}
+JSON
+cat > "$ASSET_IDENTITY_ROOT/reordered.json" <<'JSON'
+{
+  "entries": [
+    {"runtime": true, "required": true, "kind": "file", "target": "CLAUDE.md", "source": "required/instructions.md", "vendor": "claude"},
+    {"runtime": true, "required": false, "kind": "directory", "target": "tools", "source": "optional/tools", "vendor": "common"}
+  ],
+  "schema": 1
+}
+JSON
+assert_exit "asset runtime identity query succeeds" 0 \
+  python3 -m ihar.inventory asset-identity \
+    "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT"
+asset_identity_first="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+asset_identity_reordered="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/reordered.json" all "$ASSET_IDENTITY_ROOT")"
+assert_eq "asset identity ignores JSON and entry ordering" \
+  "$asset_identity_first" "$asset_identity_reordered"
+
+mkdir -p "$ASSET_IDENTITY_ROOT/optional/tools"
+asset_identity_optional_present="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+assert_exit "an optional source becoming present changes asset identity" 1 \
+  test "$asset_identity_first" = "$asset_identity_optional_present"
+
+python3 - "$ASSET_IDENTITY_ROOT/first.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+document = json.load(open(path, encoding="utf-8"))
+document["entries"].append({
+    "vendor": "codex", "source": "required/new.txt", "target": "new.txt",
+    "kind": "file", "required": True, "runtime": True,
+})
+json.dump(document, open(path, "w", encoding="utf-8"))
+PY
+asset_identity_required_added="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+assert_exit "a required runtime inventory addition changes asset identity" 1 \
+  test "$asset_identity_optional_present" = "$asset_identity_required_added"
+
 # --- mutable auth and plugin links are separate from tracked assets ---------------
 
 mutable_entry="{'vendor':'claude','source':'auth/claude/.credentials.json',

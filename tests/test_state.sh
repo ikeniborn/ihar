@@ -120,6 +120,37 @@ h4="$(ihar_config_hash protected secrets explicit vendor true aaa bbb 2.1.274)"
 assert_exit "a different masking level yields a different hash" 1 test "$h1" = "$h4"
 h5="$(ihar_config_hash protected standard explicit vendor true aaa bbb 2.1.999)"
 assert_exit "a different vendor version yields a different hash" 1 test "$h1" = "$h5"
+
+ASSET_HASH_ROOT="$IHAR_TEST_TMP/asset-hash-root"
+mkdir -p "$ASSET_HASH_ROOT/manifests"
+ln -s "$ROOT/lib" "$ASSET_HASH_ROOT/lib"
+cp "$ROOT/manifests/state.json" "$ASSET_HASH_ROOT/manifests/state.json"
+cat > "$ASSET_HASH_ROOT/manifests/assets.json" <<'JSON'
+{"schema":1,"entries":[{"vendor":"common","source":"optional/tools","target":"tools","kind":"directory","required":false,"runtime":true}]}
+JSON
+asset_hash_missing="$(IHAR_ROOT="$ASSET_HASH_ROOT" \
+  ihar_config_hash asset identity optional source a b c d)"
+mkdir -p "$ASSET_HASH_ROOT/optional/tools"
+asset_hash_present="$(IHAR_ROOT="$ASSET_HASH_ROOT" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_exit "an optional asset becoming available selects a new runtime generation" 1 \
+  test "$asset_hash_missing" = "$asset_hash_present"
+
+python3 - "$ASSET_HASH_ROOT/manifests/assets.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+document = json.load(open(path, encoding="utf-8"))
+document["entries"].append({
+    "vendor": "codex", "source": "required/new.txt", "target": "new.txt",
+    "kind": "file", "required": True, "runtime": True,
+})
+json.dump(document, open(path, "w", encoding="utf-8"))
+PY
+asset_hash_required_added="$(IHAR_ROOT="$ASSET_HASH_ROOT" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_exit "a required runtime asset addition selects a new generation" 1 \
+  test "$asset_hash_present" = "$asset_hash_required_added"
+
 assert_exit "a wrong input count is a usage error" 2 \
   bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/state/runtime.sh'
            ihar_config_hash one two"
@@ -1106,6 +1137,89 @@ assert_exit "active expired runtime survives" 0 test -d "$CURRENT_STATE/r/$ACTIV
 assert_exit "recent marker runtime survives old directory mtime" 0 test -d "$CURRENT_STATE/r/$RECENT_RUNTIME"
 assert_eq "deleted runtime is removed from marker" "False" \
   "$(python3 -c 'import json,sys; print("aaaaaaaa" in json.load(open(sys.argv[1]))["runtimes"])' "$CURRENT_STATE/home.json")"
+
+record_expired_runtime() { # <marker> <hashes...>
+  python3 - "$@" <<'PY'
+import json, sys
+path, *hashes = sys.argv[1:]
+old = "2020-01-01T00:00:00Z"
+marker = json.load(open(path, encoding="utf-8"))
+for runtime_hash in hashes:
+    marker["runtimes"][runtime_hash] = {
+        "profile": "standard", "created": old, "last_used": old,
+    }
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(marker, handle)
+PY
+}
+
+# Cleanup must upgrade an expired pre-manifest owner before removing its runtime.
+# History and every SQLite family member are independent loss-sensitive bytes.
+CLEAN_UPGRADE_PROJECT="$IHAR_TEST_TMP/clean-upgrade-project"
+mkdir -p "$CLEAN_UPGRADE_PROJECT"
+CLEAN_UPGRADE_STATE="$(ihar_state_setup "$CLEAN_UPGRADE_PROJECT")"
+CLEAN_UPGRADE_ID="$(basename "$CLEAN_UPGRADE_STATE")"
+CLEAN_UPGRADE_HASH=12121212
+CLEAN_UPGRADE_RUNTIME="$CLEAN_UPGRADE_STATE/r/$CLEAN_UPGRADE_HASH/codex"
+mkdir -p "$CLEAN_UPGRADE_RUNTIME"
+printf 'expired history\n' > "$CLEAN_UPGRADE_RUNTIME/history.jsonl"
+printf 'expired sqlite\n' > "$CLEAN_UPGRADE_RUNTIME/state_5.sqlite"
+printf 'expired wal\n' > "$CLEAN_UPGRADE_RUNTIME/state_5.sqlite-wal"
+printf 'expired shm\n' > "$CLEAN_UPGRADE_RUNTIME/state_5.sqlite-shm"
+record_expired_runtime "$CLEAN_UPGRADE_STATE/home.json" "$CLEAN_UPGRADE_HASH"
+assert_exit "cleanup upgrades expired materialized state before deletion" 0 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$CLEAN_UPGRADE_ID'"
+assert_exit "upgraded expired runtime is removed" 1 test -d "$CLEAN_UPGRADE_STATE/r/$CLEAN_UPGRADE_HASH"
+assert_eq "cleanup preserves expired history canonically" "expired history" \
+  "$(cat "$CLEAN_UPGRADE_STATE/st/codex/history.jsonl")"
+assert_eq "cleanup preserves expired SQLite canonically" "expired sqlite" \
+  "$(cat "$CLEAN_UPGRADE_STATE/st/codex/state_5.sqlite")"
+assert_eq "cleanup preserves expired SQLite WAL canonically" "expired wal" \
+  "$(cat "$CLEAN_UPGRADE_STATE/st/codex/state_5.sqlite-wal")"
+assert_eq "cleanup preserves expired SQLite SHM canonically" "expired shm" \
+  "$(cat "$CLEAN_UPGRADE_STATE/st/codex/state_5.sqlite-shm")"
+
+# Two possible materialized owners cannot be merged or guessed. Cleanup fails closed
+# and leaves both candidates available for operator recovery.
+CLEAN_AMBIG_PROJECT="$IHAR_TEST_TMP/clean-ambiguous-project"
+mkdir -p "$CLEAN_AMBIG_PROJECT"
+CLEAN_AMBIG_STATE="$(ihar_state_setup "$CLEAN_AMBIG_PROJECT")"
+CLEAN_AMBIG_ID="$(basename "$CLEAN_AMBIG_STATE")"
+mkdir -p "$CLEAN_AMBIG_STATE/r/13131313/codex" \
+  "$CLEAN_AMBIG_STATE/r/14141414/codex/sessions"
+printf 'first owner\n' > "$CLEAN_AMBIG_STATE/r/13131313/codex/history.jsonl"
+printf 'second owner\n' > "$CLEAN_AMBIG_STATE/r/14141414/codex/sessions/session.jsonl"
+record_expired_runtime "$CLEAN_AMBIG_STATE/home.json" 13131313 14141414
+assert_exit "cleanup fails closed on ambiguous materialized owners" 3 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$CLEAN_AMBIG_ID'"
+assert_eq "ambiguous history owner survives cleanup" "first owner" \
+  "$(cat "$CLEAN_AMBIG_STATE/r/13131313/codex/history.jsonl")"
+assert_eq "ambiguous session owner survives cleanup" "second owner" \
+  "$(cat "$CLEAN_AMBIG_STATE/r/14141414/codex/sessions/session.jsonl")"
+
+# An opaque active vendor candidate makes quiescence unknowable. The transactional
+# upgrade refuses it, so cleanup must preserve the only history copy.
+CLEAN_OPAQUE_PROJECT="$IHAR_TEST_TMP/clean-opaque-project"
+mkdir -p "$CLEAN_OPAQUE_PROJECT"
+CLEAN_OPAQUE_STATE="$(ihar_state_setup "$CLEAN_OPAQUE_PROJECT")"
+CLEAN_OPAQUE_ID="$(basename "$CLEAN_OPAQUE_STATE")"
+CLEAN_OPAQUE_HASH=15151515
+mkdir -p "$CLEAN_OPAQUE_STATE/r/$CLEAN_OPAQUE_HASH/codex"
+printf 'opaque owner\n' > "$CLEAN_OPAQUE_STATE/r/$CLEAN_OPAQUE_HASH/codex/history.jsonl"
+record_expired_runtime "$CLEAN_OPAQUE_STATE/home.json" "$CLEAN_OPAQUE_HASH"
+opaque_ready="$IHAR_TEST_TMP/clean-opaque-ready"
+bash -c 'exec -a codex python3 -c '\''import ctypes,pathlib,sys,time; assert ctypes.CDLL(None).prctl(4,0,0,0,0) == 0; pathlib.Path(sys.argv[1]).touch(); time.sleep(30)'\'' "$1"' _ \
+  "$opaque_ready" &
+opaque_pid=$!
+while [[ ! -e "$opaque_ready" ]]; do :; done
+assert_exit "cleanup fails closed on an opaque active vendor candidate" 3 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$CLEAN_OPAQUE_ID'"
+kill "$opaque_pid" 2>/dev/null || true
+wait "$opaque_pid" 2>/dev/null || true
+assert_eq "opaque active materialized history survives cleanup" "opaque owner" \
+  "$(cat "$CLEAN_OPAQUE_STATE/r/$CLEAN_OPAQUE_HASH/codex/history.jsonl")"
+assert_exit "opaque cleanup failure publishes no canonical state" 1 \
+  test -e "$CLEAN_OPAQUE_STATE/st/codex/history.jsonl"
 
 LOCKED_PROJECT="$IHAR_TEST_TMP/locked-clean-project"
 mkdir -p "$LOCKED_PROJECT"
