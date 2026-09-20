@@ -41,6 +41,7 @@ ihar_check_collect() {
   _IHAR_CHECK_DROPPED_ENV="$(printf '%s\n' "${IHAR_ENV_DROPPED[@]:-}" | sed '/^$/d' | sort -u)"
   _IHAR_CHECK_GATEWAY_INSTANCES="$(ihar_gateway_status)" || return $?
   _IHAR_CHECK_ASSETS="$(ihar_asset_diagnostics)" || return $?
+  _IHAR_CHECK_NETWORK_EVIDENCE="$(ihar_microvm_network_evidence)" || return $?
   _IHAR_CHECK_KNOWN_GAPS=$'claude-agent-acp #144: settings hooks may not fire\ncodex-acp #310/#477: sandbox and approval policy are overridden'
 
   for vendor in claude codex; do
@@ -62,7 +63,8 @@ ihar_check_collect() {
   export IHAR_GATEWAY_MASKING_LEVEL IHAR_PROFILE_GATEWAY IHAR_PROFILE_NETPOLICY
   export IHAR_PROFILE_SANDBOX
   export IHAR_PROFILE_MCP_STRICT _IHAR_CHECK_MASK_ENGINE _IHAR_CHECK_DROPPED_ENV
-  export _IHAR_CHECK_GATEWAY_INSTANCES _IHAR_CHECK_ASSETS _IHAR_CHECK_KNOWN_GAPS
+  export _IHAR_CHECK_GATEWAY_INSTANCES _IHAR_CHECK_ASSETS _IHAR_CHECK_NETWORK_EVIDENCE
+  export _IHAR_CHECK_KNOWN_GAPS
   _IHAR_CHECK_MANIFEST="$IHAR_ROOT/manifests/hooks.json"; export _IHAR_CHECK_MANIFEST
   _IHAR_CHECK_NETPOLICY_DIR="$IHAR_ROOT/manifests/netpolicy"; export _IHAR_CHECK_NETPOLICY_DIR
   export _IHAR_CHECK_CLAUDE_CAPABILITIES _IHAR_CHECK_CLAUDE_RECEIPT

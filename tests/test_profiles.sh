@@ -34,22 +34,24 @@ assert_eq "JSON check carries per-hook trust facts" "True" \
 assert_contains "text and JSON check share the profile" "$(ihar check)" \
   "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["profile"]["name"])' <<<"$json_check")"
 assert_eq "standard reports no network enforcement" \
-  '{"default": "allow", "scope": "none", "state": "not enforced"}' \
+  '{"active": false, "available": false, "configured": false, "default": "allow", "scope": "none", "state": "not enforced", "verified": false}' \
   "$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["network"], sort_keys=True))' <<<"$json_check")"
 
 protected_json="$(ihar --profile protected --json check)"
 assert_eq "protected does not claim whole-network enforcement" \
-  '{"default": "allow", "scope": "none", "state": "not enforced"}' \
+  '{"active": false, "available": false, "configured": false, "default": "allow", "scope": "none", "state": "not enforced", "verified": false}' \
   "$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["network"], sort_keys=True))' <<<"$protected_json")"
 assert_contains "protected text names the absent network boundary" \
-  "$(ihar --profile protected check)" "network      not enforced (scope none, default allow)"
+  "$(ihar --profile protected check)" \
+  "network      not enforced (scope none, default allow; configured false, available false, active false, verified false)"
 
 isolated_json="$(ihar --profile isolated --json check)"
-assert_eq "isolated reports deny-by-default guest enforcement" \
-  '{"default": "deny", "scope": "guest-boundary", "state": "enforced"}' \
+assert_eq "isolated does not infer enforcement from its profile" \
+  '{"active": false, "available": false, "configured": true, "default": "deny", "scope": "guest-boundary", "state": "not enforced", "verified": false}' \
   "$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["network"], sort_keys=True))' <<<"$isolated_json")"
-assert_contains "isolated text names the guest enforcement boundary" \
-  "$(ihar --profile isolated check)" "network      enforced (scope guest-boundary, default deny)"
+assert_contains "isolated text names missing live guest evidence" \
+  "$(ihar --profile isolated check)" \
+  "network      not enforced (scope guest-boundary, default deny; configured true, available false, active false, verified false)"
 
 # Diff renders in temporary directories only. A runtime difference names vendor and
 # relative path while the persistent store/state/runtime bytes stay unchanged.
@@ -61,6 +63,10 @@ check_fingerprint() {
   { find "$IHAR_STORE" "$IHAR_STATE_ROOT" -printf '%y\t%m\t%P\t%l\n' | sort
     find "$IHAR_STORE" "$IHAR_STATE_ROOT" -type f -print0 | sort -z | xargs -0 -r sha256sum; } | sha256sum | cut -d' ' -f1
 }
+before_isolated_check="$(check_fingerprint)"
+ihar --profile isolated check >/dev/null
+assert_eq "isolated check leaves persistent files unchanged" \
+  "$before_isolated_check" "$(check_fingerprint)"
 before_check="$(check_fingerprint)"
 diff_out="$(ihar check --diff)"
 assert_contains "diff names Claude relative path" "$diff_out" "claude settings.json"
@@ -194,7 +200,8 @@ settings="$(cat "$lifecycle_render/settings.json")"
 lifecycle_roots="$(python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["sandbox"]["filesystem"]["denyWrite"]))' <<<"$settings")"
 final_hash="$(printf '%s\n' \
   protected standard off vendor true hooks-fixture registry-fixture claude-2.1.274 \
-  "$(ihar_state_manifest_digest)" | sha256sum | cut -c1-8)"
+  "$(ihar_state_manifest_digest)" "$(ihar_asset_manifest_identity)" \
+  | sha256sum | cut -c1-8)"
 final_runtime="$PROJECT/state/r/$final_hash/claude"
 assert_contains "Claude denies the final selected runtime" "$lifecycle_roots" "$final_runtime"
 assert_eq "Claude does not substitute the temporary render path" "0" \

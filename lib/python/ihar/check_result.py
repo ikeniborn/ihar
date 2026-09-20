@@ -28,7 +28,11 @@ def render_text(result: dict) -> str:
         f"gateway      {result['gateway']['mode']}",
         "network      "
         f"{result['network']['state']} (scope {result['network']['scope']}, "
-        f"default {result['network']['default']})",
+        f"default {result['network']['default']}; "
+        f"configured {str(result['network']['configured']).lower()}, "
+        f"available {str(result['network']['available']).lower()}, "
+        f"active {str(result['network']['active']).lower()}, "
+        f"verified {str(result['network']['verified']).lower()})",
     ]
     for instance in result["gateway"]["instances"]:
         lines.append(
@@ -296,11 +300,19 @@ def _network_status() -> dict:
             os.path.join(os.environ["_IHAR_CHECK_NETPOLICY_DIR"], f"{policy_name}.json"),
         )
         default = policy["default"]
-    enforced = os.environ["IHAR_PROFILE_SANDBOX"] == "microvm"
+    facts = json.loads(os.environ["_IHAR_CHECK_NETWORK_EVIDENCE"])
+    expected_keys = {"configured", "available", "active", "verified"}
+    if set(facts) != expected_keys or any(type(facts[name]) is not bool for name in expected_keys):
+        raise ValueError("network evidence is not a closed boolean fact set")
+    configured = os.environ["IHAR_PROFILE_SANDBOX"] == "microvm" and bool(policy_name)
+    if facts["configured"] is not configured:
+        raise ValueError("network evidence does not match the resolved profile")
+    enforced = all(facts.values())
     return {
         "state": "enforced" if enforced else "not enforced",
-        "scope": "guest-boundary" if enforced else "none",
+        "scope": "guest-boundary" if configured else "none",
         "default": default,
+        **facts,
     }
 
 

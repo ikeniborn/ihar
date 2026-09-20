@@ -10,14 +10,14 @@ export IHAR_ROOT="$ROOT"
 source "$ROOT/lib/core/logging.sh"
 source "$ROOT/lib/core/init.sh"
 ihar_init "$ROOT/ihar.sh"
+source "$ROOT/lib/store/lockfile.sh"
 source "$ROOT/lib/sandbox/microvm.sh"
 
 mkdir -p "$IHAR_STORE/bin" "$IHAR_STATE_ROOT/project/r/hash/codex" \
   "$IHAR_STATE_ROOT/project/r/hash/claude" "$IHAR_STATE_ROOT/project/st"
-for asset in firecracker vmlinux rootfs.ext4; do
-  : > "$IHAR_STORE/bin/$asset"
-done
-chmod +x "$IHAR_STORE/bin/firecracker"
+cp "$(command -v bash)" "$IHAR_STORE/bin/firecracker"
+: > "$IHAR_STORE/bin/vmlinux"
+: > "$IHAR_STORE/bin/rootfs.ext4"
 mkdir -p "$IHAR_STORE/microvm/current"
 ssh-keygen -q -t ed25519 -N '' -f "$IHAR_STORE/microvm/current/client_key"
 cp "$IHAR_STORE/microvm/current/client_key.pub" "$IHAR_STORE/microvm/current/host_key.pub"
@@ -142,6 +142,101 @@ assert_contains "private chain is deleted" "$cleanup_rules" '-X IHAR_TEST'
 assert_contains "host-local traffic is dropped by a TAP input chain" "$rules" '-A IHAR_TEST_IN -j DROP'
 assert_contains "return traffic is admitted only when established" "$rules" \
   '-I FORWARD 1 -o tap-ihar-1 -m conntrack'
+
+# Status may claim enforcement only while a live guest and its observed firewall
+# boundary still match the required pinned assets. The record itself is not proof:
+# mutations to the observed rules, process, or assets must remove verification.
+IHAR_PROFILE_SANDBOX=microvm
+IHAR_PROFILE_NETPOLICY=isolated
+mkdir -p "$IHAR_STATE/.launch-guard"
+: > "$IHAR_TEST_TMP/tap-active"
+cat > "$IHAR_TEST_TMP/rules-active" <<'EOF'
+-C IHAR_TEST -j DROP
+-C FORWARD -i tap-ihar-1 -j IHAR_TEST
+-C IHAR_TEST -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-C FORWARD -o tap-ihar-1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-C IHAR_TEST_IN -j DROP
+-C INPUT -i tap-ihar-1 -j IHAR_TEST_IN
+-C IHAR_TEST_IN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-C IHAR_TEST_IN -d 127.0.0.1 -p tcp --dport 43123 -j ACCEPT
+-C IHAR_TEST -d 203.0.113.8 -p tcp --dport 443 -j ACCEPT
+-C INPUT -i tap-ihar-1 -p tcp --dport 43123 -m comment --comment ihar:018f-test -j ACCEPT
+-t nat -C PREROUTING -i tap-ihar-1 -d 172.31.0.1 -p tcp --dport 43123 -m comment --comment ihar:018f-test -j DNAT --to-destination 127.0.0.1:43123
+-t nat -C POSTROUTING -s 172.31.0.2 -d 203.0.113.8 -p tcp --dport 443 -m comment --comment ihar:018f-test -j MASQUERADE
+EOF
+_ihar_microvm_link_active() { test -e "$IHAR_TEST_TMP/tap-active"; }
+cat > "$IHAR_TEST_TMP/filter-IHAR_TEST" <<'EOF'
+-N IHAR_TEST
+-A IHAR_TEST -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A IHAR_TEST -d 203.0.113.8/32 -p tcp -m tcp --dport 443 -j ACCEPT
+-A IHAR_TEST -j DROP
+EOF
+cat > "$IHAR_TEST_TMP/filter-IHAR_TEST_IN" <<'EOF'
+-N IHAR_TEST_IN
+-A IHAR_TEST_IN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A IHAR_TEST_IN -d 127.0.0.1/32 -p tcp -m tcp --dport 43123 -j ACCEPT
+-A IHAR_TEST_IN -j DROP
+EOF
+cat > "$IHAR_TEST_TMP/filter-FORWARD" <<'EOF'
+-P FORWARD ACCEPT
+-A FORWARD -o tap-ihar-1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -i tap-ihar-1 -j IHAR_TEST
+EOF
+cat > "$IHAR_TEST_TMP/filter-INPUT" <<'EOF'
+-P INPUT ACCEPT
+-A INPUT -i tap-ihar-1 -j IHAR_TEST_IN
+EOF
+_ihar_microvm_iptables() {
+  if [[ "$1" == -S ]]; then cat "$IHAR_TEST_TMP/filter-$2"; return; fi
+  grep -qxF -- "$*" "$IHAR_TEST_TMP/rules-active"
+}
+evidence_config="$session/evidence-vmconfig.json"
+python3 - "$evidence_config" "$IHAR_STORE/bin/vmlinux" <<'PY'
+import json, sys
+json.dump({
+    "boot-source": {
+        "kernel_image_path": sys.argv[2],
+        "boot_args": "ip=172.31.0.2::172.31.0.1:255.255.255.252::eth0:off",
+    },
+    "network-interfaces": [{"host_dev_name": "tap-ihar-1"}],
+}, open(sys.argv[1], "w", encoding="utf-8"))
+PY
+"$IHAR_STORE/bin/firecracker" -c 'while :; do sleep 60; done' -- \
+  --config-file "$evidence_config" & evidence_vm_pid=$!
+ihar_microvm_network_evidence_write "$evidence_vm_pid" "$evidence_config"
+evidence="$(ihar_microvm_network_evidence)"
+assert_eq "live guest evidence verifies the configured boundary" "True" \
+  "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d == {"configured":True,"available":True,"active":True,"verified":True})' <<<"$evidence")"
+sed -i 's/^vm_start=.*/vm_start=1/' "$IHAR_STATE/.launch-guard/network-boundary"
+evidence="$(ihar_microvm_network_evidence)"
+assert_eq "reused PID without the recorded process identity is inactive" "True" \
+  "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["configured"] and d["available"] and not d["active"] and not d["verified"])' <<<"$evidence")"
+ihar_microvm_network_evidence_write "$evidence_vm_pid" "$evidence_config"
+sed -i '2i-A IHAR_TEST -j ACCEPT' "$IHAR_TEST_TMP/filter-IHAR_TEST"
+evidence="$(ihar_microvm_network_evidence)"
+assert_eq "an early broad ACCEPT invalidates the observed boundary" "True" \
+  "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["active"] and not d["verified"])' <<<"$evidence")"
+sed -i '/^-A IHAR_TEST -j ACCEPT$/d' "$IHAR_TEST_TMP/filter-IHAR_TEST"
+mv "$IHAR_STORE/bin/rootfs.ext4" "$IHAR_STORE/bin/rootfs.ext4.missing"
+evidence="$(ihar_microvm_network_evidence)"
+assert_eq "missing required asset prevents enforcement" "True" \
+  "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["configured"] and not d["available"] and d["active"] and not d["verified"])' <<<"$evidence")"
+mv "$IHAR_STORE/bin/rootfs.ext4.missing" "$IHAR_STORE/bin/rootfs.ext4"
+sed -i '/^-C IHAR_TEST -j DROP$/d' "$IHAR_TEST_TMP/rules-active"
+evidence="$(ihar_microvm_network_evidence)"
+assert_eq "missing observed firewall rule prevents verification" "True" \
+  "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["configured"] and d["available"] and d["active"] and not d["verified"])' <<<"$evidence")"
+kill "$evidence_vm_pid"
+wait "$evidence_vm_pid" 2>/dev/null || true
+evidence="$(ihar_microvm_network_evidence)"
+assert_eq "dead guest makes the recorded boundary inactive" "True" \
+  "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["configured"] and d["available"] and not d["active"] and not d["verified"])' <<<"$evidence")"
+ihar_microvm_network_evidence_remove
+assert_exit "network evidence cleanup removes only the live record" 1 \
+  test -e "$IHAR_STATE/.launch-guard/network-boundary"
+evidence="$(ihar_microvm_network_evidence)"
+assert_eq "installed assets without a live boundary remain unverified" "True" \
+  "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["configured"] and d["available"] and not d["active"] and not d["verified"])' <<<"$evidence")"
 
 saved_state_root="$IHAR_STATE_ROOT"
 IHAR_STATE_ROOT="$IHAR_TEST_TMP/reservations"; export IHAR_STATE_ROOT

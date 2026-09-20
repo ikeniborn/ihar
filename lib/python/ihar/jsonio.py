@@ -431,11 +431,27 @@ def _check_result_rules(obj: Mapping[str, Any]) -> None:
             raise SchemaError("check result: available metrics must carry every counter")
         if metrics["state"] == "unavailable" and any(value is not None for value in values):
             raise SchemaError("check result: unavailable metrics must not fabricate counters")
-    expected_scope = "guest-boundary" if obj["network"]["state"] == "enforced" else "none"
-    if obj["network"]["scope"] != expected_scope:
+    network = obj["network"]
+    expected_scope = "guest-boundary" if network["configured"] else "none"
+    if network["scope"] != expected_scope:
         raise SchemaError(
-            f"check result: network state {obj['network']['state']!r} "
+            f"check result: configured network boundary {network['configured']!r} "
             f"requires scope {expected_scope!r}"
+        )
+    if network["available"] and not network["configured"]:
+        raise SchemaError("check result: an available network boundary must be configured")
+    if network["active"] and not network["configured"]:
+        raise SchemaError("check result: an active network boundary must be configured")
+    observed = all(network[name] for name in ("configured", "available", "active", "verified"))
+    if network["verified"] and (not observed or network["default"] != "deny"):
+        raise SchemaError(
+            "check result: verified network evidence requires a configured, available, "
+            "active deny-by-default boundary"
+        )
+    expected_state = "enforced" if observed else "not enforced"
+    if network["state"] != expected_state:
+        raise SchemaError(
+            f"check result: observed network evidence requires state {expected_state!r}"
         )
 
 
@@ -886,6 +902,10 @@ KINDS: dict[str, dict[str, Any]] = {
                 "state": {"type": str, "enum": ("enforced", "not enforced")},
                 "scope": {"type": str, "enum": ("none", "guest-boundary")},
                 "default": {"type": str, "enum": ("allow", "deny")},
+                "configured": {"type": bool},
+                "available": {"type": bool},
+                "active": {"type": bool},
+                "verified": {"type": bool},
             }},
             "vendors": {"type": dict, "fields": {
                 vendor: {"type": dict, "fields": {

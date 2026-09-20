@@ -114,6 +114,287 @@ EOF
 
 _ihar_microvm_iptables() { sudo -n iptables "$@"; }
 
+_ihar_microvm_network_evidence_path() {
+  local state="${IHAR_STATE:-}"
+  if [[ -z "$state" ]] && declare -F _ihar_project_state >/dev/null; then
+    state="$(_ihar_project_state)"
+  fi
+  [[ -n "$state" ]] || return 1
+  printf '%s/.launch-guard/network-boundary\n' "$state"
+}
+
+_ihar_microvm_assets_available() {
+  local kvm="${IHAR_MICROVM_KVM:-/dev/kvm}" name key pinned actual
+  [[ -r "$kvm" && -w "$kvm" ]] || return 1
+  for name in firecracker vmlinux rootfs.ext4; do
+    [[ -f "$IHAR_STORE/bin/$name" ]] || return 1
+  done
+  [[ -x "$IHAR_STORE/bin/firecracker" ]] || return 1
+  for name in mkfs.ext4 debugfs ssh rsync ssh-keygen sha256sum; do
+    command -v "$name" >/dev/null 2>&1 || return 1
+  done
+  local client_key="${IHAR_MICROVM_SSH_KEY:-$IHAR_STORE/microvm/current/client_key}"
+  [[ -f "$client_key" && -f "$IHAR_STORE/microvm/current/host_key.pub" ]] || return 1
+  ssh-keygen -l -f "$IHAR_STORE/microvm/current/host_key.pub" >/dev/null 2>&1 || return 1
+  declare -F ihar_lockfile_get >/dev/null || return 1
+  for name in firecracker vmlinux rootfs.ext4; do
+    case "$name" in firecracker) key=firecracker;; vmlinux) key=kernel;; *) key=rootfs;; esac
+    pinned="$(ihar_lockfile_get "microvm.$key" 2>/dev/null)" || return 1
+    [[ -n "$pinned" ]] || return 1
+    actual="$(sha256sum "$IHAR_STORE/bin/$name" | cut -d' ' -f1)" || return 1
+    [[ "$actual" == "$pinned" ]] || return 1
+  done
+  sudo -n true >/dev/null 2>&1
+}
+
+# Published only after the guest answers through the pinned SSH identity. The file
+# is a locator for observations, never proof by itself; readers recheck the PIDs,
+# TAP, firewall rules and pinned assets.
+_ihar_microvm_process_start_time() {
+  local stat rest
+  stat="$(< "/proc/$1/stat")" 2>/dev/null || return 1
+  rest="${stat##*) }"
+  awk '{print $20}' <<< "$rest"
+}
+
+ihar_microvm_network_evidence_write() { # <firecracker-pid> <vm-config>
+  local vm_pid="$1" config="$2" record temp launch_id="${IHAR_LAUNCH_ID:-$$}"
+  local destination egress="" owner_start vm_start config_sha256
+  record="$(_ihar_microvm_network_evidence_path)" || return 1
+  [[ "$vm_pid" =~ ^[1-9][0-9]*$ && "${IHAR_MICROVM_TAP:-}" =~ ^[A-Za-z0-9_-]{1,15}$ \
+    && "${IHAR_MICROVM_CHAIN:-}" =~ ^[A-Za-z0-9_]{1,25}$ \
+    && "${IHAR_MICROVM_GUEST_IP:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ \
+    && "${IHAR_MICROVM_HOST_IP:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ \
+    && "${IHAR_GATEWAY_ACTIVE_PORT:-}" =~ ^[1-9][0-9]*$ \
+    && "$launch_id" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [[ -f "$config" && ! -L "$config" && "$config" != *$'\n'* && "$config" != *$'\t'* ]] \
+    || return 1
+  owner_start="$(_ihar_microvm_process_start_time "$$")" || return 1
+  vm_start="$(_ihar_microvm_process_start_time "$vm_pid")" || return 1
+  [[ "$owner_start" =~ ^[0-9]+$ && "$vm_start" =~ ^[0-9]+$ ]] || return 1
+  config_sha256="$(sha256sum "$config" | cut -d' ' -f1)" || return 1
+  for destination in ${IHAR_MICROVM_MCP_EGRESS:-}; do
+    [[ "$destination" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[1-9][0-9]*$ ]] || return 1
+    (( ${destination##*:} <= 65535 )) || return 1
+    egress+="${egress:+,}$destination"
+  done
+  mkdir -p "$(dirname "$record")" || return 1
+  temp="$(mktemp "${record}.XXXXXX")" || return 1
+  chmod 600 "$temp" || { rm -f -- "$temp"; return 1; }
+  {
+    printf 'schema=1\n'
+    printf 'owner_pid=%s\n' "$$"
+    printf 'owner_start=%s\n' "$owner_start"
+    printf 'vm_pid=%s\n' "$vm_pid"
+    printf 'vm_start=%s\n' "$vm_start"
+    printf 'tap=%s\n' "$IHAR_MICROVM_TAP"
+    printf 'chain=%s\n' "$IHAR_MICROVM_CHAIN"
+    printf 'guest_ip=%s\n' "$IHAR_MICROVM_GUEST_IP"
+    printf 'host_ip=%s\n' "$IHAR_MICROVM_HOST_IP"
+    printf 'gateway_port=%s\n' "$IHAR_GATEWAY_ACTIVE_PORT"
+    printf 'launch_id=%s\n' "$launch_id"
+    printf 'egress=%s\n' "$egress"
+    printf 'config_path=%s\n' "$config"
+    printf 'config_sha256=%s\n' "$config_sha256"
+    printf 'default=deny\n'
+  } > "$temp" || { rm -f -- "$temp"; return 1; }
+  mv -f -- "$temp" "$record" || { rm -f -- "$temp"; return 1; }
+}
+
+ihar_microvm_network_evidence_remove() {
+  local record
+  record="$(_ihar_microvm_network_evidence_path)" || return 0
+  rm -f -- "$record"
+}
+
+_ihar_microvm_network_evidence_read() {
+  local record
+  local -a lines=()
+  record="$(_ihar_microvm_network_evidence_path)" || return 1
+  [[ -f "$record" && ! -L "$record" ]] || return 1
+  mapfile -t lines < "$record" || return 1
+  (( ${#lines[@]} == 15 )) || return 1
+  [[ "${lines[0]}" == schema=1 ]] || return 1
+  _IHAR_MICROVM_EVIDENCE_OWNER="${lines[1]#owner_pid=}"
+  _IHAR_MICROVM_EVIDENCE_OWNER_START="${lines[2]#owner_start=}"
+  _IHAR_MICROVM_EVIDENCE_VM="${lines[3]#vm_pid=}"
+  _IHAR_MICROVM_EVIDENCE_VM_START="${lines[4]#vm_start=}"
+  _IHAR_MICROVM_EVIDENCE_TAP="${lines[5]#tap=}"
+  _IHAR_MICROVM_EVIDENCE_CHAIN="${lines[6]#chain=}"
+  _IHAR_MICROVM_EVIDENCE_GUEST="${lines[7]#guest_ip=}"
+  _IHAR_MICROVM_EVIDENCE_HOST="${lines[8]#host_ip=}"
+  _IHAR_MICROVM_EVIDENCE_PORT="${lines[9]#gateway_port=}"
+  _IHAR_MICROVM_EVIDENCE_LAUNCH="${lines[10]#launch_id=}"
+  _IHAR_MICROVM_EVIDENCE_EGRESS="${lines[11]#egress=}"
+  _IHAR_MICROVM_EVIDENCE_CONFIG="${lines[12]#config_path=}"
+  _IHAR_MICROVM_EVIDENCE_CONFIG_SHA256="${lines[13]#config_sha256=}"
+  _IHAR_MICROVM_EVIDENCE_DEFAULT="${lines[14]#default=}"
+  [[ "${lines[1]}" == owner_pid="$_IHAR_MICROVM_EVIDENCE_OWNER" \
+    && "${lines[2]}" == owner_start="$_IHAR_MICROVM_EVIDENCE_OWNER_START" \
+    && "${lines[3]}" == vm_pid="$_IHAR_MICROVM_EVIDENCE_VM" \
+    && "${lines[4]}" == vm_start="$_IHAR_MICROVM_EVIDENCE_VM_START" \
+    && "${lines[5]}" == tap="$_IHAR_MICROVM_EVIDENCE_TAP" \
+    && "${lines[6]}" == chain="$_IHAR_MICROVM_EVIDENCE_CHAIN" \
+    && "${lines[7]}" == guest_ip="$_IHAR_MICROVM_EVIDENCE_GUEST" \
+    && "${lines[8]}" == host_ip="$_IHAR_MICROVM_EVIDENCE_HOST" \
+    && "${lines[9]}" == gateway_port="$_IHAR_MICROVM_EVIDENCE_PORT" \
+    && "${lines[10]}" == launch_id="$_IHAR_MICROVM_EVIDENCE_LAUNCH" \
+    && "${lines[11]}" == egress="$_IHAR_MICROVM_EVIDENCE_EGRESS" \
+    && "${lines[12]}" == config_path="$_IHAR_MICROVM_EVIDENCE_CONFIG" \
+    && "${lines[13]}" == config_sha256="$_IHAR_MICROVM_EVIDENCE_CONFIG_SHA256" \
+    && "${lines[14]}" == default=deny ]] || return 1
+  [[ "$_IHAR_MICROVM_EVIDENCE_OWNER" =~ ^[1-9][0-9]*$ \
+    && "$_IHAR_MICROVM_EVIDENCE_OWNER_START" =~ ^[0-9]+$ \
+    && "$_IHAR_MICROVM_EVIDENCE_VM" =~ ^[1-9][0-9]*$ \
+    && "$_IHAR_MICROVM_EVIDENCE_VM_START" =~ ^[0-9]+$ \
+    && "$_IHAR_MICROVM_EVIDENCE_TAP" =~ ^[A-Za-z0-9_-]{1,15}$ \
+    && "$_IHAR_MICROVM_EVIDENCE_CHAIN" =~ ^[A-Za-z0-9_]{1,25}$ \
+    && "$_IHAR_MICROVM_EVIDENCE_GUEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ \
+    && "$_IHAR_MICROVM_EVIDENCE_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ \
+    && "$_IHAR_MICROVM_EVIDENCE_PORT" =~ ^[1-9][0-9]*$ \
+    && "$_IHAR_MICROVM_EVIDENCE_LAUNCH" =~ ^[A-Za-z0-9._-]+$ \
+    && "$_IHAR_MICROVM_EVIDENCE_CONFIG" != *$'\n'* \
+    && "$_IHAR_MICROVM_EVIDENCE_CONFIG" != *$'\t'* \
+    && "$_IHAR_MICROVM_EVIDENCE_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ \
+    && "$_IHAR_MICROVM_EVIDENCE_DEFAULT" == deny ]] || return 1
+  local destination
+  IFS=',' read -r -a _IHAR_MICROVM_EVIDENCE_EGRESS_ITEMS <<< \
+    "$_IHAR_MICROVM_EVIDENCE_EGRESS"
+  [[ -n "$_IHAR_MICROVM_EVIDENCE_EGRESS" ]] || _IHAR_MICROVM_EVIDENCE_EGRESS_ITEMS=()
+  for destination in "${_IHAR_MICROVM_EVIDENCE_EGRESS_ITEMS[@]}"; do
+    [[ "$destination" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[1-9][0-9]*$ ]] || return 1
+    (( ${destination##*:} <= 65535 )) || return 1
+  done
+}
+
+_ihar_microvm_link_active() { ip link show dev "$1" >/dev/null 2>&1; }
+
+_ihar_microvm_process_is_firecracker() {
+  local actual expected
+  actual="$(readlink -f "/proc/$1/exe" 2>/dev/null)" || return 1
+  expected="$(readlink -f "$IHAR_STORE/bin/firecracker" 2>/dev/null)" || return 1
+  [[ -n "$actual" && "$actual" == "$expected" ]]
+}
+
+_ihar_microvm_process_uses_config() {
+  local pid="$1" expected="$2" argument previous=""
+  while IFS= read -r -d '' argument; do
+    [[ "$previous" == --config-file && "$argument" == "$expected" ]] && return 0
+    previous="$argument"
+  done < "/proc/$pid/cmdline"
+  return 1
+}
+
+_ihar_microvm_config_matches_evidence() {
+  local actual
+  [[ -f "$_IHAR_MICROVM_EVIDENCE_CONFIG" && ! -L "$_IHAR_MICROVM_EVIDENCE_CONFIG" ]] \
+    || return 1
+  actual="$(sha256sum "$_IHAR_MICROVM_EVIDENCE_CONFIG" | cut -d' ' -f1)" || return 1
+  [[ "$actual" == "$_IHAR_MICROVM_EVIDENCE_CONFIG_SHA256" ]] || return 1
+  python3 - "$_IHAR_MICROVM_EVIDENCE_CONFIG" "$_IHAR_MICROVM_EVIDENCE_TAP" \
+    "$_IHAR_MICROVM_EVIDENCE_GUEST" "$_IHAR_MICROVM_EVIDENCE_HOST" \
+    "$IHAR_STORE/bin/vmlinux" <<'PY'
+import json, sys
+
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+    boot = data["boot-source"]
+    interfaces = data["network-interfaces"]
+except (OSError, KeyError, TypeError, ValueError):
+    raise SystemExit(1)
+
+expected_ip = f"ip={sys.argv[3]}::{sys.argv[4]}:255.255.255.252::eth0:off"
+valid = (
+    boot.get("kernel_image_path") == sys.argv[5]
+    and expected_ip in boot.get("boot_args", "").split()
+    and len(interfaces) == 1
+    and interfaces[0].get("host_dev_name") == sys.argv[2]
+)
+raise SystemExit(0 if valid else 1)
+PY
+}
+
+_ihar_microvm_network_rules_verified() {
+  local tap="$_IHAR_MICROVM_EVIDENCE_TAP" chain="$_IHAR_MICROVM_EVIDENCE_CHAIN"
+  local input_chain="${chain}_IN" port="$_IHAR_MICROVM_EVIDENCE_PORT"
+  local host="$_IHAR_MICROVM_EVIDENCE_HOST" marker="ihar:${_IHAR_MICROVM_EVIDENCE_LAUNCH}"
+  local guest="$_IHAR_MICROVM_EVIDENCE_GUEST" rules first second last count expected
+  local destination ip dport
+  rules="$(_ihar_microvm_iptables -S "$chain" 2>/dev/null)" || return 1
+  count="$(awk -v chain="$chain" '$1 == "-A" && $2 == chain {count++} END {print count + 0}' <<< "$rules")"
+  last="$(awk -v chain="$chain" '$1 == "-A" && $2 == chain {line=$0} END {print line}' <<< "$rules")"
+  expected=$(( ${#_IHAR_MICROVM_EVIDENCE_EGRESS_ITEMS[@]} + 2 ))
+  [[ "$count" == "$expected" && "$last" == "-A $chain -j DROP" ]] || return 1
+  rules="$(_ihar_microvm_iptables -S "$input_chain" 2>/dev/null)" || return 1
+  count="$(awk -v chain="$input_chain" '$1 == "-A" && $2 == chain {count++} END {print count + 0}' <<< "$rules")"
+  last="$(awk -v chain="$input_chain" '$1 == "-A" && $2 == chain {line=$0} END {print line}' <<< "$rules")"
+  [[ "$count" == 3 && "$last" == "-A $input_chain -j DROP" ]] || return 1
+  rules="$(_ihar_microvm_iptables -S FORWARD 2>/dev/null)" || return 1
+  first="$(awk '$1 == "-A" {print; exit}' <<< "$rules")"
+  second="$(awk '$1 == "-A" {count++; if (count == 2) {print; exit}}' <<< "$rules")"
+  [[ "$first" == "-A FORWARD -o $tap -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+    || "$first" == "-A FORWARD -o $tap -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" ]] \
+    || return 1
+  [[ "$second" == "-A FORWARD -i $tap -j $chain" ]] || return 1
+  rules="$(_ihar_microvm_iptables -S INPUT 2>/dev/null)" || return 1
+  first="$(awk '$1 == "-A" {print; exit}' <<< "$rules")"
+  [[ "$first" == "-A INPUT -i $tap -j $input_chain" ]] || return 1
+  _ihar_microvm_iptables -C "$chain" -j DROP >/dev/null 2>&1 \
+    && _ihar_microvm_iptables -C FORWARD -i "$tap" -j "$chain" >/dev/null 2>&1 \
+    && _ihar_microvm_iptables -C "$chain" -m conntrack \
+      --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 \
+    && _ihar_microvm_iptables -C FORWARD -o "$tap" -m conntrack \
+      --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 \
+    && _ihar_microvm_iptables -C "$input_chain" -j DROP >/dev/null 2>&1 \
+    && _ihar_microvm_iptables -C INPUT -i "$tap" -j "$input_chain" >/dev/null 2>&1 \
+    && _ihar_microvm_iptables -C "$input_chain" -m conntrack \
+      --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 \
+    && _ihar_microvm_iptables -C "$input_chain" -d 127.0.0.1 -p tcp \
+      --dport "$port" -j ACCEPT >/dev/null 2>&1 \
+    && _ihar_microvm_iptables -C INPUT -i "$tap" -p tcp --dport "$port" \
+      -m comment --comment "$marker" -j ACCEPT >/dev/null 2>&1 \
+    && _ihar_microvm_iptables -t nat -C PREROUTING -i "$tap" -d "$host" -p tcp \
+      --dport "$port" -m comment --comment "$marker" -j DNAT \
+      --to-destination "127.0.0.1:$port" >/dev/null 2>&1 \
+    || return 1
+  for destination in "${_IHAR_MICROVM_EVIDENCE_EGRESS_ITEMS[@]}"; do
+    ip="${destination%:*}"; dport="${destination##*:}"
+    _ihar_microvm_iptables -C "$chain" -d "$ip" -p tcp --dport "$dport" \
+      -j ACCEPT >/dev/null 2>&1 || return 1
+    _ihar_microvm_iptables -t nat -C POSTROUTING -s "$guest" -d "$ip" -p tcp \
+      --dport "$dport" -m comment --comment "$marker" -j MASQUERADE \
+      >/dev/null 2>&1 || return 1
+  done
+}
+
+# ihar_microvm_network_evidence — read-only, closed boolean facts for `ihar check`.
+ihar_microvm_network_evidence() {
+  local configured=false available=false active=false verified=false
+  if [[ "${IHAR_PROFILE_SANDBOX:-}" == microvm && -n "${IHAR_PROFILE_NETPOLICY:-}" ]]; then
+    configured=true
+    _ihar_microvm_assets_available && available=true
+    if _ihar_microvm_network_evidence_read \
+        && kill -0 "$_IHAR_MICROVM_EVIDENCE_OWNER" 2>/dev/null \
+        && [[ "$(_ihar_microvm_process_start_time "$_IHAR_MICROVM_EVIDENCE_OWNER")" \
+          == "$_IHAR_MICROVM_EVIDENCE_OWNER_START" ]] \
+        && kill -0 "$_IHAR_MICROVM_EVIDENCE_VM" 2>/dev/null \
+        && [[ "$(_ihar_microvm_process_start_time "$_IHAR_MICROVM_EVIDENCE_VM")" \
+          == "$_IHAR_MICROVM_EVIDENCE_VM_START" ]] \
+        && _ihar_microvm_process_is_firecracker "$_IHAR_MICROVM_EVIDENCE_VM" \
+        && _ihar_microvm_process_uses_config "$_IHAR_MICROVM_EVIDENCE_VM" \
+          "$_IHAR_MICROVM_EVIDENCE_CONFIG" \
+        && _ihar_microvm_config_matches_evidence \
+        && _ihar_microvm_link_active "$_IHAR_MICROVM_EVIDENCE_TAP"; then
+      active=true
+      if [[ "$available" == true ]] && _ihar_microvm_network_rules_verified; then
+        verified=true
+      fi
+    fi
+  fi
+  printf '{"configured":%s,"available":%s,"active":%s,"verified":%s}\n' \
+    "$configured" "$available" "$active" "$verified"
+}
+
 _ihar_microvm_coord_root() {
   local root
   root="${XDG_RUNTIME_DIR:-/tmp}/ihar-microvm-$(id -u)"
@@ -452,6 +733,7 @@ ihar_microvm_launch() {
     || ihar_die 3 "cannot create isolated TAP $tap"
   local pid="" socket="/tmp/ihar-${IHAR_LAUNCH_ID:-$$}.sock"
   _ihar_microvm_cleanup() {
+    ihar_microvm_network_evidence_remove
     [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true
     [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true
     ihar_microvm_network_remove
@@ -487,6 +769,8 @@ ihar_microvm_launch() {
     (( ticks++ < 60 )) || ihar_die 3 "microVM guest did not become ready"
     sleep 0.5
   done
+  ihar_microvm_network_evidence_write "$pid" "$config" \
+    || ihar_die 3 "cannot publish observed microVM network evidence"
 
   local env_file="$session/guest-env.sh" guest_script="$session/guest-run.sh" command
   ihar_microvm_write_guest_env "$env_file" "$vendor" "/mnt/ihar/runtime/$vendor"

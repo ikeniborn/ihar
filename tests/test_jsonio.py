@@ -96,7 +96,15 @@ CHECK_RESULT = {
             },
         }],
     },
-    "network": {"state": "not enforced", "scope": "none", "default": "allow"},
+    "network": {
+        "state": "not enforced",
+        "scope": "none",
+        "default": "allow",
+        "configured": False,
+        "available": False,
+        "active": False,
+        "verified": False,
+    },
     "vendors": {
         "claude": {"receipt": "verified", "hooks": [{"id": "security-pretool", "trust": "configured", **HOOK_DETAIL_EMPTY}], "conformance": "proven", "capabilities": ["fork", "remote-control"]},
         "codex": {"receipt": "missing receipt", "hooks": [{"id": "security-pretool", "trust": "trusted", "trusted_hash": "sha256:" + "a" * 64, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": "sha256:" + "a" * 64}], "conformance": "unproven", "capabilities": ["archive", "fork"]},
@@ -455,12 +463,97 @@ def test_check_result_gateway_metrics_availability_is_consistent():
 def test_check_result_network_state_matches_its_scope():
     rejects("check-result", {
         **CHECK_RESULT,
-        "network": {"state": "not enforced", "scope": "guest-boundary", "default": "deny"},
-    }, "network state")
+        "network": {**CHECK_RESULT["network"], "available": "false"},
+    }, "expected boolean")
     rejects("check-result", {
         **CHECK_RESULT,
-        "network": {"state": "enforced", "scope": "none", "default": "allow"},
-    }, "network state")
+        "network": {
+            **CHECK_RESULT["network"],
+            "configured": True,
+            "scope": "none",
+            "default": "deny",
+        },
+    }, "configured network boundary")
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "network": {
+            "state": "enforced",
+            "scope": "guest-boundary",
+            "default": "deny",
+            "configured": True,
+            "available": True,
+            "active": True,
+            "verified": False,
+        },
+    }, "observed network evidence")
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "network": {
+            "state": "not enforced",
+            "scope": "guest-boundary",
+            "default": "deny",
+            "configured": True,
+            "available": True,
+            "active": True,
+            "verified": True,
+        },
+    }, "observed network evidence")
+    enforced = {
+        "state": "enforced",
+        "scope": "guest-boundary",
+        "default": "deny",
+        "configured": True,
+        "available": True,
+        "active": True,
+        "verified": True,
+    }
+    jsonio.check("check-result", {**CHECK_RESULT, "network": enforced})
+
+
+def test_network_status_requires_observed_live_evidence_before_enforced():
+    from ihar import check_result
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "isolated.json"), "w", encoding="utf-8") as handle:
+            json.dump({
+                "schema": 1,
+                "name": "isolated",
+                "default": "deny",
+                "allow": [{"kind": "gateway", "reason": "test gateway"}],
+            }, handle)
+        names = (
+            "IHAR_PROFILE_SANDBOX",
+            "IHAR_PROFILE_NETPOLICY",
+            "_IHAR_CHECK_NETPOLICY_DIR",
+            "_IHAR_CHECK_NETWORK_EVIDENCE",
+        )
+        previous = {name: os.environ.get(name) for name in names}
+        try:
+            os.environ.update({
+                "IHAR_PROFILE_SANDBOX": "microvm",
+                "IHAR_PROFILE_NETPOLICY": "isolated",
+                "_IHAR_CHECK_NETPOLICY_DIR": tmp,
+                "_IHAR_CHECK_NETWORK_EVIDENCE": json.dumps({
+                    "configured": True,
+                    "available": True,
+                    "active": True,
+                    "verified": True,
+                }),
+            })
+            assert check_result._network_status()["state"] == "enforced"
+            os.environ["_IHAR_CHECK_NETWORK_EVIDENCE"] = json.dumps({
+                "configured": True,
+                "available": True,
+                "active": True,
+                "verified": False,
+            })
+            assert check_result._network_status()["state"] == "not enforced"
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def test_check_result_text_and_json_render_the_same_facts():
@@ -479,6 +572,9 @@ def test_check_result_text_and_json_render_the_same_facts():
     ):
         assert value in rendered, value
         assert value in encoded, value
+    for name in ("configured", "available", "active", "verified"):
+        assert f"{name} false" in rendered, name
+        assert f'"{name}": false' in encoded, name
     assert (
         "instance abcdef012345 mode explicit port 1234 pid 4321 "
         "consumers 2 healthy true"
