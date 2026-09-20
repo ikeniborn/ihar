@@ -33,6 +33,23 @@ assert_eq "JSON check carries per-hook trust facts" "True" \
   "$(python3 -c 'import json,sys; d=json.load(sys.stdin); required={"id","trust","trusted_hash","trustStatus","enabled","source","currentHash"}; print(bool(d["vendors"]["claude"]["hooks"]) and all(set(x)==required for x in d["vendors"]["claude"]["hooks"]+d["vendors"]["codex"]["hooks"]))' <<<"$json_check")"
 assert_contains "text and JSON check share the profile" "$(ihar check)" \
   "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["profile"]["name"])' <<<"$json_check")"
+assert_eq "standard reports no network enforcement" \
+  '{"default": "allow", "scope": "none", "state": "not enforced"}' \
+  "$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["network"], sort_keys=True))' <<<"$json_check")"
+
+protected_json="$(ihar --profile protected --json check)"
+assert_eq "protected does not claim whole-network enforcement" \
+  '{"default": "allow", "scope": "none", "state": "not enforced"}' \
+  "$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["network"], sort_keys=True))' <<<"$protected_json")"
+assert_contains "protected text names the absent network boundary" \
+  "$(ihar --profile protected check)" "network      not enforced (scope none, default allow)"
+
+isolated_json="$(ihar --profile isolated --json check)"
+assert_eq "isolated reports deny-by-default guest enforcement" \
+  '{"default": "deny", "scope": "guest-boundary", "state": "enforced"}' \
+  "$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["network"], sort_keys=True))' <<<"$isolated_json")"
+assert_contains "isolated text names the guest enforcement boundary" \
+  "$(ihar --profile isolated check)" "network      enforced (scope guest-boundary, default deny)"
 
 # Diff renders in temporary directories only. A runtime difference names vendor and
 # relative path while the persistent store/state/runtime bytes stay unchanged.

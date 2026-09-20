@@ -26,9 +26,22 @@ def render_text(result: dict) -> str:
         f"engine {result['masking']['engine']})",
         f"dropped env  {', '.join(result['masking']['dropped_env']) or 'none'}",
         f"gateway      {result['gateway']['mode']}",
-        f"network      {result['gateway']['network_policy'] or 'not enforced'}",
+        "network      "
+        f"{result['network']['state']} (scope {result['network']['scope']}, "
+        f"default {result['network']['default']})",
     ]
-    lines.extend(f"             {item}" for item in result["gateway"]["instances"])
+    for instance in result["gateway"]["instances"]:
+        lines.append(
+            f"             instance {instance['key']} mode {instance['mode']} "
+            f"port {_status_value(instance['port'])} pid {_status_value(instance['pid'])} "
+            f"consumers {instance['consumers']} healthy {_status_value(instance['healthy'])}"
+        )
+        metrics = instance["metrics"]
+        lines.append(
+            f"             metrics {metrics['state']} masked {_status_value(metrics['masked'])} "
+            f"refused {_status_value(metrics['refused'])} relayed {_status_value(metrics['relayed'])} "
+            f"uptime_seconds {_status_value(metrics['uptime_seconds'])}"
+        )
     for vendor in ("claude", "codex"):
         item = result["vendors"][vendor]
         hooks = ", ".join(_render_hook_text(hook) for hook in item["hooks"]) or "none"
@@ -64,6 +77,14 @@ def _render_hook_text(hook: dict) -> str:
         f"enabled {value('enabled')}; source {value('source')}; "
         f"currentHash {value('currentHash')}]"
     )
+
+
+def _status_value(value: object) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
 
 
 def _split_lines(name: str) -> list[str]:
@@ -249,9 +270,9 @@ def _collect(target: str) -> None:
         },
         "gateway": {
             "mode": os.environ["IHAR_PROFILE_GATEWAY"],
-            "network_policy": os.environ.get("IHAR_PROFILE_NETPOLICY") or None,
-            "instances": _split_lines("_IHAR_CHECK_GATEWAY_INSTANCES"),
+            "instances": json.loads(os.environ["_IHAR_CHECK_GATEWAY_INSTANCES"]),
         },
+        "network": _network_status(),
         "vendors": vendors,
         "assets": assets,
         "mcp": {
@@ -264,6 +285,23 @@ def _collect(target: str) -> None:
         "known_gaps": _split_lines("_IHAR_CHECK_KNOWN_GAPS"),
     }
     jsonio.write("check-result", target, result)
+
+
+def _network_status() -> dict:
+    policy_name = os.environ.get("IHAR_PROFILE_NETPOLICY", "")
+    default = "allow"
+    if policy_name:
+        policy = jsonio.read(
+            "netpolicy",
+            os.path.join(os.environ["_IHAR_CHECK_NETPOLICY_DIR"], f"{policy_name}.json"),
+        )
+        default = policy["default"]
+    enforced = os.environ["IHAR_PROFILE_SANDBOX"] == "microvm"
+    return {
+        "state": "enforced" if enforced else "not enforced",
+        "scope": "guest-boundary" if enforced else "none",
+        "default": default,
+    }
 
 
 def _sha256(path: str) -> str:

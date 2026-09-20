@@ -343,6 +343,29 @@ def _test_inventory_rules(obj: Mapping[str, Any]) -> None:
             )
 
 
+def _check_result_rules(obj: Mapping[str, Any]) -> None:
+    for instance in obj["gateway"]["instances"]:
+        for name in ("port", "pid"):
+            if isinstance(instance[name], bool):
+                raise SchemaError(f"check result: gateway {name} must be an integer or null")
+        metrics = instance["metrics"]
+        metric_names = ("masked", "refused", "relayed", "uptime_seconds")
+        values = [metrics[name] for name in metric_names]
+        for name in metric_names:
+            if isinstance(metrics[name], bool):
+                raise SchemaError(f"check result: gateway metric {name} must be an integer or null")
+        if metrics["state"] == "available" and any(value is None for value in values):
+            raise SchemaError("check result: available metrics must carry every counter")
+        if metrics["state"] == "unavailable" and any(value is not None for value in values):
+            raise SchemaError("check result: unavailable metrics must not fabricate counters")
+    expected_scope = "guest-boundary" if obj["network"]["state"] == "enforced" else "none"
+    if obj["network"]["scope"] != expected_scope:
+        raise SchemaError(
+            f"check result: network state {obj['network']['state']!r} "
+            f"requires scope {expected_scope!r}"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
@@ -752,8 +775,26 @@ KINDS: dict[str, dict[str, Any]] = {
             }},
             "gateway": {"type": dict, "fields": {
                 "mode": {"type": str, "enum": ("off", "explicit")},
-                "network_policy": _NULLABLE_STR,
-                "instances": {"type": list, "items": {"type": str, "min_len": 1}},
+                "instances": {"type": list, "items": {"type": dict, "fields": {
+                    "key": {"type": str, "pattern": r"[0-9a-f]{12}"},
+                    "mode": {"type": str, "enum": ("explicit",)},
+                    "port": {"type": (int, type(None)), "min": 1, "max": 65535},
+                    "pid": {"type": (int, type(None)), "min": 1},
+                    "consumers": {"type": int, "min": 0},
+                    "healthy": {"type": bool},
+                    "metrics": {"type": dict, "fields": {
+                        "state": {"type": str, "enum": ("available", "unavailable")},
+                        "masked": {"type": (int, type(None)), "min": 0},
+                        "refused": {"type": (int, type(None)), "min": 0},
+                        "relayed": {"type": (int, type(None)), "min": 0},
+                        "uptime_seconds": {"type": (int, type(None)), "min": 0},
+                    }},
+                }}},
+            }},
+            "network": {"type": dict, "fields": {
+                "state": {"type": str, "enum": ("enforced", "not enforced")},
+                "scope": {"type": str, "enum": ("none", "guest-boundary")},
+                "default": {"type": str, "enum": ("allow", "deny")},
             }},
             "vendors": {"type": dict, "fields": {
                 vendor: {"type": dict, "fields": {
@@ -786,7 +827,7 @@ KINDS: dict[str, dict[str, Any]] = {
             }},
             "known_gaps": {"type": list, "items": {"type": str, "min_len": 1}},
         },
-        "rules": [],
+        "rules": [_check_result_rules],
     },
 }
 

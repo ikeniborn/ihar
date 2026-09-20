@@ -66,7 +66,25 @@ CHECK_RESULT = {
     "schema": 1,
     "profile": {"name": "protected", "guarantee": "masked model egress"},
     "masking": {"level": "standard", "floor": "standard", "engine": "regex", "dropped_env": ["TOKEN"]},
-    "gateway": {"mode": "explicit", "network_policy": "protected", "instances": ["abc port 1234"]},
+    "gateway": {
+        "mode": "explicit",
+        "instances": [{
+            "key": "abcdef012345",
+            "mode": "explicit",
+            "port": 1234,
+            "pid": 4321,
+            "consumers": 2,
+            "healthy": True,
+            "metrics": {
+                "state": "available",
+                "masked": 3,
+                "refused": 1,
+                "relayed": 0,
+                "uptime_seconds": 15,
+            },
+        }],
+    },
+    "network": {"state": "not enforced", "scope": "none", "default": "allow"},
     "vendors": {
         "claude": {"receipt": "verified", "hooks": [{"id": "security-pretool", "trust": "configured", **HOOK_DETAIL_EMPTY}], "conformance": "proven", "capabilities": ["fork", "remote-control"]},
         "codex": {"receipt": "missing receipt", "hooks": [{"id": "security-pretool", "trust": "trusted", "trusted_hash": "sha256:" + "a" * 64, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": "sha256:" + "a" * 64}], "conformance": "unproven", "capabilities": ["archive", "fork"]},
@@ -308,6 +326,49 @@ def test_check_result_is_closed_and_covers_both_vendors():
     rejects("check-result", missing_codex, "codex")
 
 
+def test_check_result_gateway_metrics_availability_is_consistent():
+    unavailable = {
+        **CHECK_RESULT["gateway"]["instances"][0],
+        "healthy": False,
+        "metrics": {
+            "state": "unavailable",
+            "masked": None,
+            "refused": None,
+            "relayed": None,
+            "uptime_seconds": None,
+        },
+    }
+    jsonio.check("check-result", {
+        **CHECK_RESULT,
+        "gateway": {**CHECK_RESULT["gateway"], "instances": [unavailable]},
+    })
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "gateway": {**CHECK_RESULT["gateway"], "instances": [{
+            **unavailable,
+            "metrics": {**unavailable["metrics"], "refused": 0},
+        }]},
+    }, "unavailable metrics")
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "gateway": {**CHECK_RESULT["gateway"], "instances": [{
+            **CHECK_RESULT["gateway"]["instances"][0],
+            "metrics": {**CHECK_RESULT["gateway"]["instances"][0]["metrics"], "refused": True},
+        }]},
+    }, "refused")
+
+
+def test_check_result_network_state_matches_its_scope():
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "network": {"state": "not enforced", "scope": "guest-boundary", "default": "deny"},
+    }, "network state")
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "network": {"state": "enforced", "scope": "none", "default": "allow"},
+    }, "network state")
+
+
 def test_check_result_text_and_json_render_the_same_facts():
     from ihar import check_result
 
@@ -316,12 +377,21 @@ def test_check_result_text_and_json_render_the_same_facts():
     jsonio.check("check-result", json.loads(encoded))
     for value in (
         "protected", "masked model egress", "standard", "explicit", "verified", "missing receipt",
+        "abcdef012345", "1234", "4321", "available", "masked", "refused", "relayed",
+        "not enforced", "none", "allow",
         "commands", "security-pretool", "trusted", "trusted_hash", "trustStatus", "enabled",
         "source", "user", "currentHash", "sha256:" + "a" * 64,
         "missing TOKEN", "claude-agent-acp #144",
     ):
         assert value in rendered, value
         assert value in encoded, value
+    assert (
+        "instance abcdef012345 mode explicit port 1234 pid 4321 "
+        "consumers 2 healthy true"
+    ) in rendered
+    assert (
+        "metrics available masked 3 refused 1 relayed 0 uptime_seconds 15"
+    ) in rendered
 
 
 def test_codex_hook_facts_are_evaluated_per_hook_from_vendor_and_trust_records():

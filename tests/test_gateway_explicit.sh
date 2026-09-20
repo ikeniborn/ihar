@@ -126,6 +126,30 @@ metrics="$(curl -sS "http://127.0.0.1:$PORT/api/metrics" 2>/dev/null)"
 assert_contains "refusals are counted" "$metrics" '"refused"'
 assert_contains "and maskings are counted" "$metrics" '"masked"'
 
+# --- structured status ----------------------------------------------------------------------
+
+source "$ROOT/lib/core/logging.sh"
+source "$ROOT/lib/core/init.sh"
+source "$ROOT/lib/gateway/gateway.sh"
+live_key=abcdef012345
+live_dir="$IHAR_STATE_ROOT/gw/$live_key"
+stale_key=012345abcdef
+stale_dir="$IHAR_STATE_ROOT/gw/$stale_key"
+mkdir -p "$live_dir/consumers" "$stale_dir/consumers"
+printf '%s\n' "$GW_PID" > "$live_dir/pid"
+printf '%s\n' "$PORT" > "$live_dir/port"
+printf '%s\n' "$$" > "$live_dir/consumers/$$.pid"
+printf '%s\n' 999999 > "$stale_dir/pid"
+
+log_before="$(find "$IHAR_TEST_TMP/logs" -type f -print0 | sort -z | xargs -0 sha256sum)"
+status="$(ihar_gateway_status)"
+log_after="$(find "$IHAR_TEST_TMP/logs" -type f -print0 | sort -z | xargs -0 sha256sum)"
+assert_eq "gateway status is read-only" "$log_before" "$log_after"
+assert_eq "live gateway status carries typed identity health and metrics" "True" \
+  "$(python3 -c 'import json,sys; rows={x["key"]:x for x in json.load(sys.stdin)}; x=rows["abcdef012345"]; m=x["metrics"]; print(x["mode"]=="explicit" and x["port"]>0 and x["pid"]>0 and x["consumers"]==1 and x["healthy"] is True and m["state"]=="available" and all(isinstance(m[k],int) for k in ("masked","refused","relayed","uptime_seconds")))' <<<"$status")"
+assert_eq "stale gateway status uses explicit unavailable values" "True" \
+  "$(python3 -c 'import json,sys; rows={x["key"]:x for x in json.load(sys.stdin)}; x=rows["012345abcdef"]; m=x["metrics"]; print(x["port"] is None and x["pid"]==999999 and x["healthy"] is False and m=={"state":"unavailable","masked":None,"refused":None,"relayed":None,"uptime_seconds":None})' <<<"$status")"
+
 # --- a requested port is a preference, never a requirement -------------------------------------
 #
 # The caller remembers the port an instance last used, because the base_url rendered

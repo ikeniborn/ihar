@@ -151,15 +151,5 @@ _ihar_gateway_release_locked() {
 
 # ihar_gateway_status — every instance, for ihar check.
 ihar_gateway_status() {
-  local root="$IHAR_STATE_ROOT/gw" dir key pid port consumers
-  [[ -d "$root" ]] || return 0
-  for dir in "$root"/*/; do
-    [[ -d "$dir" ]] || continue
-    key="$(basename "$dir")"
-    pid="$(cat "$dir/pid" 2>/dev/null || echo -)"
-    port="$(cat "$dir/port" 2>/dev/null || echo -)"
-    consumers="$(find "$dir/consumers" -name '*.pid' 2>/dev/null | wc -l)"
-    printf '             instance %s port %s pid %s consumers %s\n' \
-      "$key" "$port" "$pid" "$consumers"
-  done
+  ihar_python ihar.gateway.status "$IHAR_STATE_ROOT/gw"
 }
