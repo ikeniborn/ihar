@@ -7,31 +7,8 @@
 # declared state files intentionally retain dangling links until the vendor creates
 # their canonical targets.
 #
-# Failure class: fail-soft for a link that cannot be made, because the vendor may not
-# need that entry; a caller whose profile depends on one verifies it separately.
-
-# Store entries, as `<store-relative source>:<runtime-relative name>`.
-_IHAR_STORE_LINKS_CLAUDE=(
-  "skills:skills"
-  "hooks:hooks"
-  "manifests/config/claude/commands:commands"
-  "manifests/config/claude/agents:agents"
-  "manifests/config/claude/scripts:scripts"
-  "manifests/config/claude/CLAUDE.md:CLAUDE.md"
-  "manifests/config/claude/router.json:router.json"
-  "plugins/claude:plugins"
-  "auth/claude/.credentials.json:.credentials.json"
-)
-
-_IHAR_STORE_LINKS_CODEX=(
-  "skills:skills"
-  "hooks:hooks"
-  "manifests/config/codex/rules:rules"
-  "manifests/config/codex/agents:agents"
-  "manifests/config/codex/profiles:profiles"
-  "plugins/codex:plugins"
-  "auth/codex/auth.json:auth.json"
-)
+# Failure class: fail-closed for a declared required store asset; fail-soft for an
+# optional link that cannot be made, because the vendor may not need that entry.
 
 ihar_state_inventory() {
   ihar_python ihar.inventory state "$IHAR_ROOT/manifests/state.json" "$1"
@@ -134,14 +111,21 @@ _ihar_link() {
 
 # ihar_link_runtime <vendor> <runtime-dir> <state-dir> — wire one runtime home.
 ihar_link_runtime() {
-  local vendor="$1" runtime="$2" state="$3" entry source name kind suffix inventory
+  local vendor="$1" runtime="$2" state="$3" source name kind required runtime_link suffix inventory
 
-  local -n store_links="_IHAR_STORE_LINKS_${vendor^^}"
-  for entry in "${store_links[@]}"; do
-    source="$IHAR_STORE/${entry%%:*}"
-    name="${entry##*:}"
+  while IFS=$'\t' read -r source name kind required runtime_link; do
+    [[ "$runtime_link" == true ]] || continue
+    source="$IHAR_STORE/$source"
+    if [[ ! -e "$source" ]]; then
+      if [[ "$required" == true ]]; then
+        ihar_die 3 "required runtime asset is missing from the store: $source"
+      fi
+      ihar_warn "optional runtime asset is missing from the store: $source"
+      continue
+    fi
+    mkdir -p "$(dirname "$runtime/$name")"
     _ihar_link "$source" "$runtime/$name"
-  done
+  done < <(ihar_asset_inventory "$vendor") || return 3
 
   inventory="$(ihar_state_inventory "$vendor")" \
     || { ihar_warn "cannot read $vendor state inventory"; return 3; }

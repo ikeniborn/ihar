@@ -18,7 +18,7 @@ IHAR_CODEX_RELEASE_URL="${IHAR_CODEX_RELEASE_URL:-https://github.com/openai/code
 IHAR_NPM_PACKAGE="${IHAR_NPM_PACKAGE:-@anthropic-ai/claude-code}"
 IHAR_NPM_BIN="${IHAR_NPM_BIN:-$IHAR_NVM/bin/npm}"
 # Mutable auth, plugins and unknown vendor data stay at their stable active paths.
-_IHAR_INSTALL_STORE_PATHS=(bin hooks manifests skills verification venv acp microvm)
+_IHAR_INSTALL_STORE_PATHS=(bin verification venv acp microvm)
 
 # ihar_download <url> <target> — one seam for every fetch.
 ihar_download() {
@@ -80,7 +80,12 @@ _ihar_activate_generation() { # <store-stage> <nvm-stage> <backup>
   local -a sources=() targets=() olds=() activated=() had_old=()
   mkdir -p "$backup/store" || return 1
 
-  for name in "${_IHAR_INSTALL_STORE_PATHS[@]}"; do
+  local -a install_paths=("${_IHAR_INSTALL_STORE_PATHS[@]}")
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && install_paths+=("$name")
+  done < <(ihar_asset_store_roots)
+
+  for name in "${install_paths[@]}"; do
     source="$store_stage/$name"
     [[ -e "$source" || -L "$source" ]] || continue
     sources+=("$source")
@@ -141,6 +146,7 @@ ihar_install_transaction() { # <install|update>
   local mode="$1" store_parent nvm_parent store_stage nvm_stage backup name status=0
   local active_store="$IHAR_STORE" active_nvm="$IHAR_NVM" active_npm="$IHAR_NPM_BIN"
   _IHAR_INSTALL_BACKUP_RETAIN=false
+  ihar_asset_validate "$IHAR_ROOT/manifests/assets.json" || return 3
   store_parent="$(dirname "$active_store")"
   nvm_parent="$(dirname "$active_nvm")"
   mkdir -p "$store_parent" "$nvm_parent" || return 1
@@ -306,23 +312,16 @@ ihar_install_microvm() {
 # The store
 # --------------------------------------------------------------------------- #
 
-# ihar_install_store — copy the tracked trees and verify their immutable release pins.
+# ihar_install_store — verify tracked assets already staged and release pins.
 #
 # Copied rather than symlinked into the checkout: the store is the trusted side of
 # the boundary, and a link would put an agent's writable working tree back on the
 # path a hook is loaded from.
 ihar_install_store() {
-  mkdir -p "$IHAR_STORE"/{bin,hooks,manifests,skills,auth/claude,auth/codex,plugins/claude,plugins/codex,verification,venv} \
+  ihar_asset_install "$IHAR_STORE" || return $?
+  mkdir -p "$IHAR_STORE"/{bin,auth/claude,auth/codex,plugins/claude,plugins/codex,verification,venv} \
     || ihar_die 1 "cannot create the store at $IHAR_STORE"
   chmod 700 "$IHAR_STORE/auth"
-
-  local tree
-  for tree in hooks manifests skills; do
-    [[ -d "$IHAR_ROOT/$tree" ]] || continue
-    rm -rf "${IHAR_STORE:?}/$tree"
-    cp -R "$IHAR_ROOT/$tree" "$IHAR_STORE/$tree" \
-      || ihar_die 1 "cannot copy $tree into the store"
-  done
 
   ihar_store_verify_hooks false
   ihar_info "store ready at $IHAR_STORE"

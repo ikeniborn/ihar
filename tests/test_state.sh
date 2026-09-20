@@ -8,6 +8,7 @@ ihar_sandbox
 source "$ROOT/lib/core/logging.sh"
 source "$ROOT/lib/core/init.sh"
 source "$ROOT/lib/core/lock.sh"
+source "$ROOT/lib/store/assets.sh"
 source "$ROOT/lib/state/state.sh"
 source "$ROOT/lib/state/links.sh"
 source "$ROOT/lib/state/runtime.sh"
@@ -20,6 +21,7 @@ assert_eq "legacy migration is explicit, never hidden in launch" "1" \
 IHAR_ROOT="$ROOT"; export IHAR_ROOT
 PROJECT="$IHAR_TEST_TMP/My Project"
 mkdir -p "$PROJECT"
+ihar_asset_install "$IHAR_STORE" >/dev/null
 
 # --- home id ---------------------------------------------------------------------
 
@@ -177,7 +179,6 @@ assert_exit "and leaves vendor-written state writable" 0 test -w "$sealed/logs_2
 
 # --- links -------------------------------------------------------------------------
 
-mkdir -p "$IHAR_STORE/skills" "$IHAR_STORE/hooks"
 rt2_hash="$(ihar_config_hash a b c d e f g h)"
 rt2="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER")"
 assert_exit "a present store entry is linked" 0 test -L "$rt2/skills"
@@ -286,6 +287,19 @@ ln -sfn /nowhere "$rt2/hooks"
 ihar_link_runtime claude "$rt2" "$STATE" 2>/dev/null
 assert_eq "a wrong link is repointed" "$IHAR_STORE/hooks" "$(readlink "$rt2/hooks")"
 
+# Runtime links are a projection of the installed tracked-asset inventory: every
+# runtime entry must be present, while a store pathname absent from that inventory
+# is never linked merely because it happens to exist.
+mkdir -p "$IHAR_STORE/undeclared"
+printf 'not portable\n' > "$IHAR_STORE/undeclared/data"
+rt_assets="$(ihar_runtime_materialise codex "$(ihar_config_hash asset inventory runtime links a b c d)" "$RENDER")"
+while IFS=$'\t' read -r source target kind required runtime; do
+  [[ "$runtime" == true ]] || continue
+  [[ -e "$IHAR_STORE/$source" ]] || continue
+  assert_exit "runtime asset $target is linked" 0 test -L "$rt_assets/$target"
+done < <(ihar_asset_inventory codex)
+assert_exit "an undeclared store entry is never linked" 1 test -e "$rt_assets/undeclared"
+
 # Both runtime linking and migration consume one validated inventory. This fixture
 # is intentionally outside the repository so adding an entry proves neither path
 # depends on a second hard-coded Bash list.
@@ -311,6 +325,7 @@ cat > "$MANIFEST_ROOT/manifests/state.json" <<'JSON'
   ]
 }
 JSON
+printf '{"schema":1,"entries":[]}\n' > "$MANIFEST_ROOT/manifests/assets.json"
 printf 'db\n' > "$MANIFEST_LEGACY/state.sqlite"
 printf 'wal\n' > "$MANIFEST_LEGACY/state.sqlite-wal"
 printf 'shm\n' > "$MANIFEST_LEGACY/state.sqlite-shm"

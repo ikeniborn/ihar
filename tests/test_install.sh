@@ -19,6 +19,7 @@ source "$ROOT/lib/core/logging.sh"
 source "$ROOT/lib/core/init.sh"
 source "$ROOT/lib/core/lock.sh"
 source "$ROOT/lib/store/lockfile.sh"
+source "$ROOT/lib/store/assets.sh"
 source "$ROOT/lib/store/install.sh"
 
 export IHAR_CLAUDE_BIN="$IHAR_NVM/npm-global/bin/claude"
@@ -65,6 +66,27 @@ assert_eq "install never rewrites release lock" "$before_lock" \
 # The store is copied, never linked: a link would put the agent's writable checkout
 # back on the path a hook is loaded from.
 assert_exit "the store is a copy, not a link into the checkout" 1 test -L "$IHAR_STORE/hooks"
+
+# Required asset inputs are checked before an install transaction can touch the
+# active store. Optional sources stay visible for check collection without blocking
+# publication.
+ASSET_ROOT="$IHAR_TEST_TMP/assets-root"
+ASSET_STAGE="$IHAR_TEST_TMP/assets-stage"
+mkdir -p "$ASSET_ROOT/manifests" "$ASSET_ROOT/hooks"
+printf '{"schema":1,"entries":[{"vendor":"common","source":"hooks","target":"hooks","kind":"directory","required":true,"runtime":true},{"vendor":"claude","source":"extensions","target":"extensions","kind":"directory","required":false,"runtime":true}]}\n' \
+  > "$ASSET_ROOT/manifests/assets.json"
+printf 'active asset generation\n' > "$IHAR_STORE/asset-generation"
+asset_fingerprint_before="$(sha256sum "$IHAR_STORE/asset-generation" | cut -d' ' -f1)"
+rm -rf "$ASSET_ROOT/hooks"
+assert_exit "a missing required asset aborts before transaction publication" 3 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/install.sh'; PYTHONPATH='$ROOT/lib/python' IHAR_ROOT='$ASSET_ROOT' IHAR_STORE='$IHAR_STORE' IHAR_NVM='$IHAR_NVM' ihar_install_transaction install"
+assert_eq "a missing required asset preserves the active store fingerprint" \
+  "$asset_fingerprint_before" "$(sha256sum "$IHAR_STORE/asset-generation" | cut -d' ' -f1)"
+mkdir -p "$ASSET_ROOT/hooks"
+optional_assets="$(IHAR_ROOT="$ASSET_ROOT" ihar_asset_install "$ASSET_STAGE")"
+assert_contains "a missing optional asset emits a stable diagnostic" "$optional_assets" \
+  $'optional\tmissing\textensions\textensions'
+assert_exit "a missing optional asset does not block asset staging" 0 test -d "$ASSET_STAGE/hooks"
 
 # --- the command on PATH -------------------------------------------------------------------
 

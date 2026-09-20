@@ -296,6 +296,24 @@ def _state_manifest_rules(obj: Mapping[str, Any]) -> None:
         keys.add(key)
 
 
+def _asset_manifest_rules(obj: Mapping[str, Any]) -> None:
+    forbidden = {"auth", "cache", "caches", "plugins", "st", "transcripts"}
+    generated = {"settings.json", "config.toml", "router.json"}
+    keys: set[tuple[str, str]] = set()
+    for entry in obj["entries"]:
+        key = (entry["vendor"], entry["target"])
+        if key in keys:
+            raise SchemaError(
+                f"asset manifest: duplicate target for vendor {key[0]!r} and target {key[1]!r}"
+            )
+        keys.add(key)
+        parts = set(entry["source"].split("/")) | set(entry["target"].split("/"))
+        if forbidden & parts or any(part.endswith(".cache") for part in parts):
+            raise SchemaError("asset manifest: authentication, caches, plugins, transcripts and state are not tracked assets")
+        if generated & parts:
+            raise SchemaError("asset manifest: generated settings are not tracked assets")
+
+
 # --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
@@ -659,6 +677,26 @@ KINDS: dict[str, dict[str, Any]] = {
             },
         },
         "rules": [_state_manifest_rules],
+    },
+    "asset-manifest": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "entries": {
+                "type": list,
+                "items": {
+                    "type": dict,
+                    "fields": {
+                        "vendor": {"type": str, "enum": ("common", *_VENDOR)},
+                        "source": {"type": str, "pattern": _SAFE_REL},
+                        "target": {"type": str, "pattern": _SAFE_REL},
+                        "kind": {"type": str, "enum": ("directory", "file")},
+                        "required": {"type": bool},
+                        "runtime": {"type": bool},
+                    },
+                },
+            },
+        },
+        "rules": [_asset_manifest_rules],
     },
 }
 

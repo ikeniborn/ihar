@@ -166,7 +166,7 @@ accept "a nested script path inside the hooks directory is accepted" hook-manife
 
 for kind in profile netpolicy hook-manifest mcp-registry capabilities session \
             launch-claim handoff daemon-record conformance home-marker lockfile \
-            install-receipt state-manifest; do
+            install-receipt state-manifest asset-manifest; do
   assert_exit "contract kind '$kind' is registered" 0 py "
 import sys
 from ihar import jsonio
@@ -178,6 +178,30 @@ done
 assert_exit "the persistent-state manifest validates" 0 \
   py 'import sys; from ihar import jsonio; jsonio.read("state-manifest", sys.argv[1])' \
   "$ROOT/manifests/state.json"
+
+# --- tracked assets are one safe, explicit inventory -----------------------------
+
+asset_entry="{'vendor':'common','source':'hooks','target':'hooks','kind':'directory',
+             'required':True,'runtime':False}"
+
+accept "a minimal asset inventory entry is accepted" asset-manifest \
+  "{'schema':1,'entries':[$asset_entry]}"
+reject "an asset source that escapes its root is rejected" asset-manifest \
+  "{'schema':1,'entries':[{**$asset_entry,'source':'../auth'}]}"
+reject "an asset target that escapes its runtime is rejected" asset-manifest \
+  "{'schema':1,'entries':[{**$asset_entry,'target':'../hooks'}]}"
+reject "authentication is not a tracked asset" asset-manifest \
+  "{'schema':1,'entries':[{**$asset_entry,'source':'auth/claude'}]}"
+reject "generated settings are not tracked assets" asset-manifest \
+  "{'schema':1,'entries':[{**$asset_entry,'target':'settings.json'}]}"
+reject "state is not a tracked asset" asset-manifest \
+  "{'schema':1,'entries':[{**$asset_entry,'source':'st/codex'}]}"
+reject "an asset target is unique per vendor" asset-manifest \
+  "{'schema':1,'entries':[$asset_entry, {**$asset_entry,'source':'skills'}]}"
+
+assert_exit "the tracked-asset manifest validates" 0 \
+  py 'import sys; from ihar import jsonio; jsonio.read("asset-manifest", sys.argv[1])' \
+  "$ROOT/manifests/assets.json"
 
 assert_exit "the tracked release lockfile validates" 0 \
   py 'import sys; from ihar import jsonio; jsonio.read("lockfile", sys.argv[1])' \
