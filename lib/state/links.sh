@@ -111,8 +111,9 @@ _ihar_link() {
 
 # ihar_link_runtime <vendor> <runtime-dir> <state-dir> — wire one runtime home.
 ihar_link_runtime() {
-  local vendor="$1" runtime="$2" state="$3" source name kind required runtime_link suffix inventory
+  local vendor="$1" runtime="$2" state="$3" asset_inventory source name kind required runtime_link suffix inventory
 
+  asset_inventory="$(ihar_asset_inventory "$vendor")" || return 3
   while IFS=$'\t' read -r source name kind required runtime_link; do
     [[ "$runtime_link" == true ]] || continue
     source="$IHAR_STORE/$source"
@@ -125,7 +126,7 @@ ihar_link_runtime() {
     fi
     mkdir -p "$(dirname "$runtime/$name")"
     _ihar_link "$source" "$runtime/$name"
-  done < <(ihar_asset_inventory "$vendor") || return 3
+  done <<< "$asset_inventory"
 
   inventory="$(ihar_state_inventory "$vendor")" \
     || { ihar_warn "cannot read $vendor state inventory"; return 3; }

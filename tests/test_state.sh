@@ -300,6 +300,28 @@ while IFS=$'\t' read -r source target kind required runtime; do
 done < <(ihar_asset_inventory codex)
 assert_exit "an undeclared store entry is never linked" 1 test -e "$rt_assets/undeclared"
 
+# The complete asset inventory is read and validated before the linker touches a
+# runtime target. A malformed manifest must therefore preserve an existing target
+# byte-for-byte instead of silently falling through to state linking.
+INVALID_ASSET_ROOT="$IHAR_TEST_TMP/invalid-asset-root"
+INVALID_ASSET_RUNTIME="$IHAR_TEST_TMP/invalid-asset-runtime"
+INVALID_ASSET_STATE="$IHAR_TEST_TMP/invalid-asset-state"
+mkdir -p "$INVALID_ASSET_ROOT/manifests" "$INVALID_ASSET_RUNTIME/hooks" "$INVALID_ASSET_STATE"
+ln -s "$ROOT/lib" "$INVALID_ASSET_ROOT/lib"
+printf 'not valid JSON\n' > "$INVALID_ASSET_ROOT/manifests/assets.json"
+printf '{"schema":1,"entries":[]}\n' > "$INVALID_ASSET_ROOT/manifests/state.json"
+printf 'runtime target must remain\n' > "$INVALID_ASSET_RUNTIME/hooks/sentinel"
+invalid_asset_fingerprint="$(find "$INVALID_ASSET_RUNTIME" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+invalid_asset_status=0
+invalid_asset_out="$(IHAR_ROOT="$INVALID_ASSET_ROOT" ihar_link_runtime claude "$INVALID_ASSET_RUNTIME" "$INVALID_ASSET_STATE" 2>&1)" \
+  || invalid_asset_status=$?
+assert_eq "an invalid asset inventory aborts linking" "3" "$invalid_asset_status"
+assert_contains "an invalid asset inventory is diagnosed" "$invalid_asset_out" \
+  "cannot read tracked asset inventory"
+assert_eq "an invalid asset inventory leaves runtime targets unchanged" \
+  "$invalid_asset_fingerprint" \
+  "$(find "$INVALID_ASSET_RUNTIME" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+
 # Both runtime linking and migration consume one validated inventory. This fixture
 # is intentionally outside the repository so adding an entry proves neither path
 # depends on a second hard-coded Bash list.
