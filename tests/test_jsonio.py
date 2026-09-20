@@ -140,6 +140,19 @@ def test_unknown_key_is_an_error_not_a_warning():
     rejects("profile", {**PROFILE, "surprise": 1}, "unknown key")
 
 
+def test_state_manifest_rejects_overlapping_paths():
+    """One runtime pathname must have one manifest owner; otherwise migration
+    cannot preserve and publish both entries independently."""
+    overlapping = {
+        "schema": 1,
+        "entries": [
+            {"vendor": "codex", "path": "sessions", "kind": "directory"},
+            {"vendor": "codex", "path": "sessions/archive", "kind": "directory"},
+        ],
+    }
+    rejects("state-manifest", overlapping, "overlapping paths")
+
+
 def test_missing_key_is_reported_by_name():
     incomplete = {key: value for key, value in PROFILE.items() if key != "acp"}
     rejects("profile", incomplete, "missing required key 'acp'")

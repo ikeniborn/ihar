@@ -696,6 +696,9 @@ with open(path, "w", encoding="utf-8") as handle:
     json.dump(manifest, handle)
 PY
 printf 'added\n' > "$MANIFEST_LEGACY/added.jsonl"
+manifest_runtime_hash_added="$(ihar_config_hash manifest reuse state links a b c d)"
+assert_exit "a state-manifest change selects a new runtime generation" 1 \
+  test "$manifest_runtime_hash" = "$manifest_runtime_hash_added"
 MANIFEST_LINK_STATE_ADDED="$IHAR_TEST_TMP/manifest-link-state-added"
 MANIFEST_MIGRATE_STATE_ADDED="$IHAR_TEST_TMP/manifest-migrate-state-added"
 MANIFEST_RUNTIME_ADDED="$IHAR_TEST_TMP/manifest-runtime-added"
@@ -703,15 +706,51 @@ mkdir -p "$MANIFEST_LINK_STATE_ADDED/st/codex" \
   "$MANIFEST_MIGRATE_STATE_ADDED/st/codex" "$MANIFEST_RUNTIME_ADDED"
 assert_eq "manifest additions reach linker and migration without Bash array edits" \
   "$(state_inventory codex)" "$(migration_inventory codex)"
-ihar_runtime_materialise codex "$manifest_runtime_hash" "$RENDER" >/dev/null
-assert_eq "runtime reuse links an entry added after publication" \
+ihar_runtime_materialise codex "$manifest_runtime_hash_added" "$RENDER" >/dev/null
+MANIFEST_REUSE_RUNTIME_ADDED="$IHAR_RUNTIME"
+assert_exit "an incompatible state inventory does not reuse the old runtime" 1 \
+  test "$MANIFEST_REUSE_RUNTIME" = "$MANIFEST_REUSE_RUNTIME_ADDED"
+assert_eq "the new runtime generation links the added entry" \
   "$MANIFEST_LINK_STATE/st/codex/added.jsonl" \
-  "$(readlink "$MANIFEST_REUSE_RUNTIME/added.jsonl")"
+  "$(readlink "$MANIFEST_REUSE_RUNTIME_ADDED/added.jsonl")"
 ihar_link_runtime codex "$MANIFEST_RUNTIME_ADDED" "$MANIFEST_LINK_STATE_ADDED" 2>/dev/null
 assert_exit "the added file is linked" 0 test -L "$MANIFEST_RUNTIME_ADDED/added.jsonl"
 ihar_migrate_vendor codex "$MANIFEST_MIGRATE_STATE_ADDED" "$MANIFEST_PROJECT" >/dev/null
 assert_exit "the added file is migrated" 0 \
   test -f "$MANIFEST_MIGRATE_STATE_ADDED/st/codex/added.jsonl"
+
+# A pre-manifest runtime may own vendor state as real files/directories. Creating a
+# generation keyed by the current manifest migrates exactly one old owner, keeps a
+# private recovery copy, and links both old and new runtimes to canonical st/.
+UPGRADE_STATE="$IHAR_TEST_TMP/runtime-upgrade-state"
+UPGRADE_OLD="$UPGRADE_STATE/r/11111111/codex"
+mkdir -p "$UPGRADE_STATE/st/codex" "$UPGRADE_OLD/data"
+printf 'old runtime record\n' > "$UPGRADE_OLD/data/record"
+printf 'old runtime db\n' > "$UPGRADE_OLD/state.sqlite"
+printf 'old runtime wal\n' > "$UPGRADE_OLD/state.sqlite-wal"
+printf 'old runtime shm\n' > "$UPGRADE_OLD/state.sqlite-shm"
+IHAR_STATE="$UPGRADE_STATE"
+upgrade_hash="$(ihar_config_hash runtime upgrade manifest identity a b c d)"
+ihar_runtime_materialise codex "$upgrade_hash" "$RENDER" >/dev/null
+UPGRADE_NEW="$IHAR_RUNTIME"
+assert_eq "runtime upgrade publishes materialized directory state" "old runtime record" \
+  "$(cat "$UPGRADE_STATE/st/codex/data/record")"
+assert_eq "runtime upgrade publishes the SQLite WAL" "old runtime wal" \
+  "$(cat "$UPGRADE_STATE/st/codex/state.sqlite-wal")"
+assert_eq "runtime upgrade replaces the old directory with a canonical link" \
+  "$UPGRADE_STATE/st/codex/data" "$(readlink "$UPGRADE_OLD/data")"
+assert_eq "the new runtime links the migrated directory" \
+  "$UPGRADE_STATE/st/codex/data" "$(readlink "$UPGRADE_NEW/data")"
+upgrade_recovery="$(find "$UPGRADE_STATE/recovery/runtime-state/codex" \
+  -mindepth 1 -maxdepth 1 -type d -name '11111111-*' -print -quit)"
+assert_eq "runtime upgrade preserves the original recovery bytes" "old runtime record" \
+  "$(cat "$upgrade_recovery/data/record")"
+recovery_count_before="$(find "$UPGRADE_STATE/recovery/runtime-state/codex" \
+  -mindepth 1 -maxdepth 1 -type d | wc -l)"
+ihar_runtime_materialise codex "$upgrade_hash" "$RENDER" >/dev/null
+assert_eq "runtime upgrade is idempotent" "$recovery_count_before" \
+  "$(find "$UPGRADE_STATE/recovery/runtime-state/codex" \
+    -mindepth 1 -maxdepth 1 -type d | wc -l)"
 IHAR_STATE="$SAVED_IHAR_STATE"
 IHAR_RUNTIME="$SAVED_IHAR_RUNTIME"
 IHAR_ROOT="$SAVED_IHAR_ROOT"

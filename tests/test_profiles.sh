@@ -192,7 +192,10 @@ IHAR_STATE="$PROJECT/state" IHAR_PROFILE=protected IHAR_PROFILE_MASKING_LEVEL=st
   IHAR_GATEWAY_MODE=off ihar_render_config claude "$lifecycle_render"
 settings="$(cat "$lifecycle_render/settings.json")"
 lifecycle_roots="$(python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["sandbox"]["filesystem"]["denyWrite"]))' <<<"$settings")"
-final_runtime="$PROJECT/state/r/ed832395/claude"
+final_hash="$(printf '%s\n' \
+  protected standard off vendor true hooks-fixture registry-fixture claude-2.1.274 \
+  "$(ihar_state_manifest_digest)" | sha256sum | cut -c1-8)"
+final_runtime="$PROJECT/state/r/$final_hash/claude"
 assert_contains "Claude denies the final selected runtime" "$lifecycle_roots" "$final_runtime"
 assert_eq "Claude does not substitute the temporary render path" "0" \
   "$(grep -cxF "$lifecycle_render" <<<"$lifecycle_roots")"

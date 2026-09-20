@@ -22,6 +22,7 @@
     "tests/test_mcp.sh",
     "tests/test_microvm.sh",
     "tests/test_profiles.sh",
+    "tests/test_runtime_state_upgrade.py",
     "tests/test_sessions.sh",
     "tests/test_sessions_readers.py",
     "tests/test_state.sh",

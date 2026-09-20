@@ -305,6 +305,7 @@ def _conformance_rules(obj: Mapping[str, Any]) -> None:
 
 def _state_manifest_rules(obj: Mapping[str, Any]) -> None:
     keys: set[tuple[str, str]] = set()
+    paths: dict[str, list[str]] = {}
     for entry in obj["entries"]:
         key = (entry["vendor"], entry["path"])
         if key in keys:
@@ -312,6 +313,16 @@ def _state_manifest_rules(obj: Mapping[str, Any]) -> None:
                 f"state manifest: duplicate entry for vendor {key[0]!r} and path {key[1]!r}"
             )
         keys.add(key)
+        paths.setdefault(entry["vendor"], []).append(entry["path"])
+    for vendor, vendor_paths in paths.items():
+        ordered = sorted(vendor_paths)
+        for index, path in enumerate(ordered):
+            for other in ordered[index + 1 :]:
+                if other.startswith(path + "/"):
+                    raise SchemaError(
+                        f"state manifest: overlapping paths for vendor {vendor!r}: "
+                        f"{path!r} and {other!r}"
+                    )
 
 
 def _asset_manifest_rules(obj: Mapping[str, Any]) -> None:

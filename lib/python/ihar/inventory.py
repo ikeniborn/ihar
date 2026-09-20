@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import stat
 import sys
@@ -17,6 +19,15 @@ def state_entries(
     for entry in document["entries"]:
         if entry["vendor"] == vendor:
             yield entry["path"], entry["kind"]
+
+
+def state_manifest_digest(manifest: str | os.PathLike[str]) -> str:
+    """Return a stable digest of the validated semantic manifest document."""
+    document = jsonio.read("state-manifest", manifest)
+    encoded = json.dumps(
+        document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def asset_entries(
@@ -173,7 +184,7 @@ def prepare_mutable_sources(
 
 
 def main(argv: list[str]) -> int:
-    query_commands = ("state", "assets", "mutable-links")
+    query_commands = ("state", "state-digest", "assets", "mutable-links")
     mutable_commands = ("mutable-preflight", "mutable-prepare")
     if len(argv) not in (3, 4) or argv[0] not in (*query_commands, *mutable_commands):
         return 2
@@ -186,6 +197,8 @@ def main(argv: list[str]) -> int:
         if command == "state":
             for path, kind in state_entries(manifest, vendor):
                 print(f"{path}\t{kind}")
+        elif command == "state-digest":
+            print(state_manifest_digest(manifest))
         elif command == "assets":
             for source, target, kind, required, runtime in asset_entries(manifest, vendor):
                 print(f"{source}\t{target}\t{kind}\t{str(required).lower()}\t{str(runtime).lower()}")
