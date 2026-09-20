@@ -57,13 +57,17 @@ ihar_verify_runtime_state_links() {
     fi
   done <<< "$inventory"
 
-  # Validate the complete set before repairing anything. A fail-closed result must
-  # not leave half the runtime relinked while a materialised state entry remains.
+  # Validate the complete set before creating anything. A fail-closed result must
+  # not leave half the runtime linked while an unsafe state entry remains.
   for entry in "${entries[@]}"; do
     name="${entry%%$'\t'*}"
+    source="$state/st/$vendor/$name"
     target="$runtime/$name"
-    if [[ -e "$target" && ! -L "$target" ]]; then
-      source="$state/st/$vendor/$name"
+    if [[ -L "$target" ]]; then
+      if [[ "$(readlink "$target")" != "$source" ]]; then
+        ihar_die 3 "runtime state link $target points to $(readlink "$target"), not $source, and was preserved; remove or recover the wrong link, then retry"
+      fi
+    elif [[ -e "$target" ]]; then
       ihar_die 3 "runtime state entry $target is materialised and was preserved; move it to a recovery location, then retry so ihar can link $source"
     fi
   done
@@ -74,16 +78,6 @@ ihar_verify_runtime_state_links() {
     source="$state/st/$vendor/$name"
     target="$runtime/$name"
 
-    if [[ -L "$target" ]]; then
-      [[ "$(readlink "$target")" == "$source" ]] && continue
-      rm -f "$target" \
-        || ihar_die 3 "cannot remove wrong state link $target"
-    elif [[ -e "$target" ]]; then
-      # Recheck after validation: a vendor may have materialised the entry while
-      # this runtime was active. Preserve it and fail exactly as in the first pass.
-      ihar_die 3 "runtime state entry $target is materialised and was preserved; move it to a recovery location, then retry so ihar can link $source"
-    fi
-
     if [[ "$kind" == directory ]]; then
       mkdir -p "$source" \
         || ihar_die 3 "cannot create canonical state directory $source"
@@ -91,6 +85,19 @@ ihar_verify_runtime_state_links() {
       mkdir -p "$(dirname "$source")" \
         || ihar_die 3 "cannot create canonical state parent for $source"
     fi
+
+    # Recheck after validation: an active vendor may have changed the pathname.
+    # Never unlink during reuse; preserving a wrong or materialised entry is safer
+    # than racing a vendor write.
+    if [[ -L "$target" ]]; then
+      if [[ "$(readlink "$target")" != "$source" ]]; then
+        ihar_die 3 "runtime state link $target points to $(readlink "$target"), not $source, and was preserved; remove or recover the wrong link, then retry"
+      fi
+      continue
+    elif [[ -e "$target" ]]; then
+      ihar_die 3 "runtime state entry $target is materialised and was preserved; move it to a recovery location, then retry so ihar can link $source"
+    fi
+
     mkdir -p "$(dirname "$target")" \
       || ihar_die 3 "cannot create runtime state parent for $target"
     ln -s "$source" "$target" \

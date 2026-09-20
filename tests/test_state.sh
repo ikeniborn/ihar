@@ -186,9 +186,19 @@ assert_exit "vendor state is linked out of the runtime home" 0 test -L "$rt2/pro
 assert_eq "vendor state resolves into st/" "$STATE/st/claude/projects" \
   "$(readlink "$rt2/projects")"
 
-# Reusing an already-published runtime verifies rendered files first, then repairs
-# every manifest-derived state link. Repair only replaces runtime entries; canonical
-# state is never populated from a materialised runtime fork.
+rm "$rt2/projects"
+rmdir "$STATE/st/claude/projects"
+ln -s "$STATE/st/claude/projects" "$rt2/projects"
+ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null
+assert_exit "runtime reuse creates the source for a correct dangling directory link" 0 \
+  test -d "$STATE/st/claude/projects"
+assert_eq "runtime reuse keeps the correct directory link" \
+  "$STATE/st/claude/projects" "$(readlink "$rt2/projects")"
+mkdir -p "$STATE/st/claude/projects"
+
+# Reusing an already-published runtime verifies rendered files first, then verifies
+# every manifest-derived state link. Missing links are created; unsafe entries are
+# preserved and rejected, so canonical state is never populated from a runtime fork.
 printf 'canonical directory\n' > "$STATE/st/claude/projects/canonical"
 rm "$rt2/projects"
 ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null
@@ -199,11 +209,18 @@ printf 'canonical file\n' > "$STATE/st/claude/history.jsonl"
 WRONG_STATE_TARGET="$IHAR_TEST_TMP/wrong-state-target"
 printf 'wrong target stays intact\n' > "$WRONG_STATE_TARGET"
 ln -sfn "$WRONG_STATE_TARGET" "$rt2/history.jsonl"
-ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null 2>&1
-assert_eq "runtime reuse repoints a wrong state file link" \
-  "$STATE/st/claude/history.jsonl" "$(readlink "$rt2/history.jsonl")"
-assert_eq "repointing a wrong state link preserves its target" "wrong target stays intact" \
+wrong_state_status=0
+wrong_state_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || wrong_state_status=$?
+assert_eq "runtime reuse rejects a wrong state symlink" "3" "$wrong_state_status"
+assert_contains "wrong state link diagnostics give an explicit recovery step" \
+  "$wrong_state_out" "remove or recover the wrong link"
+assert_eq "runtime reuse preserves the wrong state symlink target" \
+  "$WRONG_STATE_TARGET" "$(readlink "$rt2/history.jsonl")"
+assert_eq "rejecting a wrong state link preserves its referent" "wrong target stays intact" \
   "$(cat "$WRONG_STATE_TARGET")"
+rm -f "$rt2/history.jsonl"
+ln -s "$STATE/st/claude/history.jsonl" "$rt2/history.jsonl"
 
 printf 'canonical dotfile\n' > "$STATE/st/claude/.claude.json"
 rm "$rt2/.claude.json"
