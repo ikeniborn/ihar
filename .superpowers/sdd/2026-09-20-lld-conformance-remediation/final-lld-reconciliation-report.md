@@ -2,7 +2,7 @@
 
 ## Status
 
-Completion-pending. `docs/lld/unified-harness.md` is revision 11 and describes the effective contracts reviewed through commit `0f4066a` without weakening fail-closed behavior or data-preservation guarantees. Post-`0f4066a` implementation evidence is focused-only; the final full suite has not yet run on that executable state.
+Code verification complete; durable delivery remains completion-pending. `docs/lld/unified-harness.md` is revision 11 and describes the effective contracts reviewed through commit `0f4066a` without weakening fail-closed behavior or data-preservation guarantees. The final 28-file suite passed on the stable branch fingerprint recorded below. iwiki/task-ledger replay, lint, and code-graph publication remain outstanding while the hosted service returns HTTP 502.
 
 ## Inputs reconciled
 
@@ -32,15 +32,16 @@ Documentation-only checks on the final two-file diff:
 - Contradiction search for the nonexistent `ihar_codex_auth_mode` enum, whole-tree SHA pinning, writer-only legacy exclusion, unchanged-lockfile command no-op, completed lifecycle, and zero-unresolved-decision claims — exit 0 with no matches.
 - Positive contract search for exact asset/pin integrity, exact runtime links, narrow auth-prefix selection, any-open-descriptor exclusion, version-stamp-only reinstall skips, and completion-pending focused evidence — exit 0.
 - Carrier checks for `lib/python/ihar/runtime_state_upgrade.py`, `manifests/mutable-links.json`, `tests/test_runtime_state_upgrade.py`, their LLD tree entries, and the 28-entry `manifests/tests.json` — exit 0.
-- Implementation evidence after `0f4066a` is limited to the focused compile, runtime-upgrade, JSON, contract, session-reader, configuration, profile, concurrency, and state checks recorded in `final-fix-runtime-upgrade-report.md`; that report explicitly says the full suite was not run.
-- No code suite was run for this documentation-only reconciliation; validation was limited to documentation structure, links, contradiction searches, inventory checks, and whitespace.
+- Final stable implementation fingerprint: `1c2d872c9798bcf1fd2aad808c8e3a9c3b63d6b82bb7195c3b23edc3179e3b63` for `git diff --binary "$(git merge-base origin/master HEAD)"..HEAD -- . ':(exclude).iwiki.toml'`; verification head `fdb365c240f65cc0cea7d8ed4d74a2746af8da95`.
+- `bash tests/run.sh` — exit 0, `files=28 failed=0`. This is the sole full-suite run on that stable executable fingerprint.
+- The documentation-only update recording this evidence does not change executable inputs and therefore does not invalidate the result.
 
 ## Scope and blockers
 
 - Changed only `docs/lld/unified-harness.md` and this report.
 - Preserved the pre-existing user-owned `.iwiki.toml` modification and all code/test files.
-- Lifecycle remains completion-pending until the final full suite runs on the post-`0f4066a` executable state. Durable iwiki/task-ledger reconciliation and code-graph publication also remain parent-owned follow-up work.
+- Code verification is complete. Lifecycle remains completion-pending only for durable iwiki/task-ledger reconciliation, lint, and code-graph publication.
 
 ## Proposed changelog
 
-`return`: Final LLD reconciler kept revision 11 aligned with reviewed implementation through `0f4066a`, corrected auth-prefix, integrity, install-skip, open-consumer, and carrier claims, and marked delivery completion-pending because post-`0f4066a` evidence is focused-only and the final full suite remains outstanding; documentation checks passed; no code/tests or user-owned `.iwiki.toml` changed.
+`verification`: Final 28-file suite passed with `files=28 failed=0` on fingerprint `1c2d872c…`; code verification is complete, while durable iwiki/task-ledger, lint, and code-graph delivery remain completion-pending because hosted iwiki returns HTTP 502.
