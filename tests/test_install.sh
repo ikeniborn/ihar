@@ -363,9 +363,25 @@ OLD_RECEIPT='{"schema":1,"release_lock_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 COMMAND_LEGACY_STORE="$IHAR_TEST_TMP/legacy-command-store"
 mkdir -p "$COMMAND_LEGACY_STORE/hooks"
 printf 'legacy hook\n' > "$COMMAND_LEGACY_STORE/hooks/security-pretool.py"
+printf 'legacy stage proof\n' > "$COMMAND_LEGACY_STORE/hooks/migration-proof"
 printf '{"schema":1,"release_lock_sha256":"%064d","installed_at":"2026-09-18T00:00:00Z","components":{}}\n' 0 \
   > "$COMMAND_LEGACY_STORE/install-receipt.json"
 command_legacy_before="$(find "$COMMAND_LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+
+migration_stage_observation() { # <scenario>
+  printf '%s/%s-migration-stage\n' "$IHAR_TEST_TMP" "$1"
+}
+
+assert_migration_stage_observed() { # <scenario>
+  local scenario="$1" observation content=""
+  observation="$(migration_stage_observation "$scenario")"
+  assert_exit "$scenario observes migrated content in install stage" 0 test -f "$observation"
+  [[ ! -f "$observation" ]] || content="$(cat "$observation")"
+  assert_contains "$scenario observes legacy hook bytes before installer overwrite" \
+    "$content" "legacy stage proof"
+  assert_contains "$scenario observes legacy receipt before receipt publication" \
+    "$content" '"release_lock_sha256":"0000000000000000000000000000000000000000000000000000000000000000"'
+}
 
 reset_active_generation() {
   mkdir -p "$IHAR_STORE/hooks" "$(dirname "$IHAR_CODEX_BIN")" "$(dirname "$IHAR_CLAUDE_BIN")"
@@ -387,10 +403,12 @@ generation_fingerprint() {
 }
 
 run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activation|rollback> [install|update]
-  local scenario="$1" operation="${2:-install}"
+  local scenario="$1" operation="${2:-install}" migration_observation
   export IHAR_ACTIVE_TEST_STORE="$IHAR_STORE"
   if [[ "$scenario" == migration-* ]]; then
     export IHAR_FLAG_MIGRATE_STORE=true IHAR_LEGACY_STORE="$COMMAND_LEGACY_STORE"
+    migration_observation="$(migration_stage_observation "$scenario")"
+    rm -f -- "$migration_observation"
   else
     export IHAR_FLAG_MIGRATE_STORE=false
     unset IHAR_LEGACY_STORE
@@ -398,6 +416,14 @@ run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activati
   ihar_install_command() { :; }
   ihar_install_example_config() { :; }
   ihar_install_store() {
+    if [[ "$scenario" == migration-* &&
+          -f "$IHAR_STORE/hooks/migration-proof" &&
+          -f "$IHAR_STORE/install-receipt.json" ]]; then
+      {
+        cat "$IHAR_STORE/hooks/migration-proof"
+        cat "$IHAR_STORE/install-receipt.json"
+      } > "$migration_observation"
+    fi
     mkdir -p "$IHAR_STORE/hooks"
     printf 'new hook\n' > "$IHAR_STORE/hooks/security-pretool.py"
   }
@@ -497,6 +523,7 @@ for scenario in migration-conformance migration-receipt; do
   assert_eq "$scenario failure leaves legacy source byte-identical" \
     "$command_legacy_before" \
     "$(find "$COMMAND_LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+  assert_migration_stage_observed "$scenario"
 done
 
 reset_active_generation
@@ -575,6 +602,7 @@ assert_contains "migrated install rollback restores pre-command hooks" \
 assert_eq "incomplete migrated install leaves legacy source byte-identical" \
   "$command_legacy_before" \
   "$(find "$COMMAND_LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+assert_migration_stage_observed migration-rollback
 
 reset_active_generation
 run_install_scenario success >/dev/null 2>&1
