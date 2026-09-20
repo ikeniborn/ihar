@@ -14,6 +14,7 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "python"))
 
 from ihar import install_receipt, jsonio  # noqa: E402
+from ihar.conformance import REQUIRED_CASES  # noqa: E402
 
 HOOK_DETAIL_EMPTY = {
     "trusted_hash": None,
@@ -150,7 +151,7 @@ def test_free_form_maps_validate_keys_and_values():
         "schema": 1, "vendor": "codex", "version": "0.154.0",
         "binary_sha256": "a" * 64, "manifest_digest": "b" * 64,
         "created_at": "2026-09-18T10:00:00Z",
-        "cases": {"deny": {"status": "passed"}},
+        "cases": {name: {"status": "passed"} for name in REQUIRED_CASES["codex"]},
     }
     jsonio.check("conformance", record)
     rejects("conformance", {**record, "cases": {"deny": {"status": "maybe"}}}, "cases.deny.status")

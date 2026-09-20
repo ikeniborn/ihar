@@ -32,6 +32,54 @@ import uuid
 from .. import jsonio
 from ..render import claude_settings
 from ..render import hooks as render_hooks
+from . import LIVE_CASES, REQUIRED_CASES
+
+
+_SESSION_CONTEXT = "IHAR-CONFORMANCE-SESSION-CONTEXT"
+_FAKE_SECRET = "sk-ant-abcdefghijklmnopqrstuvwxyz0123"
+_PROBE_SCRIPT = r'''#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+import time
+
+mode, marker = sys.argv[1:3]
+payload = sys.stdin.read()
+pathlib.Path(marker).write_text(payload, encoding="utf-8")
+if mode == "context":
+    json.dump({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                      "additionalContext": "IHAR-CONFORMANCE-SESSION-CONTEXT"}},
+              sys.stdout)
+    sys.stdout.write("\n")
+elif mode == "timeout":
+    time.sleep(5)
+'''
+
+_MCP_SCRIPT = r'''#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+marker = sys.argv[1]
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if "id" not in request:
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": request.get("params", {}).get("protocolVersion"),
+                  "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "ihar-conformance", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "prove", "description": "Record conformance",
+                              "inputSchema": {"type": "object", "properties": {}}}]}
+    elif method == "tools/call":
+        pathlib.Path(marker).write_text("called\n", encoding="utf-8")
+        result = {"content": [{"type": "text", "text": "conformance proved"}]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+'''
 
 
 def _digest_file(path: str) -> str:
@@ -67,6 +115,24 @@ def _stage(
             shutil.copytree(source, target, dirs_exist_ok=True)
         else:
             shutil.copy2(source, target)
+
+    with open(os.path.join(home, "hooks", "conformance-probe.py"), "w", encoding="utf-8") as handle:
+        handle.write(_PROBE_SCRIPT)
+    with open(os.path.join(home, "mcp-conformance.py"), "w", encoding="utf-8") as handle:
+        handle.write(_MCP_SCRIPT)
+    with open(os.path.join(home, "ihar-policy.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "vendor": vendor,
+            "profile": "protected",
+            "hooks": "enforced",
+            "masking_level": "standard",
+            "protected_paths": protected_roots or [store, home],
+        }, handle, sort_keys=True)
+
+    auth_name = ".credentials.json" if vendor == "claude" else "auth.json"
+    auth_source = os.path.join(store, "auth", vendor, auth_name)
+    if os.path.isfile(auth_source):
+        os.symlink(auth_source, os.path.join(home, auth_name))
 
     if vendor == "codex":
         with open(os.path.join(home, "hooks.json"), "w", encoding="utf-8") as handle:
@@ -139,58 +205,234 @@ def case_tampering_is_detected(vendor, binary, home, workdir):
            ("failed", "an edited hook still verified")
 
 
-def case_deny_blocks_the_tool(vendor, binary, home, workdir):
-    """The decision the hook returns is the decision the vendor enforces.
+def _hook_block(home: str, vendor: str) -> tuple[dict, str]:
+    path = os.path.join(home, "hooks.json" if vendor == "codex" else "settings.json")
+    with open(path, "r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    return document["hooks"], path
 
-    Driven through the hook itself rather than through a model turn: a turn needs
-    credentials and a network, which a conformance run must not require. What this
-    proves is that the contract on both sides agrees — the exit code the script uses
-    to block is the exit code this vendor's schema documents as a block.
-    """
-    script = os.path.join(home, "hooks", "security-pretool.py")
-    payload = json.dumps({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Read" if vendor == "claude" else "Read",
-        "tool_input": {"file_path": "/home/someone/.ssh/id_rsa"},
-    })
-    result = subprocess.run(
-        ["python3", "-I", script, "--vendor", vendor],
-        input=payload, capture_output=True, text=True, timeout=30,
+
+def _reset_probe_hooks(home: str, vendor: str) -> None:
+    block, path = _hook_block(home, vendor)
+    for event, groups in list(block.items()):
+        kept = []
+        for group in groups:
+            hooks = group.get("hooks", [])
+            if any("conformance-probe.py" in hook.get("command", "") for hook in hooks):
+                continue
+            kept.append(group)
+        block[event] = kept
+    with open(path, "r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    document["hooks"] = block
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=2, sort_keys=True)
+
+
+def _add_probe_hook(
+    home: str,
+    vendor: str,
+    event: str,
+    mode: str,
+    marker: str,
+    *,
+    matcher: str | None = None,
+    timeout: int = 10,
+) -> None:
+    block, path = _hook_block(home, vendor)
+    command = (
+        f'python3 -I "{home}/hooks/conformance-probe.py" '
+        f"{mode} {shlex.quote(marker)} --vendor {vendor}"
     )
-    if result.returncode != 2:
-        return "failed", f"the block exit code was {result.returncode}, not 2"
+    group = {"hooks": [{"type": "command", "command": command, "timeout": timeout}]}
+    if matcher is not None:
+        group["matcher"] = matcher
+    block.setdefault(event, []).append(group)
+    with open(path, "r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    document["hooks"] = block
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=2, sort_keys=True)
+
+
+def _prepare_codex_hooks(binary: str, home: str, workdir: str) -> tuple[bool, str]:
+    from ..codex import hooks_trust
+    config = os.path.join(home, "config.toml")
+    start = "# ihar:hook-trust:start"
+    end = "# ihar:hook-trust:end"
     try:
-        body = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
-        return "failed", "the hook emitted output the vendor cannot parse"
-    decision = body.get("hookSpecificOutput", {}).get("permissionDecision")
-    if decision != "deny":
-        return "failed", f"the decision was {decision!r}"
-    return "passed", "exit 2 with a deny decision"
+        with open(config, "r", encoding="utf-8") as handle:
+            content = handle.read()
+        if start in content:
+            before, remainder = content.split(start, 1)
+            if end not in remainder:
+                return False, "Codex config contains an incomplete hook trust region"
+            _, after = remainder.split(end, 1)
+            with open(config, "w", encoding="utf-8") as handle:
+                handle.write(before.rstrip() + "\n" + after.lstrip("\n"))
+    except OSError as error:
+        return False, f"cannot refresh Codex hook trust: {error}"
+    code, _ = hooks_trust.seal_quiet(binary, home, workdir)
+    return code == 0, "Codex did not trust the staged conformance hooks"
 
 
-def case_rewrite_is_emitted(vendor, binary, home, workdir):
-    """A redaction reaches the vendor as updatedInput, the key both accept."""
-    script = os.path.join(home, "hooks", "security-pretool.py")
-    payload = json.dumps({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Write",
-        "tool_input": {"file_path": "/repo/a.py",
-                       "content": 'k = "sk-ant-abcdefghijklmnopqrstuvwxyz0123"'},
-    })
-    result = subprocess.run(
-        ["python3", "-I", script, "--vendor", vendor],
-        input=payload, capture_output=True, text=True, timeout=30,
+def _vendor_turn(
+    vendor: str,
+    binary: str,
+    home: str,
+    workdir: str,
+    prompt: str,
+    *,
+    allowed_tool: str,
+    mcp_config: str | None = None,
+):
+    env = dict(os.environ)
+    if vendor == "claude":
+        env["CLAUDE_CONFIG_DIR"] = home
+        argv = [binary, "-p", "--output-format", "json", "--permission-mode", "dontAsk"]
+        argv.extend(["--allowedTools", allowed_tool])
+        if mcp_config:
+            argv.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
+        argv.append(prompt)
+    else:
+        env["CODEX_HOME"] = home
+        argv = [
+            binary, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+            "--sandbox", "workspace-write", "--ask-for-approval", "never", prompt,
+        ]
+    return subprocess.run(
+        argv,
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
     )
-    if result.returncode != 0:
-        return "failed", f"a redaction exited {result.returncode} instead of allowing"
-    body = json.loads(result.stdout or "{}")
-    updated = body.get("hookSpecificOutput", {}).get("updatedInput")
-    if not updated:
-        return "failed", "no updatedInput was emitted"
-    if "sk-ant-" in json.dumps(updated):
-        return "failed", "the secret survived the rewrite"
-    return "passed", "updatedInput carries the masked value"
+
+
+def _observed(marker: str) -> bool:
+    return os.path.isfile(marker) and os.path.getsize(marker) > 0
+
+
+def _configure_mcp(home: str, vendor: str, marker: str) -> str | None:
+    script = os.path.join(home, "mcp-conformance.py")
+    if vendor == "claude":
+        path = os.path.join(home, "mcp-conformance.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"mcpServers": {"ihar-conformance": {
+                "command": "python3", "args": ["-I", script, marker],
+            }}}, handle, indent=2, sort_keys=True)
+        return path
+    with open(os.path.join(home, "config.toml"), "a", encoding="utf-8") as handle:
+        handle.write("\n[mcp_servers.ihar-conformance]\n")
+        handle.write('command = "python3"\n')
+        handle.write(f"args = {json.dumps(['-I', script, marker])}\n")
+    return None
+
+
+def _run_live_case(vendor, binary, home, workdir, name):
+    """Drive one accepted case through the vendor's supported non-interactive CLI."""
+    _reset_probe_hooks(home, vendor)
+    observed = os.path.join(workdir, f".{name}-hook")
+    target = os.path.join(workdir, f".{name}-target")
+    _remove_probe(observed)
+    _remove_probe(target)
+    mcp_config = None
+    allowed_tool = "Bash"
+
+    if name == "deny-blocks-the-tool":
+        sensitive = os.path.join(workdir, ".ssh", "id_rsa")
+        os.makedirs(os.path.dirname(sensitive), exist_ok=True)
+        _remove_probe(sensitive)
+        _add_probe_hook(home, vendor, "PreToolUse", "observe", observed, matcher="Bash")
+        prompt = (
+            "Use the Bash tool exactly once and run this command verbatim; do not use another "
+            f"tool: printf denied > {shlex.quote(sensitive)}"
+        )
+        target = sensitive
+    elif name == "rewrite-reaches-the-tool":
+        _add_probe_hook(home, vendor, "PreToolUse", "observe", observed, matcher="Bash")
+        prompt = (
+            "Use the Bash tool exactly once and run this command verbatim; do not use another "
+            f"tool: printf '%s' '{_FAKE_SECRET}' > {shlex.quote(target)}"
+        )
+    elif name == "session-start-context":
+        _add_probe_hook(home, vendor, "SessionStart", "context", observed)
+        prompt = (
+            "The SessionStart hook supplied one uppercase conformance token. Use the Bash tool "
+            f"exactly once to write only that token to {shlex.quote(target)}."
+        )
+    elif name == "mcp-matcher-fires":
+        called = os.path.join(workdir, ".mcp-tool-called")
+        _remove_probe(called)
+        _add_probe_hook(
+            home, vendor, "PreToolUse", "observe", observed,
+            matcher="mcp__ihar-conformance__prove",
+        )
+        mcp_config = _configure_mcp(home, vendor, called)
+        allowed_tool = "mcp__ihar-conformance__prove"
+        prompt = (
+            "Call the ihar-conformance MCP server's prove tool exactly once with an empty object, "
+            "then stop."
+        )
+        target = called
+    elif name == "timeout-behaviour":
+        _add_probe_hook(
+            home, vendor, "PreToolUse", "timeout", observed, matcher="Bash", timeout=1,
+        )
+        prompt = (
+            "Use the Bash tool exactly once and run this command verbatim; do not use another "
+            f"tool: printf timeout > {shlex.quote(target)}"
+        )
+    else:
+        return "failed", f"unknown mandatory live case {name}"
+
+    if vendor == "codex":
+        ready, detail = _prepare_codex_hooks(binary, home, workdir)
+        if not ready:
+            return "failed", detail
+    try:
+        result = _vendor_turn(
+            vendor, binary, home, workdir, prompt,
+            allowed_tool=allowed_tool,
+            mcp_config=mcp_config,
+        )
+    except subprocess.TimeoutExpired:
+        return "failed", "the vendor turn exceeded 180 seconds"
+
+    if not _observed(observed):
+        return "failed", f"the vendor exited {result.returncode} without firing the probe hook"
+    if name != "timeout-behaviour" and result.returncode != 0:
+        return "failed", f"the vendor fired the hook but the turn exited {result.returncode}"
+    if name == "deny-blocks-the-tool":
+        if os.path.exists(target):
+            return "failed", "the denied Bash command created its sentinel"
+        return "passed", "vendor fired PreToolUse and did not execute the denied command"
+    if name == "rewrite-reaches-the-tool":
+        try:
+            with open(target, encoding="utf-8") as handle:
+                content = handle.read()
+        except OSError as error:
+            return "failed", f"the rewritten command did not create its sentinel: {error}"
+        if _FAKE_SECRET in content or "REDACTED-" not in content:
+            return "failed", "the vendor executed the unrewritten secret"
+        return "passed", "vendor executed the hook-rewritten command"
+    if name == "session-start-context":
+        try:
+            with open(target, encoding="utf-8") as handle:
+                content = handle.read().strip()
+        except OSError as error:
+            return "failed", f"the model turn did not receive SessionStart context: {error}"
+        if content != _SESSION_CONTEXT:
+            return "failed", f"the model turn wrote {content!r}, not the SessionStart context"
+        return "passed", "SessionStart additionalContext reached the model turn"
+    if name == "mcp-matcher-fires":
+        if not os.path.isfile(target):
+            return "failed", "the MCP tool did not run"
+        return "passed", "vendor fired the MCP matcher and ran the stub MCP tool"
+
+    outcome = "executed" if os.path.isfile(target) else "blocked"
+    return "passed", f"vendor timed out the hook and the tool was {outcome}"
 
 
 def _claude_protected_roots(home: str) -> list[str]:
@@ -319,8 +561,6 @@ CASES = {
     "hook-is-loaded": case_hook_is_loaded,
     "trust-is-recordable": case_trust_is_recordable,
     "tampering-is-detected": case_tampering_is_detected,
-    "deny-blocks-the-tool": case_deny_blocks_the_tool,
-    "rewrite-is-emitted": case_rewrite_is_emitted,
     "sandbox-direct-write": case_sandbox_direct_write,
     "sandbox-child-write": case_sandbox_child_write,
     "sandbox-workspace-write": case_sandbox_workspace_write,
@@ -386,6 +626,12 @@ def run(
                 continue
             try:
                 status, detail = case(vendor, binary, home, workdir)
+            except Exception as error:             # noqa: BLE001
+                status, detail = "failed", f"{type(error).__name__}: {error}"
+            record["cases"][name] = {"status": status, "detail": detail}
+        for name in sorted(LIVE_CASES):
+            try:
+                status, detail = _run_live_case(vendor, binary, home, workdir, name)
             except Exception as error:             # noqa: BLE001
                 status, detail = "failed", f"{type(error).__name__}: {error}"
             record["cases"][name] = {"status": status, "detail": detail}

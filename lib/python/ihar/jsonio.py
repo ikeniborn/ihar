@@ -26,6 +26,8 @@ import re
 import tempfile
 from typing import Any, Mapping
 
+from .conformance import REQUIRED_CASES as REQUIRED_CONFORMANCE_CASES
+
 __all__ = ["SchemaError", "check", "read", "write", "merge_managed", "KINDS"]
 
 
@@ -282,6 +284,21 @@ def _conformance_rules(obj: Mapping[str, Any]) -> None:
         raise SchemaError(
             f"conformance {obj['vendor']} {obj['version']}: no cases recorded; "
             "an empty record would let an enforced profile launch unproven"
+        )
+    required = REQUIRED_CONFORMANCE_CASES[obj["vendor"]]
+    missing = sorted(required - obj["cases"].keys())
+    if missing:
+        raise SchemaError(
+            f"conformance {obj['vendor']} {obj['version']}: missing mandatory cases: "
+            f"{', '.join(missing)}"
+        )
+    incomplete = sorted(
+        name for name in required if obj["cases"][name]["status"] == "skipped"
+    )
+    if incomplete:
+        raise SchemaError(
+            f"conformance {obj['vendor']} {obj['version']}: mandatory cases were skipped: "
+            f"{', '.join(incomplete)}"
         )
 
 
