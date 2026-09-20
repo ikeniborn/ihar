@@ -30,7 +30,7 @@ json_check="$(ihar --json check)"
 assert_eq "JSON check validates as a closed result" "standard" \
   "$(PYTHONPATH="$ROOT/lib/python" python3 -c 'import json,sys; from ihar import jsonio; print(jsonio.check("check-result", json.load(sys.stdin))["profile"]["name"])' <<<"$json_check")"
 assert_eq "JSON check carries per-hook trust facts" "True" \
-  "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(bool(d["vendors"]["claude"]["hooks"]) and all(set(x)=={"id","trust"} for x in d["vendors"]["claude"]["hooks"]+d["vendors"]["codex"]["hooks"]))' <<<"$json_check")"
+  "$(python3 -c 'import json,sys; d=json.load(sys.stdin); required={"id","trust","trusted_hash","trustStatus","enabled","source","currentHash"}; print(bool(d["vendors"]["claude"]["hooks"]) and all(set(x)==required for x in d["vendors"]["claude"]["hooks"]+d["vendors"]["codex"]["hooks"]))' <<<"$json_check")"
 assert_contains "text and JSON check share the profile" "$(ihar check)" \
   "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["profile"]["name"])' <<<"$json_check")"
 

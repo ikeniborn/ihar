@@ -55,6 +55,7 @@ ihar_check_collect() {
     printf -v "_IHAR_CHECK_${vendor^^}_CONFORMANCE" '%s' \
       "$(ihar_check_conformance_status "$vendor" "$binary")"
     printf -v "_IHAR_CHECK_${vendor^^}_RUNTIME" '%s' "$(_ihar_check_runtime "$vendor")"
+    printf -v "_IHAR_CHECK_${vendor^^}_BINARY" '%s' "$binary"
     printf -v "_IHAR_CHECK_MCP_${vendor^^}" '%s' "$notes"
   done
 
@@ -66,7 +67,8 @@ ihar_check_collect() {
   export _IHAR_CHECK_CLAUDE_CAPABILITIES _IHAR_CHECK_CLAUDE_RECEIPT
   export _IHAR_CHECK_CLAUDE_RUNTIME _IHAR_CHECK_CLAUDE_CONFORMANCE _IHAR_CHECK_MCP_CLAUDE
   export _IHAR_CHECK_CODEX_CAPABILITIES _IHAR_CHECK_CODEX_RECEIPT
-  export _IHAR_CHECK_CODEX_RUNTIME _IHAR_CHECK_CODEX_CONFORMANCE _IHAR_CHECK_MCP_CODEX
+  export _IHAR_CHECK_CODEX_RUNTIME _IHAR_CHECK_CODEX_BINARY
+  export _IHAR_CHECK_CODEX_CONFORMANCE _IHAR_CHECK_MCP_CODEX
   ihar_python ihar.check_result collect "$target"
 }
 

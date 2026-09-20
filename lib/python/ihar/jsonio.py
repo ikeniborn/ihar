@@ -721,7 +721,12 @@ KINDS: dict[str, dict[str, Any]] = {
                     "receipt": {"type": str, "enum": ("valid", "stale", "missing", "invalid", "not-installed")},
                     "hooks": {"type": list, "items": {"type": dict, "fields": {
                         "id": {"type": str, "pattern": _SLUG},
-                        "trust": {"type": str, "enum": ("configured", "recorded", "unavailable")},
+                        "trust": {"type": str, "enum": ("configured", "trusted", "untrusted", "unavailable")},
+                        "trusted_hash": {"type": (str, type(None)), "pattern": r"sha256:[0-9a-f]{64}"},
+                        "trustStatus": {"type": (str, type(None))},
+                        "enabled": {"type": (bool, type(None))},
+                        "source": {"type": (str, type(None))},
+                        "currentHash": {"type": (str, type(None)), "pattern": r"sha256:[0-9a-f]{64}"},
                     }}},
                     "conformance": {"type": str, "enum": ("proven", "stale", "unproven", "not-installed")},
                     "capabilities": {"type": list, "items": {"type": str, "min_len": 1}},

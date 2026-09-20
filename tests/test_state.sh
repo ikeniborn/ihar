@@ -796,6 +796,21 @@ assert_exit "current cleanup rejects a colliding project marker" 2 \
   bash -c "cd '$COLLISION_PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean"
 assert_exit "collision rejection preserves its runtime" 0 test -d "$COLLISION_STATE/r/11111111"
 
+MOVED_PROJECT="$IHAR_TEST_TMP/moved-marker-project"
+mkdir -p "$MOVED_PROJECT"
+MOVED_ID=44444444
+MOVED_STATE="$IHAR_STATE_ROOT/$MOVED_ID"
+mkdir -p "$MOVED_STATE/r/55555555/claude"
+python3 - "$MOVED_STATE/home.json" "$MOVED_PROJECT" <<'PY'
+import json, sys
+old = "2020-01-01T00:00:00Z"
+json.dump({"schema":3,"project_root":sys.argv[2],"created":old,"vendors":["claude"],"runtimes":{"55555555":{"profile":"standard","created":old,"last_used":old}},"migrated_from":{}}, open(sys.argv[1], "w", encoding="utf-8"))
+PY
+assert_exit "named cleanup rejects a valid marker moved under the wrong id" 2 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$MOVED_ID'"
+assert_exit "moved marker rejection preserves its runtime" 0 \
+  test -d "$MOVED_STATE/r/55555555"
+
 MALFORMED_ID=22222222
 MALFORMED_STATE="$IHAR_STATE_ROOT/$MALFORMED_ID"
 mkdir -p "$MALFORMED_STATE/r/33333333/claude"

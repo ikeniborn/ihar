@@ -15,6 +15,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from ihar import install_receipt, jsonio  # noqa: E402
 
+HOOK_DETAIL_EMPTY = {
+    "trusted_hash": None,
+    "trustStatus": None,
+    "enabled": None,
+    "source": None,
+    "currentHash": None,
+}
+
 PROFILE = {
     "schema": 1,
     "name": "x",
@@ -59,8 +67,8 @@ CHECK_RESULT = {
     "masking": {"level": "standard", "floor": "standard", "engine": "regex", "dropped_env": ["TOKEN"]},
     "gateway": {"mode": "explicit", "network_policy": "protected", "instances": ["abc port 1234"]},
     "vendors": {
-        "claude": {"receipt": "valid", "hooks": [{"id": "security-pretool", "trust": "configured"}], "conformance": "proven", "capabilities": ["fork", "remote-control"]},
-        "codex": {"receipt": "missing", "hooks": [{"id": "security-pretool", "trust": "recorded"}], "conformance": "unproven", "capabilities": ["archive", "fork"]},
+        "claude": {"receipt": "valid", "hooks": [{"id": "security-pretool", "trust": "configured", **HOOK_DETAIL_EMPTY}], "conformance": "proven", "capabilities": ["fork", "remote-control"]},
+        "codex": {"receipt": "missing", "hooks": [{"id": "security-pretool", "trust": "trusted", "trusted_hash": "sha256:" + "a" * 64, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": "sha256:" + "a" * 64}], "conformance": "unproven", "capabilities": ["archive", "fork"]},
     },
     "assets": [{"requirement": "optional", "presence": "missing", "source": "commands", "target": "commands"}],
     "mcp": {"strict": True, "notes": {"claude": ["missing TOKEN"], "codex": []}},
@@ -307,10 +315,58 @@ def test_check_result_text_and_json_render_the_same_facts():
     jsonio.check("check-result", json.loads(encoded))
     for value in (
         "protected", "masked model egress", "standard", "explicit", "valid", "missing",
-        "commands", "security-pretool", "recorded", "missing TOKEN", "claude-agent-acp #144",
+        "commands", "security-pretool", "trusted", "trusted_hash", "trustStatus", "enabled",
+        "source", "user", "currentHash", "sha256:" + "a" * 64,
+        "missing TOKEN", "claude-agent-acp #144",
     ):
         assert value in rendered, value
         assert value in encoded, value
+
+
+def test_codex_hook_facts_are_evaluated_per_hook_from_vendor_and_trust_records():
+    from ihar import check_result
+
+    manifest = {
+        "schema": 1,
+        "entries": [
+            {"id": "hook-one", "event": "PreToolUse", "vendors": ["codex"], "profiles": ["*"], "tools": ["any"], "script": "one.py", "args": [], "timeout": 5, "rewrites_input": False, "required_in": []},
+            {"id": "hook-two", "event": "PostToolUse", "vendors": ["codex"], "profiles": ["*"], "tools": ["any"], "script": "two.py", "args": [], "timeout": 5, "rewrites_input": False, "required_in": []},
+        ],
+    }
+    one_hash = "sha256:" + "1" * 64
+    two_hash = "sha256:" + "2" * 64
+    with tempfile.TemporaryDirectory() as runtime:
+        hooks_path = os.path.join(runtime, "hooks.json")
+        with open(hooks_path, "w", encoding="utf-8") as handle:
+            json.dump({"hooks": {
+                "PreToolUse": [{"hooks": [{"command": 'python3 -I "$CODEX_HOME/hooks/one.py" --vendor codex'}]}],
+                "PostToolUse": [{"hooks": [{"command": 'python3 -I "$CODEX_HOME/hooks/two.py" --vendor codex'}]}],
+            }}, handle)
+        one_key = f"{hooks_path}:PreToolUse:0:0"
+        two_key = f"{hooks_path}:PostToolUse:0:0"
+        observed = [
+            {"key": one_key, "sourcePath": hooks_path, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": one_hash},
+            {"key": two_key, "sourcePath": hooks_path, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": two_hash},
+        ]
+
+        def write_trust(records):
+            with open(os.path.join(runtime, "config.toml"), "w", encoding="utf-8") as handle:
+                for key, value in records.items():
+                    handle.write(f'[hooks.state."{key}"]\ntrusted_hash = "{value}"\n')
+
+        write_trust({one_key: one_hash, two_key: two_hash})
+        facts = check_result.codex_hook_facts(manifest, "standard", runtime, observed)
+        assert {fact["id"]: fact["trust"] for fact in facts} == {"hook-one": "trusted", "hook-two": "trusted"}
+        assert next(fact for fact in facts if fact["id"] == "hook-one")["currentHash"] == one_hash
+
+        write_trust({one_key: one_hash, two_key: "sha256:" + "3" * 64})
+        facts = check_result.codex_hook_facts(manifest, "standard", runtime, observed)
+        assert {fact["id"]: fact["trust"] for fact in facts} == {"hook-one": "trusted", "hook-two": "untrusted"}
+
+        write_trust({one_key: one_hash})
+        facts = check_result.codex_hook_facts(manifest, "standard", runtime, observed)
+        assert {fact["id"]: fact["trust"] for fact in facts} == {"hook-one": "trusted", "hook-two": "untrusted"}
+        assert next(fact for fact in facts if fact["id"] == "hook-two")["trusted_hash"] is None
 
 
 if __name__ == "__main__":
