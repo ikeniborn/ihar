@@ -152,6 +152,15 @@ def test_state_manifest_rejects_overlapping_paths():
     }
     rejects("state-manifest", overlapping, "overlapping paths")
 
+    sqlite_alias = {
+        "schema": 1,
+        "entries": [
+            {"vendor": "codex", "path": "state.sqlite", "kind": "sqlite-family"},
+            {"vendor": "codex", "path": "state.sqlite-wal", "kind": "file"},
+        ],
+    }
+    rejects("state-manifest", sqlite_alias, "expanded path")
+
 
 def test_missing_key_is_reported_by_name():
     incomplete = {key: value for key, value in PROFILE.items() if key != "acp"}

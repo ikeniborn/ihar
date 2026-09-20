@@ -306,6 +306,7 @@ def _conformance_rules(obj: Mapping[str, Any]) -> None:
 def _state_manifest_rules(obj: Mapping[str, Any]) -> None:
     keys: set[tuple[str, str]] = set()
     paths: dict[str, list[str]] = {}
+    expanded: dict[tuple[str, str], str] = {}
     for entry in obj["entries"]:
         key = (entry["vendor"], entry["path"])
         if key in keys:
@@ -313,7 +314,18 @@ def _state_manifest_rules(obj: Mapping[str, Any]) -> None:
                 f"state manifest: duplicate entry for vendor {key[0]!r} and path {key[1]!r}"
             )
         keys.add(key)
-        paths.setdefault(entry["vendor"], []).append(entry["path"])
+        expanded_paths = [entry["path"]]
+        if entry["kind"] == "sqlite-family":
+            expanded_paths.extend((entry["path"] + "-wal", entry["path"] + "-shm"))
+        for path in expanded_paths:
+            expanded_key = (entry["vendor"], path)
+            if expanded_key in expanded:
+                raise SchemaError(
+                    f"state manifest: expanded path {path!r} for vendor "
+                    f"{entry['vendor']!r} aliases {expanded[expanded_key]!r}"
+                )
+            expanded[expanded_key] = entry["path"]
+            paths.setdefault(entry["vendor"], []).append(path)
     for vendor, vendor_paths in paths.items():
         ordered = sorted(vendor_paths)
         for index, path in enumerate(ordered):

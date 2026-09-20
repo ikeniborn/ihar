@@ -58,3 +58,31 @@ Focused evidence on the final executable state:
 - User-owned `.iwiki.toml` remains untouched and unstaged.
 - LLD and parent iwiki ledger remain unchanged for parent reconciliation.
 - No blockers remain.
+
+## Review fix round 1
+
+### RED evidence
+
+- `PYTHONPATH=lib/python python3 tests/test_jsonio.py` — exit 1 because an explicit `state.sqlite-wal` entry could alias the WAL expanded from a `state.sqlite` family.
+- `PYTHONPATH=lib/python python3 tests/test_runtime_state_upgrade.py` — exit 1 because a process holding canonical state open was ignored. Added failures also reproduced runtime-root, generation, and vendor ancestry symlinks; an active sibling runtime; writes after staging and after publication; and non-atomic publication rollback.
+
+### Remediation
+
+- State, runtime, generation, vendor, manifest-entry, staging, recovery, and relink traversal now uses retained directory descriptors with `O_NOFOLLOW`. Runtime ancestry symlinks fail before mutation and external referents remain byte-identical.
+- Quiescence scans every same-vendor runtime and blocks inspectable processes that select any such runtime or hold a canonical/materialized path as cwd or an open descriptor. Missing process evidence fails closed; non-dumpable session services with no inspectable project-runtime evidence are outside the candidate set.
+- Staging is re-fingerprinted against source after copy, after the second quiescence gate, immediately after publication, and after relink. Late writes roll back publication while retaining the writer's latest source bytes.
+- Publication uses Linux `renameat2(RENAME_EXCHANGE)`, so the canonical vendor directory is never absent. The prior canonical tree stays in the private stage until relink verification commits it into recovery; failed publication exchanges it back atomically.
+- State-manifest overlap validation now runs on SQLite-family-expanded paths. Explicit base/WAL/SHM aliases fail schema validation before state-tree inspection or recovery creation.
+
+### GREEN evidence
+
+- `PYTHONPATH=lib/python python3 tests/test_jsonio.py` — exit 0, `PASS=29 FAIL=0`.
+- `PYTHONPATH=lib/python python3 tests/test_runtime_state_upgrade.py` — exit 0, `PASS=15 FAIL=0`.
+- `bash tests/test_contracts.sh` — exit 0, `PASS=84 FAIL=0`.
+- `PYTHONPATH=lib/python python3 tests/test_sessions_readers.py` — exit 0.
+- `bash tests/test_config.sh` — exit 0, `PASS=20 FAIL=0`.
+- `bash tests/test_profiles.sh` — exit 0, `PASS=58 FAIL=0`.
+- `bash tests/test_concurrency.sh` — exit 0, `PASS=33 FAIL=0`.
+- `bash tests/test_state.sh` — exit 0, `PASS=317 FAIL=0`.
+- Python compile, Bash syntax, and `git diff --check` — exit 0.
+- Full suite intentionally not run per review-fix scope.
