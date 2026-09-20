@@ -426,6 +426,47 @@ def test_unreadable_live_process_environment_fails_closed():
         assert not any((state / "st" / "codex").iterdir())
 
 
+def test_detached_unreadable_native_selector_and_runtime_fd_fail_closed():
+    module = implementation()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest, state, runtimes = fixture(Path(tmp), "99999983", "99999984")
+        write_materialized(runtimes[0])
+        environment = {**os.environ, "CODEX_HOME": str(runtimes[1])}
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import ctypes,sys; f=open(sys.argv[1], 'rb'); "
+                    "assert ctypes.CDLL(None).prctl(4,0,0,0,0) == 0; "
+                    "print('ready', flush=True); sys.stdin.read()"
+                ),
+                str(runtimes[0] / "history.jsonl"),
+            ],
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        assert process.stdout is not None and process.stdout.readline().strip() == "ready"
+        try:
+            try:
+                run_upgrade(module, manifest, state, "codex", process.pid)
+            except module.UpgradeError as error:
+                assert "cannot prove" in str(error)
+                assert str(process.pid) in str(error)
+            else:
+                raise AssertionError("detached unreadable runtime consumer was ignored")
+        finally:
+            assert process.stdin is not None
+            process.stdin.close()
+            process.wait(timeout=5)
+
+        assert_materialized(runtimes[0])
+        assert not any((state / "st" / "codex").iterdir())
+
+
 def test_partial_live_process_environment_fails_closed():
     module = implementation()
     process = subprocess.Popen(
@@ -455,6 +496,44 @@ def test_partial_live_process_environment_fails_closed():
         process.wait(timeout=5)
 
 
+def test_detached_partial_environment_still_checks_runtime_file_descriptors():
+    module = implementation()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest, state, (runtime,) = fixture(Path(tmp), "99999982")
+        write_materialized(runtime)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys; f=open(sys.argv[1], 'rb'); print('ready', flush=True); sys.stdin.read()",
+                str(runtime / "history.jsonl"),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        assert process.stdout is not None and process.stdout.readline().strip() == "ready"
+        try:
+            with mock.patch.object(
+                module.Path, "read_bytes", return_value=b"CODEX_HOME=/partial"
+            ):
+                try:
+                    run_upgrade(module, manifest, state, "codex", process.pid)
+                except module.UpgradeError as error:
+                    assert "consumer" in str(error)
+                    assert str(runtime / "history.jsonl") in str(error)
+                else:
+                    raise AssertionError("partial environment skipped runtime fd inspection")
+        finally:
+            assert process.stdin is not None
+            process.stdin.close()
+            process.wait(timeout=5)
+
+        assert_materialized(runtime)
+        assert not any((state / "st" / "codex").iterdir())
+
+
 def test_current_helper_is_excluded_by_pid_even_when_environment_is_unreadable():
     module = implementation()
     with mock.patch.object(module, "_proc_processes", return_value=[Path(f"/proc/{os.getpid()}")]), \
@@ -464,6 +543,43 @@ def test_current_helper_is_excluded_by_pid_even_when_environment_is_unreadable()
             Path("/state/st/codex"),
             Path("/state/r/generation/codex"),
         )
+
+
+def test_parent_consumers_are_not_excluded_from_child_upgrade_scan():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for generation, target_kind in (("99999980", "materialized"), ("99999981", "canonical")):
+            case_root = root / target_kind
+            case_root.mkdir()
+            manifest, state, (runtime,) = fixture(case_root, generation)
+            write_materialized(runtime)
+            canonical = state / "st" / "codex"
+            target = runtime / "history.jsonl"
+            if target_kind == "canonical":
+                target = canonical / "consumer-state"
+                target.write_text("canonical\n", encoding="utf-8")
+            with target.open("rb"):
+                script = (
+                    "import os,sys; from pathlib import Path; "
+                    "from ihar import runtime_state_upgrade as m; "
+                    "m._proc_processes=lambda proc:[Path(f'/proc/{os.getppid()}')]; "
+                    "sys.exit(m.main(sys.argv[1:]))"
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", script, str(manifest), str(state), "codex"],
+                    env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "lib/python")},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            assert result.returncode == 1, result.stderr
+            assert str(os.getpid()) in result.stderr
+            assert_materialized(runtime)
+            assert canonical.is_dir()
+            if target_kind == "materialized":
+                assert not any(canonical.iterdir())
+            else:
+                assert target.read_text(encoding="utf-8") == "canonical\n"
 
 
 def test_native_runtime_selectors_block_owner_sibling_and_canonical_state():

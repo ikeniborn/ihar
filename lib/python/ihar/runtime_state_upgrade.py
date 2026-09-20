@@ -436,21 +436,6 @@ def _runtime_views(
     return views
 
 
-def _ancestor_pids() -> set[int]:
-    ignored = {os.getpid()}
-    parent = os.getppid()
-    while parent > 1 and parent not in ignored:
-        ignored.add(parent)
-        try:
-            status = Path(f"/proc/{parent}/status").read_text(encoding="utf-8")
-            parent = int(
-                next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:"))
-            )
-        except (OSError, StopIteration, ValueError):
-            break
-    return ignored
-
-
 def _path_within(path: str, root: Path) -> bool:
     deleted_suffix = " (deleted)"
     if path.endswith(deleted_suffix):
@@ -467,13 +452,6 @@ def _process_exists(process: Path) -> bool:
 
 def _proc_processes(proc: Path) -> list[Path]:
     return list(proc.iterdir())
-
-
-def _same_process_session(pid: int) -> bool:
-    try:
-        return os.getsid(pid) == os.getsid(0)
-    except ProcessLookupError:
-        return False
 
 
 def _selected_runtime(
@@ -499,7 +477,7 @@ def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) 
     proc = Path("/proc")
     if not proc.is_dir():
         raise UpgradeError("cannot prove runtime-state quiescence: /proc is unavailable")
-    ignored = _ancestor_pids()
+    ignored = {os.getpid()}
     current_uid = os.getuid()
     protected_roots = (canonical, owner)
     uncertainties: list[str] = []
@@ -508,51 +486,51 @@ def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) 
             continue
         pid = int(process.name)
         try:
-            status = (process / "status").read_text(encoding="utf-8")
-            uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
-            uid = int(uid_line.split()[1])
+            uid = process.stat(follow_symlinks=False).st_uid
         except FileNotFoundError:
             continue
-        except (OSError, StopIteration, ValueError) as error:
+        except OSError as error:
             if not _process_exists(process):
                 continue
-            uncertainties.append(f"process {pid} status: {error}")
+            uncertainties.append(f"process {pid} identity: {error}")
             continue
         if uid != current_uid:
             continue
         try:
             environment_bytes = (process / "environ").read_bytes()
-        except FileNotFoundError:
-            continue
         except OSError as error:
             if not _process_exists(process):
-                continue
-            if not _same_process_session(pid):
                 continue
             uncertainties.append(f"process {pid} environment: {error}")
-            continue
-        if not environment_bytes or not environment_bytes.endswith(b"\0"):
-            if _same_process_session(pid):
+            environment_bytes = None
+        if environment_bytes is not None:
+            if not environment_bytes or not environment_bytes.endswith(b"\0"):
                 uncertainties.append(f"process {pid} environment is incomplete")
-            continue
-        environment = environment_bytes.split(b"\0")
-        selected = _selected_runtime(environment, runtime_paths, canonical, owner)
-        if selected is not None:
-            selector, active_runtime = selected
-            raise UpgradeError(
-                f"runtime state is active in process {pid}: {selector}={active_runtime}"
-            )
-        links: list[tuple[str, Path]] = [("cwd", process / "cwd")]
+            else:
+                environment = environment_bytes.split(b"\0")
+                selected = _selected_runtime(environment, runtime_paths, canonical, owner)
+                if selected is not None:
+                    selector, active_runtime = selected
+                    raise UpgradeError(
+                        f"runtime state is active in process {pid}: {selector}={active_runtime}"
+                    )
+
         try:
-            links.extend(("open file", entry) for entry in (process / "fd").iterdir())
-        except FileNotFoundError:
-            continue
+            cwd = os.readlink(process / "cwd")
         except OSError as error:
-            if not _process_exists(process):
-                continue
-            uncertainties.append(f"process {pid} file descriptors: {error}")
-            continue
-        for kind, link in links:
+            if _process_exists(process):
+                uncertainties.append(f"process {pid} cwd: {error}")
+        else:
+            if any(_path_within(cwd, root) for root in protected_roots):
+                raise UpgradeError(f"runtime-state cwd consumer is active in process {pid}: {cwd}")
+
+        try:
+            file_descriptors = list((process / "fd").iterdir())
+        except OSError as error:
+            if _process_exists(process):
+                uncertainties.append(f"process {pid} file descriptors: {error}")
+            file_descriptors = []
+        for link in file_descriptors:
             try:
                 target = os.readlink(link)
             except FileNotFoundError:
@@ -560,10 +538,12 @@ def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) 
             except OSError as error:
                 if not _process_exists(process):
                     continue
-                uncertainties.append(f"process {pid} {kind}: {error}")
+                uncertainties.append(f"process {pid} open file {link.name}: {error}")
                 continue
             if any(_path_within(target, root) for root in protected_roots):
-                raise UpgradeError(f"runtime-state {kind} consumer is active in process {pid}: {target}")
+                raise UpgradeError(
+                    f"runtime-state open file consumer is active in process {pid}: {target}"
+                )
     if uncertainties:
         raise UpgradeError(
             "cannot prove that runtime-state consumers are quiescent: " + "; ".join(uncertainties)

@@ -115,3 +115,31 @@ Focused evidence on the final executable state:
 - `bash tests/test_state.sh` — exit 0, `PASS=317 FAIL=0`.
 - Python compile, Bash syntax, and `git diff --check` — exit 0.
 - Full suite intentionally not run per review-fix scope.
+
+## Review fix round 3
+
+### RED evidence
+
+- A detached `setsid` process with `CODEX_HOME` selecting a sibling runtime, an open materialized-state fd, and unreadable environment was skipped solely because its session differed from the migration helper.
+- A detached process with a partial environment and an open runtime fd was skipped before cwd/fd inspection.
+- A parent process holding materialized or canonical state open was excluded as helper ancestry while its child successfully invoked the migration.
+
+### Remediation
+
+- Environment failure no longer short-circuits a process scan. Every same-UID process is checked for cwd and every enumerable fd even when its environment is unreadable, empty, or partial. Any protected-path reference blocks immediately; remaining unknown environment/cwd/fd evidence fails closed.
+- Session-based relevance filtering was removed. Detached processes receive the same inspection as every other same-UID process.
+- Blanket parent and ancestor exclusion was removed. Only the exact current migration PID is excluded; this migration creates no subprocesses, so it owns no additional exclusion lifetime.
+- Process identity now comes from the `/proc/<pid>` directory owner before reading process evidence. Exited processes are treated as races; live permission failures remain blocking uncertainty.
+
+### GREEN evidence
+
+- `PYTHONPATH=lib/python python3 tests/test_jsonio.py` — exit 0, `PASS=29 FAIL=0`.
+- `PYTHONPATH=lib/python python3 tests/test_runtime_state_upgrade.py` — exit 0, `PASS=26 FAIL=0`.
+- `bash tests/test_contracts.sh` — exit 0, `PASS=84 FAIL=0`.
+- `PYTHONPATH=lib/python python3 tests/test_sessions_readers.py` — exit 0.
+- `bash tests/test_config.sh` — exit 0, `PASS=20 FAIL=0`.
+- `bash tests/test_profiles.sh` — exit 0, `PASS=58 FAIL=0`.
+- `bash tests/test_concurrency.sh` — exit 0, `PASS=33 FAIL=0`.
+- `unshare --map-user=1000 --map-group=1000 -pf --mount-proc bash tests/test_state.sh` — exit 0, `PASS=317 FAIL=0`. PID isolation prevents unrelated opaque host services from becoming intentional fail-closed quiescence blockers while retaining non-root permission behavior.
+- Python compile, Bash syntax, and `git diff --check` — exit 0.
+- Full suite intentionally not run per review-fix scope.
