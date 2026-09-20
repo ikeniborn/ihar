@@ -195,6 +195,86 @@ ln -sfn /nowhere "$rt2/hooks"
 ihar_link_runtime claude "$rt2" "$STATE" 2>/dev/null
 assert_eq "a wrong link is repointed" "$IHAR_STORE/hooks" "$(readlink "$rt2/hooks")"
 
+# Both runtime linking and migration consume one validated inventory. This fixture
+# is intentionally outside the repository so adding an entry proves neither path
+# depends on a second hard-coded Bash list.
+MANIFEST_PARENT="$IHAR_TEST_TMP/manifest-parent"
+MANIFEST_ROOT="$MANIFEST_PARENT/ihar"
+MANIFEST_PROJECT="$IHAR_TEST_TMP/manifest-project"
+MANIFEST_HASH="$(printf '%s' "$MANIFEST_PROJECT" | sha256sum | cut -c1-12)"
+MANIFEST_LEGACY="$MANIFEST_PARENT/icodex/.codex-homes/fixture-$MANIFEST_HASH"
+MANIFEST_LINK_STATE="$IHAR_TEST_TMP/manifest-link-state"
+MANIFEST_MIGRATE_STATE="$IHAR_TEST_TMP/manifest-migrate-state"
+MANIFEST_RUNTIME="$IHAR_TEST_TMP/manifest-runtime"
+mkdir -p "$MANIFEST_ROOT/manifests" "$MANIFEST_LEGACY/data" \
+  "$MANIFEST_LINK_STATE/st/codex" "$MANIFEST_MIGRATE_STATE/st/codex" \
+  "$MANIFEST_RUNTIME" "$MANIFEST_PROJECT"
+ln -s "$ROOT/lib" "$MANIFEST_ROOT/lib"
+cat > "$MANIFEST_ROOT/manifests/state.json" <<'JSON'
+{
+  "schema": 1,
+  "entries": [
+    {"vendor":"codex","path":"data","kind":"directory"},
+    {"vendor":"codex","path":"future.jsonl","kind":"file"},
+    {"vendor":"codex","path":"state.sqlite","kind":"sqlite-family"}
+  ]
+}
+JSON
+printf 'db\n' > "$MANIFEST_LEGACY/state.sqlite"
+printf 'wal\n' > "$MANIFEST_LEGACY/state.sqlite-wal"
+printf 'shm\n' > "$MANIFEST_LEGACY/state.sqlite-shm"
+printf 'nested\n' > "$MANIFEST_LEGACY/data/record"
+
+SAVED_IHAR_ROOT="$IHAR_ROOT"
+IHAR_ROOT="$MANIFEST_ROOT"
+state_inventory() { ihar_state_inventory "$1"; }
+migration_inventory() { ihar_migration_inventory "$1"; }
+assert_exit "link inventory query succeeds" 0 ihar_state_inventory codex
+assert_exit "migration inventory query succeeds" 0 ihar_migration_inventory codex
+assert_eq "linker and migration read the same entries" \
+  "$(state_inventory codex)" "$(migration_inventory codex)"
+ihar_link_runtime codex "$MANIFEST_RUNTIME" "$MANIFEST_LINK_STATE" 2>/dev/null
+assert_exit "a declared directory is linked" 0 test -L "$MANIFEST_RUNTIME/data"
+assert_exit "a declared directory source is created" 0 \
+  test -d "$MANIFEST_LINK_STATE/st/codex/data"
+assert_exit "a declared absent file gets a dangling link" 0 test -L "$MANIFEST_RUNTIME/future.jsonl"
+assert_exit "a SQLite base is linked" 0 test -L "$MANIFEST_RUNTIME/state.sqlite"
+assert_exit "a SQLite WAL is linked" 0 test -L "$MANIFEST_RUNTIME/state.sqlite-wal"
+assert_exit "a SQLite SHM is linked" 0 test -L "$MANIFEST_RUNTIME/state.sqlite-shm"
+
+ihar_migrate_vendor codex "$MANIFEST_MIGRATE_STATE" "$MANIFEST_PROJECT" >/dev/null
+assert_exit "migration copies a manifest directory" 0 \
+  test -f "$MANIFEST_MIGRATE_STATE/st/codex/data/record"
+assert_exit "migration copies a SQLite base" 0 \
+  test -f "$MANIFEST_MIGRATE_STATE/st/codex/state.sqlite"
+assert_exit "migration keeps the SQLite WAL" 0 \
+  test -f "$MANIFEST_MIGRATE_STATE/st/codex/state.sqlite-wal"
+assert_exit "migration keeps the SQLite SHM" 0 \
+  test -f "$MANIFEST_MIGRATE_STATE/st/codex/state.sqlite-shm"
+
+python3 - "$MANIFEST_ROOT/manifests/state.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+manifest = json.load(open(path, encoding="utf-8"))
+manifest["entries"].append({"vendor": "codex", "path": "added.jsonl", "kind": "file"})
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle)
+PY
+printf 'added\n' > "$MANIFEST_LEGACY/added.jsonl"
+MANIFEST_LINK_STATE_ADDED="$IHAR_TEST_TMP/manifest-link-state-added"
+MANIFEST_MIGRATE_STATE_ADDED="$IHAR_TEST_TMP/manifest-migrate-state-added"
+MANIFEST_RUNTIME_ADDED="$IHAR_TEST_TMP/manifest-runtime-added"
+mkdir -p "$MANIFEST_LINK_STATE_ADDED/st/codex" \
+  "$MANIFEST_MIGRATE_STATE_ADDED/st/codex" "$MANIFEST_RUNTIME_ADDED"
+assert_eq "manifest additions reach linker and migration without Bash array edits" \
+  "$(state_inventory codex)" "$(migration_inventory codex)"
+ihar_link_runtime codex "$MANIFEST_RUNTIME_ADDED" "$MANIFEST_LINK_STATE_ADDED" 2>/dev/null
+assert_exit "the added file is linked" 0 test -L "$MANIFEST_RUNTIME_ADDED/added.jsonl"
+ihar_migrate_vendor codex "$MANIFEST_MIGRATE_STATE_ADDED" "$MANIFEST_PROJECT" >/dev/null
+assert_exit "the added file is migrated" 0 \
+  test -f "$MANIFEST_MIGRATE_STATE_ADDED/st/codex/added.jsonl"
+IHAR_ROOT="$SAVED_IHAR_ROOT"
+
 # --- migration from a legacy home ----------------------------------------------------
 
 LEGACY="$IHAR_TEST_TMP/parent/iclaude/.claude-homes/whatever-$(printf '%s' "$PROJECT" | sha256sum | cut -c1-12)"
@@ -209,6 +289,7 @@ ln -s /etc/passwd "$LEGACY/.credentials.json"
 IHAR_ROOT="$IHAR_TEST_TMP/parent/ihar"
 mkdir -p "$IHAR_ROOT"
 ln -sfn "$ROOT/lib" "$IHAR_ROOT/lib"
+ln -sfn "$ROOT/manifests" "$IHAR_ROOT/manifests"
 FRESH="$IHAR_TEST_TMP/fresh-state"
 mkdir -p "$FRESH/st/claude"
 ihar_migrate_vendor claude "$FRESH" "$PROJECT" >/dev/null
@@ -372,8 +453,12 @@ ln -s /etc/passwd "$CLI_CLAUDE/projects/nested-link"
 mkfifo "$CLI_CLAUDE/projects/nested-fifo"
 printf 'codex-history\n' > "$CLI_CODEX/state_5.sqlite"
 printf 'codex-wal\n' > "$CLI_CODEX/state_5.sqlite-wal"
-printf 'thread-history\n' > "$CLI_CODEX/thread_history_1.sqlite"
-printf 'thread-wal\n' > "$CLI_CODEX/thread_history_1.sqlite-wal"
+printf 'codex-shm\n' > "$CLI_CODEX/state_5.sqlite-shm"
+for family in goals_1.sqlite memories_1.sqlite logs_2.sqlite; do
+  printf '%s\n' "$family" > "$CLI_CODEX/$family"
+  printf '%s wal\n' "$family" > "$CLI_CODEX/$family-wal"
+  printf '%s shm\n' "$family" > "$CLI_CODEX/$family-shm"
+done
 printf '{"schema":1,"project_root":"%s","created":"2026-01-01T00:00:00Z"}\n' \
   "$CLI_PROJECT" > "$CLI_CLAUDE/home.json"
 
@@ -402,8 +487,16 @@ assert_exit "homes migrate copies Codex state" 0 \
   test -f "$CLI_STATE/st/codex/state_5.sqlite"
 assert_exit "homes migrate copies the Codex WAL with its database" 0 \
   test -f "$CLI_STATE/st/codex/state_5.sqlite-wal"
-assert_exit "homes migrate copies the thread-history WAL with its database" 0 \
-  test -f "$CLI_STATE/st/codex/thread_history_1.sqlite-wal"
+assert_exit "homes migrate copies the Codex SHM with its database" 0 \
+  test -f "$CLI_STATE/st/codex/state_5.sqlite-shm"
+for family in goals_1.sqlite memories_1.sqlite logs_2.sqlite; do
+  assert_exit "homes migrate copies $family" 0 \
+    test -f "$CLI_STATE/st/codex/$family"
+  assert_exit "homes migrate copies $family WAL" 0 \
+    test -f "$CLI_STATE/st/codex/$family-wal"
+  assert_exit "homes migrate copies $family SHM" 0 \
+    test -f "$CLI_STATE/st/codex/$family-shm"
+done
 assert_exit "homes migrate skips nested legacy symlinks" 1 \
   test -e "$CLI_STATE/st/claude/projects/nested-link"
 assert_exit "homes migrate skips nested special files" 1 \

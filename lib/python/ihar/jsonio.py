@@ -285,6 +285,17 @@ def _conformance_rules(obj: Mapping[str, Any]) -> None:
         )
 
 
+def _state_manifest_rules(obj: Mapping[str, Any]) -> None:
+    keys: set[tuple[str, str]] = set()
+    for entry in obj["entries"]:
+        key = (entry["vendor"], entry["path"])
+        if key in keys:
+            raise SchemaError(
+                f"state manifest: duplicate entry for vendor {key[0]!r} and path {key[1]!r}"
+            )
+        keys.add(key)
+
+
 # --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
@@ -627,6 +638,27 @@ KINDS: dict[str, dict[str, Any]] = {
             },
         },
         "rules": [],
+    },
+    # LLD 2.4
+    "state-manifest": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "entries": {
+                "type": list,
+                "items": {
+                    "type": dict,
+                    "fields": {
+                        "vendor": {"type": str, "enum": _VENDOR},
+                        "path": {"type": str, "pattern": _SAFE_REL},
+                        "kind": {
+                            "type": str,
+                            "enum": ("directory", "file", "sqlite-family"),
+                        },
+                    },
+                },
+            },
+        },
+        "rules": [_state_manifest_rules],
     },
 }
 

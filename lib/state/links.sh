@@ -3,8 +3,9 @@
 #
 # The repair rules are lifted from iclaude:lib/config/isolated.sh:link_shared_assets:
 # a correct link is untouched, a wrong link or a materialised real copy is replaced
-# with a warning, a stale link into a since-removed entry is pruned, an absent source
-# is skipped, and the source is never mutated.
+# with a warning, and the source is never mutated. Absent store sources are skipped;
+# declared state files intentionally retain dangling links until the vendor creates
+# their canonical targets.
 #
 # Failure class: fail-soft for a link that cannot be made, because the vendor may not
 # need that entry; a caller whose profile depends on one verifies it separately.
@@ -32,18 +33,15 @@ _IHAR_STORE_LINKS_CODEX=(
   "auth/codex/auth.json:auth.json"
 )
 
-# Vendor state directories, which persist across every profile switch. Files the
-# vendor seeds itself, such as .claude.json and history.jsonl, are not linked here:
-# a dangling link would break the vendor, and only the adapter knows what valid
-# initial content is. S4 owns that seeding.
-_IHAR_STATE_DIRS_CLAUDE=(projects sessions session-env file-history)
-_IHAR_STATE_DIRS_CODEX=(sessions app-server-control)
+ihar_state_inventory() {
+  ihar_python ihar.inventory state "$IHAR_ROOT/manifests/state.json" "$1"
+}
 
 # _ihar_link <source> <target> — idempotent, self-repairing.
 _ihar_link() {
-  local source="$1" target="$2"
+  local source="$1" target="$2" allow_missing="${3:-false}"
 
-  if [[ ! -e "$source" ]]; then
+  if [[ ! -e "$source" && "$allow_missing" != true ]]; then
     # A stale link into a source that has since been removed is pruned, so the
     # runtime home never carries a dangling entry.
     if [[ -L "$target" && ! -e "$target" ]]; then
@@ -68,7 +66,7 @@ _ihar_link() {
 
 # ihar_link_runtime <vendor> <runtime-dir> <state-dir> — wire one runtime home.
 ihar_link_runtime() {
-  local vendor="$1" runtime="$2" state="$3" entry source name
+  local vendor="$1" runtime="$2" state="$3" entry source name kind suffix inventory
 
   local -n store_links="_IHAR_STORE_LINKS_${vendor^^}"
   for entry in "${store_links[@]}"; do
@@ -77,10 +75,28 @@ ihar_link_runtime() {
     _ihar_link "$source" "$runtime/$name"
   done
 
-  local -n state_dirs="_IHAR_STATE_DIRS_${vendor^^}"
-  for name in "${state_dirs[@]}"; do
-    source="$state/st/$vendor/$name"
-    mkdir -p "$source"
-    _ihar_link "$source" "$runtime/$name"
-  done
+  inventory="$(ihar_state_inventory "$vendor")" \
+    || { ihar_warn "cannot read $vendor state inventory"; return 3; }
+  while IFS=$'\t' read -r name kind; do
+    [[ -n "$name" ]] || continue
+    case "$kind" in
+      directory)
+        source="$state/st/$vendor/$name"
+        mkdir -p "$source" "$(dirname "$runtime/$name")"
+        _ihar_link "$source" "$runtime/$name" true
+        ;;
+      file)
+        source="$state/st/$vendor/$name"
+        mkdir -p "$(dirname "$source")" "$(dirname "$runtime/$name")"
+        _ihar_link "$source" "$runtime/$name" true
+        ;;
+      sqlite-family)
+        for suffix in '' -wal -shm; do
+          source="$state/st/$vendor/$name$suffix"
+          mkdir -p "$(dirname "$source")" "$(dirname "$runtime/$name$suffix")"
+          _ihar_link "$source" "$runtime/$name$suffix" true
+        done
+        ;;
+    esac
+  done <<< "$inventory"
 }

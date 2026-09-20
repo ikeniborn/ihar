@@ -46,6 +46,13 @@ RECEIPT = {
     },
 }
 
+STATE_MANIFEST = {
+    "schema": 1,
+    "entries": [
+        {"vendor": "codex", "path": "state_5.sqlite", "kind": "sqlite-family"},
+    ],
+}
+
 
 def rejects(kind, doc, needle=None, **kwargs):
     try:
@@ -250,6 +257,25 @@ def test_invalid_install_receipt_preserves_previous_file():
             raise AssertionError("write_receipt accepted invalid evidence")
         assert open(target, encoding="utf-8").read() == "previous\n"
         assert not [name for name in os.listdir(tmp) if name.startswith(".install-receipt-")]
+
+
+def test_state_manifest_accepts_only_safe_relative_paths_and_supported_kinds():
+    jsonio.check("state-manifest", STATE_MANIFEST)
+    for path in ("", "/absolute", "../escape", "nested/../escape", "nested//empty", "trailing/"):
+        rejects("state-manifest", {
+            **STATE_MANIFEST,
+            "entries": [{"vendor": "codex", "path": path, "kind": "file"}],
+        }, "path")
+    rejects("state-manifest", {
+        **STATE_MANIFEST,
+        "entries": [{"vendor": "codex", "path": "state", "kind": "socket"}],
+    }, "kind")
+
+
+def test_state_manifest_rejects_duplicate_vendor_path_keys():
+    entry = STATE_MANIFEST["entries"][0]
+    duplicate = {**entry, "kind": "file"}
+    rejects("state-manifest", {**STATE_MANIFEST, "entries": [entry, duplicate]}, "duplicate")
 
 
 if __name__ == "__main__":

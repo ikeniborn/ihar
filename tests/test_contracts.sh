@@ -166,13 +166,18 @@ accept "a nested script path inside the hooks directory is accepted" hook-manife
 
 for kind in profile netpolicy hook-manifest mcp-registry capabilities session \
             launch-claim handoff daemon-record conformance home-marker lockfile \
-            install-receipt; do
+            install-receipt state-manifest; do
   assert_exit "contract kind '$kind' is registered" 0 py "
 import sys
 from ihar import jsonio
 sys.exit(0 if sys.argv[1] in jsonio.KINDS else 1)
 " "$kind"
 done
+
+
+assert_exit "the persistent-state manifest validates" 0 \
+  py 'import sys; from ihar import jsonio; jsonio.read("state-manifest", sys.argv[1])' \
+  "$ROOT/manifests/state.json"
 
 assert_exit "the tracked release lockfile validates" 0 \
   py 'import sys; from ihar import jsonio; jsonio.read("lockfile", sys.argv[1])' \
