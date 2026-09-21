@@ -212,6 +212,11 @@ ihar_install_transaction() { # <install|update>
   if (( status == 0 )); then
     _ihar_activate_generation "$store_stage" "$nvm_stage" "$backup" || status=$?
   fi
+  if (( status == 0 )) && [[ -f "$store_stage/.ihar-unproven-vendors" ]]; then
+    while IFS= read -r name; do
+      ihar_warn "hook conformance unproven for $name; run 'ihar check --conformance' after authentication"
+    done < "$store_stage/.ihar-unproven-vendors"
+  fi
   rm -rf -- "$store_stage" "$nvm_stage"
   if [[ "${IHAR_FLAG_MIGRATE_STORE:-false}" == true ]]; then
     _ihar_store_release_source_locks
@@ -544,7 +549,10 @@ ihar_install_conformance() {
           ihar_warn "cannot discard failed conformance record for $vendor"
           return 3
         }
-        ihar_warn "hook conformance unproven for $vendor; run 'ihar check --conformance' after authentication"
+        printf '%s\n' "$vendor" >> "$IHAR_STORE/.ihar-unproven-vendors" || {
+          ihar_warn "cannot record unproven conformance for $vendor"
+          return 3
+        }
         continue
       fi
     fi

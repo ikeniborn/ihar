@@ -807,8 +807,11 @@ for scenario in bootstrap-prerecord bootstrap-missing-record bootstrap-invalid-r
     bootstrap-receipt) expected_status=37 ;;
     bootstrap-activation) expected_status=39 ;;
   esac
-  assert_exit "$scenario aborts install" "$expected_status" \
-    run_install_scenario "$scenario"
+  scenario_status=0
+  scenario_output="$(run_install_scenario "$scenario" 2>&1)" || scenario_status=$?
+  assert_eq "$scenario aborts install" "$expected_status" "$scenario_status"
+  assert_exit "$scenario prints no post-auth proof advice without activation" 1 \
+    grep -qF -- "ihar check --conformance" <<< "$scenario_output"
   assert_bootstrap_published_nothing "$scenario"
   assert_eq "$scenario attempts both installed vendor suites" \
     $'claude\ncodex' "$(cat "$IHAR_TEST_TMP/$scenario.conformance-runs")"
