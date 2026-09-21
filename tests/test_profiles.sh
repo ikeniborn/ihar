@@ -355,6 +355,14 @@ printf 'wrong newest\n' > "$CHECK_STATE/r/ffffffff/codex/config.toml"
 touch "$CHECK_STATE/r/ffffffff"
 exact_diff="$(ihar --profile protected check --diff)"
 assert_eq "diff uses exact desired runtime and real gateway inputs" "no differences" "$exact_diff"
+combined_status=0
+combined_output="$(IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
+  IHAR_TEST_FAIL_VENDOR=claude IHAR_CLAUDE_BIN="$VENDOR_STUB" \
+  IHAR_CODEX_BIN="$VENDOR_STUB" ihar --profile protected check --diff --conformance)" \
+  || combined_status=$?
+assert_eq "clean diff retains failed conformance status" 1 "$combined_status"
+assert_eq "combined flags still render the clean diff" "no differences" \
+  "$(tail -n 1 <<<"$combined_output")"
 
 FAIL_TMP="$IHAR_TEST_TMP/check-failure-temp"
 FAIL_PY="$IHAR_TEST_TMP/fail-check-python"

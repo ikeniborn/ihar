@@ -133,7 +133,10 @@ ihar_cmd_check() (
       ihar_cmd_conformance || conformance_status=$?
     fi
   fi
-  if [[ "$IHAR_FLAG_DIFF" == true ]]; then ihar_check_diff; return $?; fi
+  if [[ "$IHAR_FLAG_DIFF" == true ]]; then
+    ihar_check_diff || return $?
+    return "$conformance_status"
+  fi
   result="$(mktemp "${TMPDIR:-/tmp}/ihar-check-result-XXXXXX.json")" || return 1
   ihar_check_collect "$result" || return $?
   if [[ "$IHAR_FLAG_JSON" == true ]]; then
