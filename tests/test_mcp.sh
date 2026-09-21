@@ -37,6 +37,16 @@ assert_exit "the shipped registry validates" 0 python3 -c "
 from ihar import jsonio
 jsonio.read('mcp-registry', '$ROOT/manifests/mcp/registry.json')"
 
+remote_codex="$(IHAR_IWIKI_REMOTE_URL=https://wiki.example/mcp \
+  IWIKI_REMOTE_TOKEN=test-token REGISTRY="$ROOT/manifests/mcp/registry.json" \
+  body codex standard)"
+assert_contains "the shipped remote URL is concrete for Codex" "$remote_codex" \
+  'url = "https://wiki.example/mcp"'
+assert_contains "the shipped remote token is forwarded by name" "$remote_codex" \
+  'bearer_token_env_var = "IWIKI_REMOTE_TOKEN"'
+assert_eq "the shipped remote token value is absent" "0" \
+  "$(grep -c 'test-token' <<<"$remote_codex")"
+
 # --- each vendor gets its own spelling ---------------------------------------------------
 
 write_registry "$BOTH"

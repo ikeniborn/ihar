@@ -581,7 +581,7 @@ hook enforcement unproven for <vendor> <version>; run ihar check --conformance
  ]}
 ```
 
-`env_names` forward by name only. `${IHAR_PROJECT_ROOT}` and `${IHAR_STATE}` are expanded by the renderer; any other `${…}` is left to the vendor, and since Codex does not expand, an unexpanded reference in a Codex render is exit 3. `egress` lists the hosts the server itself needs and feeds the network policy of §9.2.
+`env_names` forward by name only. `${IHAR_PROJECT_ROOT}`, `${IHAR_STATE}`, `${IHAR_STORE}`, and the configured `${IHAR_IWIKI_REMOTE_URL}` are expanded by the renderer; the remote bearer token remains forwarded by name. Any other `${…}` is left to the vendor, and since Codex does not expand, an unexpanded reference in a Codex render is exit 3. `egress` lists the hosts the server itself needs and feeds the network policy of §9.2.
 
 ### 7.2 Rendering
 
