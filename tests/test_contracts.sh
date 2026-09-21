@@ -235,11 +235,21 @@ asset_identity_reordered="$(python3 -m ihar.inventory asset-identity \
 assert_eq "asset identity ignores JSON and entry ordering" \
   "$asset_identity_first" "$asset_identity_reordered"
 
-mkdir -p "$ASSET_IDENTITY_ROOT/optional/tools"
+mkdir -p "$ASSET_IDENTITY_ROOT/optional"
+printf 'wrong kind\n' > "$ASSET_IDENTITY_ROOT/optional/tools"
+asset_identity_optional_wrong_kind="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+assert_exit "an optional wrong-kind source differs from absence" 1 \
+  test "$asset_identity_first" = "$asset_identity_optional_wrong_kind"
+
+rm "$ASSET_IDENTITY_ROOT/optional/tools"
+mkdir "$ASSET_IDENTITY_ROOT/optional/tools"
 asset_identity_optional_present="$(python3 -m ihar.inventory asset-identity \
   "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
-assert_exit "an optional source becoming present changes asset identity" 1 \
+assert_exit "an optional correct-kind source differs from absence" 1 \
   test "$asset_identity_first" = "$asset_identity_optional_present"
+assert_exit "an optional correct-kind source differs from wrong kind" 1 \
+  test "$asset_identity_optional_wrong_kind" = "$asset_identity_optional_present"
 
 python3 - "$ASSET_IDENTITY_ROOT/first.json" <<'PY'
 import json, sys
@@ -251,10 +261,23 @@ document["entries"].append({
 })
 json.dump(document, open(path, "w", encoding="utf-8"))
 PY
-asset_identity_required_added="$(python3 -m ihar.inventory asset-identity \
+asset_identity_required_absent="$(python3 -m ihar.inventory asset-identity \
   "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
 assert_exit "a required runtime inventory addition changes asset identity" 1 \
-  test "$asset_identity_optional_present" = "$asset_identity_required_added"
+  test "$asset_identity_optional_present" = "$asset_identity_required_absent"
+mkdir -p "$ASSET_IDENTITY_ROOT/required/new.txt"
+asset_identity_required_wrong_kind="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+assert_exit "a required wrong-kind source differs from absence" 1 \
+  test "$asset_identity_required_absent" = "$asset_identity_required_wrong_kind"
+rm -rf "$ASSET_IDENTITY_ROOT/required/new.txt"
+printf 'required new\n' > "$ASSET_IDENTITY_ROOT/required/new.txt"
+asset_identity_required_present="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+assert_exit "a required correct-kind source differs from absence" 1 \
+  test "$asset_identity_required_absent" = "$asset_identity_required_present"
+assert_exit "a required correct-kind source differs from wrong kind" 1 \
+  test "$asset_identity_required_wrong_kind" = "$asset_identity_required_present"
 
 # --- mutable auth and plugin links are separate from tracked assets ---------------
 

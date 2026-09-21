@@ -140,6 +140,32 @@ asset_runtime_missing="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_ST
 assert_exit "an absent optional store source is absent from its generation" 1 \
   test -e "$asset_runtime_missing/tools"
 
+# Wrong-kind and symlinked optional sources are distinct store topologies, but
+# neither is eligible for linking into a runtime.
+mkdir -p "$ASSET_HASH_STORE/optional"
+printf 'wrong kind\n' > "$ASSET_HASH_STORE/optional/tools"
+asset_hash_wrong_kind="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_exit "an optional wrong-kind store source has a distinct generation" 1 \
+  test "$asset_hash_missing" = "$asset_hash_wrong_kind"
+asset_runtime_wrong_kind="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_wrong_kind")"
+assert_exit "an optional wrong-kind store source is not linked" 1 \
+  test -e "$asset_runtime_wrong_kind/tools"
+
+rm -rf "$ASSET_HASH_STORE/optional"
+mkdir -p "$ASSET_HASH_STORE/outside-optional/tools"
+ln -s "$ASSET_HASH_STORE/outside-optional" "$ASSET_HASH_STORE/optional"
+asset_hash_symlink="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_exit "a symlinked optional store parent has a distinct generation" 1 \
+  test "$asset_hash_wrong_kind" = "$asset_hash_symlink"
+asset_runtime_symlink="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_symlink")"
+assert_exit "an optional source behind a symlinked parent is not linked" 1 \
+  test -e "$asset_runtime_symlink/tools"
+rm "$ASSET_HASH_STORE/optional"
+
 # A repository source appearing before install does not change the actual topology
 # the runtime linker sees. Publishing it into the store does, and must choose a new
 # generation rather than silently reuse the link-less one.
@@ -154,6 +180,10 @@ asset_hash_present="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE
   ihar_config_hash asset identity optional source a b c d)"
 assert_exit "an optional store asset becoming available selects a new generation" 1 \
   test "$asset_hash_missing" = "$asset_hash_present"
+assert_exit "an optional correct-kind store source differs from wrong kind" 1 \
+  test "$asset_hash_wrong_kind" = "$asset_hash_present"
+assert_exit "an optional correct-kind source differs from symlinked topology" 1 \
+  test "$asset_hash_symlink" = "$asset_hash_present"
 asset_runtime_present="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
   IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_present")"
 assert_exit "the optional asset generation is distinct" 1 \
@@ -173,12 +203,61 @@ json.dump(document, open(path, "w", encoding="utf-8"))
 PY
 mkdir -p "$ASSET_HASH_ROOT/required"
 printf 'required\n' > "$ASSET_HASH_ROOT/required/new.txt"
+asset_hash_required_absent="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+required_absent_runtime="$IHAR_TEST_TMP/required-absent-runtime"
+mkdir -p "$required_absent_runtime"
+printf 'runtime stays\n' > "$required_absent_runtime/sentinel"
+required_absent_status=0
+(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_link_runtime claude "$required_absent_runtime" "$ASSET_HASH_STATE") \
+  >/dev/null 2>&1 || required_absent_status=$?
+assert_eq "an absent required store source fails closed" "3" "$required_absent_status"
+assert_exit "required absence mutates no earlier optional target" 1 \
+  test -e "$required_absent_runtime/tools"
+assert_eq "required absence preserves existing runtime bytes" "runtime stays" \
+  "$(cat "$required_absent_runtime/sentinel")"
+
+mkdir -p "$ASSET_HASH_STORE/required/new.txt"
+asset_hash_required_wrong="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_exit "a required wrong-kind store source has a distinct generation" 1 \
+  test "$asset_hash_required_absent" = "$asset_hash_required_wrong"
+required_wrong_runtime="$IHAR_TEST_TMP/required-wrong-runtime"
+mkdir -p "$required_wrong_runtime"
+printf 'runtime stays\n' > "$required_wrong_runtime/sentinel"
+required_wrong_status=0
+(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_link_runtime claude "$required_wrong_runtime" "$ASSET_HASH_STATE") \
+  >/dev/null 2>&1 || required_wrong_status=$?
+assert_eq "a wrong-kind required store source fails closed" "3" "$required_wrong_status"
+assert_exit "required wrong kind mutates no earlier optional target" 1 \
+  test -e "$required_wrong_runtime/tools"
+assert_eq "required wrong kind preserves existing runtime bytes" "runtime stays" \
+  "$(cat "$required_wrong_runtime/sentinel")"
+required_wrong_materialise_status=0
+(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" \
+  ihar_runtime_materialise claude "$asset_hash_required_wrong") \
+  >/dev/null 2>&1 || required_wrong_materialise_status=$?
+assert_eq "required wrong kind aborts runtime materialisation" \
+  "3" "$required_wrong_materialise_status"
+assert_exit "required wrong kind creates no runtime generation" 1 \
+  test -e "$ASSET_HASH_STATE/r/$asset_hash_required_wrong"
+assert_eq "required wrong kind creates no runtime staging tree" "0" \
+  "$(find "$ASSET_HASH_STATE/r" -maxdepth 1 -type d -name '.staging-*' | wc -l)"
+
+rm -rf "$ASSET_HASH_STORE/required/new.txt"
 IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
   ihar_asset_install "$ASSET_HASH_STORE" >/dev/null
 asset_hash_required_added="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
   ihar_config_hash asset identity optional source a b c d)"
 assert_exit "a required runtime asset addition selects a new generation" 1 \
   test "$asset_hash_present" = "$asset_hash_required_added"
+assert_exit "a required correct-kind store source differs from wrong kind" 1 \
+  test "$asset_hash_required_wrong" = "$asset_hash_required_added"
+assert_exit "a required correct-kind store source differs from absence" 1 \
+  test "$asset_hash_required_absent" = "$asset_hash_required_added"
 asset_runtime_required="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
   IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_required_added")"
 assert_eq "the required asset generation links the installed source" \

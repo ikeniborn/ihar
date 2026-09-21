@@ -13,6 +13,15 @@ ihar_asset_inventory() {
     || { ihar_error "cannot read tracked asset inventory"; return 3; }
 }
 
+# ihar_asset_topology_inventory <vendor|all> — print validated asset semantics
+# plus nofollow store topology. This is the same projection used by runtime identity.
+ihar_asset_topology_inventory() {
+  local vendor="$1"
+  ihar_python ihar.inventory asset-topology \
+    "$IHAR_ROOT/manifests/assets.json" "$vendor" "$IHAR_STORE" \
+    || { ihar_error "cannot read tracked asset inventory"; return 3; }
+}
+
 # ihar_mutable_inventory <vendor|all> — print canonical store source, runtime
 # target and kind from the separate mutable-link inventory.
 ihar_mutable_inventory() {

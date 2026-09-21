@@ -61,16 +61,34 @@ ihar_verify_runtime_mutable_links() {
 # wrong or materialised path may be the only evidence of runtime tampering.
 ihar_verify_runtime_asset_links() {
   local vendor="$1" runtime="$2"
-  local inventory declared_source name kind required runtime_link source target
+  local inventory declared_source name kind required runtime_link topology source target
 
-  inventory="$(ihar_asset_inventory "$vendor")" || return 3
-  while IFS=$'\t' read -r declared_source name kind required runtime_link; do
+  inventory="$(ihar_asset_topology_inventory "$vendor")" || return 3
+  while IFS=$'\t' read -r declared_source name kind required runtime_link topology; do
     [[ "$runtime_link" == true ]] || continue
     source="$IHAR_STORE/$declared_source"
     target="$runtime/$name"
 
-    if [[ ! -e "$source" && "$required" == true ]]; then
-      ihar_die 3 "required runtime asset is missing from the store: $source"
+    if [[ "$required" == true && "$topology" != "$kind" ]]; then
+      if [[ "$topology" == absent ]]; then
+        ihar_die 3 "required runtime asset is missing from the store: $source"
+      fi
+      ihar_die 3 "required runtime asset has topology $topology, expected $kind: $source"
+    fi
+  done <<< "$inventory"
+
+  while IFS=$'\t' read -r declared_source name kind required runtime_link topology; do
+    [[ "$runtime_link" == true ]] || continue
+    source="$IHAR_STORE/$declared_source"
+    target="$runtime/$name"
+
+    if [[ "$topology" != "$kind" ]]; then
+      if [[ -L "$target" ]]; then
+        ihar_die 3 "optional runtime asset link $target has store topology $topology, expected $kind, and was preserved; remove it, then retry"
+      fi
+      [[ -e "$target" ]] \
+        && ihar_die 3 "runtime asset entry $target is materialised and was preserved; move it to a recovery location, then retry"
+      continue
     fi
 
     if [[ -L "$target" ]]; then
@@ -182,19 +200,29 @@ _ihar_link() {
 
 # ihar_link_runtime <vendor> <runtime-dir> <state-dir> — wire one runtime home.
 ihar_link_runtime() {
-  local vendor="$1" runtime="$2" state="$3" asset_inventory mutable_inventory source name kind required runtime_link suffix inventory
+  local vendor="$1" runtime="$2" state="$3" asset_inventory mutable_inventory source name kind required runtime_link topology suffix inventory
 
-  asset_inventory="$(ihar_asset_inventory "$vendor")" || return 3
+  asset_inventory="$(ihar_asset_topology_inventory "$vendor")" || return 3
   mutable_inventory="$(ihar_mutable_inventory "$vendor")" || return 3
   ihar_mutable_preflight "$IHAR_STORE" "$vendor" || return 3
-  while IFS=$'\t' read -r source name kind required runtime_link; do
+  while IFS=$'\t' read -r source name kind required runtime_link topology; do
+    [[ "$runtime_link" == true ]] || continue
+    if [[ "$required" == true && "$topology" != "$kind" ]]; then
+      source="$IHAR_STORE/$source"
+      if [[ "$topology" == absent ]]; then
+        ihar_error "required runtime asset is missing from the store: $source"
+        return 3
+      fi
+      ihar_error "required runtime asset has topology $topology, expected $kind: $source"
+      return 3
+    fi
+  done <<< "$asset_inventory"
+
+  while IFS=$'\t' read -r source name kind required runtime_link topology; do
     [[ "$runtime_link" == true ]] || continue
     source="$IHAR_STORE/$source"
-    if [[ ! -e "$source" ]]; then
-      if [[ "$required" == true ]]; then
-        ihar_die 3 "required runtime asset is missing from the store: $source"
-      fi
-      ihar_warn "optional runtime asset is missing from the store: $source"
+    if [[ "$topology" != "$kind" ]]; then
+      ihar_warn "optional runtime asset has topology $topology, expected $kind: $source"
       continue
     fi
     mkdir -p "$(dirname "$runtime/$name")"

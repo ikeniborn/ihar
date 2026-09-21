@@ -59,8 +59,11 @@ ihar_runtime_materialise() {
   [[ -n "${IHAR_STATE:-}" ]] || ihar_die 1 "ihar_runtime_materialise: IHAR_STATE is not set"
 
   local runtime="$IHAR_STATE/r/$hash/$vendor"
+  local materialise_status=0
   ihar_with_lock --required "$IHAR_STATE/.ihar.lock" 30 \
-    _ihar_runtime_materialise "$vendor" "$hash" "$render" "$mode" "$runtime"
+    _ihar_runtime_materialise "$vendor" "$hash" "$render" "$mode" "$runtime" \
+    || materialise_status=$?
+  (( materialise_status == 0 )) || return "$materialise_status"
 
   IHAR_RUNTIME="$runtime"
   export IHAR_RUNTIME
@@ -100,7 +103,12 @@ _ihar_runtime_materialise() {
     cp -R "$render/." "$build/" || ihar_die 1 "cannot copy the render into $build"
   fi
 
-  ihar_link_runtime "$vendor" "$build" "$IHAR_STATE"
+  local link_status=0
+  ihar_link_runtime "$vendor" "$build" "$IHAR_STATE" || link_status=$?
+  if (( link_status != 0 )); then
+    rm -rf -- "$staging"
+    return "$link_status"
+  fi
 
   mkdir -p "$IHAR_STATE/r/$hash"
   if ! mv "$build" "$runtime" 2>/dev/null; then

@@ -39,6 +39,72 @@ def asset_entries(
             yield entry["source"], entry["target"], entry["kind"], entry["required"], entry["runtime"]
 
 
+def _asset_source_topology(root: str, source: str) -> str:
+    """Classify a store source without following any path component."""
+    current = os.path.sep
+    for component in os.path.abspath(root).split(os.path.sep)[1:]:
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return "absent"
+        except NotADirectoryError:
+            return "non-directory-root"
+        if stat.S_ISLNK(metadata.st_mode):
+            return "symlinked-root"
+        if not stat.S_ISDIR(metadata.st_mode):
+            return "non-directory-root"
+
+    components = source.split("/")
+    for index, component in enumerate(components):
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return "absent"
+        except NotADirectoryError:
+            return "non-directory-parent"
+        leaf = index == len(components) - 1
+        if stat.S_ISLNK(metadata.st_mode):
+            return "symlink" if leaf else "symlinked-parent"
+        if not leaf:
+            if not stat.S_ISDIR(metadata.st_mode):
+                return "non-directory-parent"
+            continue
+        if stat.S_ISREG(metadata.st_mode):
+            return "file"
+        if stat.S_ISDIR(metadata.st_mode):
+            return "directory"
+        return "other"
+    raise AssertionError("validated asset source must not be empty")
+
+
+def _asset_topology_entries(
+    document: dict, vendor: str, root: str
+) -> Iterator[tuple[str, str, str, str, bool, bool, str]]:
+    for entry in document["entries"]:
+        if vendor != "all" and entry["vendor"] not in ("common", vendor):
+            continue
+        topology = _asset_source_topology(root, entry["source"])
+        yield (
+            entry["vendor"],
+            entry["source"],
+            entry["target"],
+            entry["kind"],
+            entry["required"],
+            entry["runtime"],
+            topology,
+        )
+
+
+def asset_topology_entries(
+    manifest: str | os.PathLike[str], vendor: str, root: str | os.PathLike[str]
+) -> Iterator[tuple[str, str, str, str, bool, bool, str]]:
+    """Yield validated asset semantics with nofollow store topology."""
+    document = jsonio.read("asset-manifest", manifest)
+    yield from _asset_topology_entries(document, vendor, os.fspath(root))
+
+
 def asset_manifest_identity(
     manifest: str | os.PathLike[str], vendor: str, root: str | os.PathLike[str]
 ) -> str:
@@ -49,16 +115,21 @@ def asset_manifest_identity(
     an optional installed source changes which links the next runtime owns.
     """
     document = jsonio.read("asset-manifest", manifest)
-    root_path = os.path.abspath(os.fspath(root))
     entries = []
-    for entry in document["entries"]:
-        if not entry["runtime"]:
+    for entry_vendor, source, target, kind, required, runtime, topology in _asset_topology_entries(
+        document, vendor, os.fspath(root)
+    ):
+        if not runtime:
             continue
-        if vendor != "all" and entry["vendor"] not in ("common", vendor):
-            continue
-        source = os.path.join(root_path, entry["source"])
-        present = os.path.isdir(source) if entry["kind"] == "directory" else os.path.isfile(source)
-        entries.append({**entry, "present": present})
+        entries.append({
+            "vendor": entry_vendor,
+            "source": source,
+            "target": target,
+            "kind": kind,
+            "required": required,
+            "runtime": runtime,
+            "topology": topology,
+        })
     entries.sort(
         key=lambda entry: (
             entry["vendor"],
@@ -225,13 +296,14 @@ def prepare_mutable_sources(
 def main(argv: list[str]) -> int:
     query_commands = ("state", "state-digest", "assets", "mutable-links")
     mutable_commands = ("mutable-preflight", "mutable-prepare")
-    commands = (*query_commands, "asset-identity", *mutable_commands)
+    asset_store_commands = ("asset-identity", "asset-topology")
+    commands = (*query_commands, *asset_store_commands, *mutable_commands)
     if len(argv) not in (3, 4) or argv[0] not in commands:
         return 2
     command, manifest, vendor = argv[:3]
     if command in query_commands and len(argv) != 3:
         return 2
-    if command == "asset-identity" and len(argv) != 4:
+    if command in asset_store_commands and len(argv) != 4:
         return 2
     if command in mutable_commands and len(argv) != 4:
         return 2
@@ -246,6 +318,14 @@ def main(argv: list[str]) -> int:
                 print(f"{source}\t{target}\t{kind}\t{str(required).lower()}\t{str(runtime).lower()}")
         elif command == "asset-identity":
             print(asset_manifest_identity(manifest, vendor, argv[3]))
+        elif command == "asset-topology":
+            for _entry_vendor, source, target, kind, required, runtime, topology in asset_topology_entries(
+                manifest, vendor, argv[3]
+            ):
+                print(
+                    f"{source}\t{target}\t{kind}\t{str(required).lower()}\t"
+                    f"{str(runtime).lower()}\t{topology}"
+                )
         elif command == "mutable-links":
             for source, target, kind in mutable_link_entries(manifest, vendor):
                 print(f"{source}\t{target}\t{kind}")
