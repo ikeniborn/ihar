@@ -157,9 +157,17 @@ _ihar_microvm_process_start_time() {
   awk '{print $20}' <<< "$rest"
 }
 
+_ihar_microvm_launch_config_digest() {
+  printf '%s\0' "$@" | sha256sum | cut -d' ' -f1
+}
+
 ihar_microvm_network_evidence_write() { # <firecracker-pid> <vm-config>
   local vm_pid="$1" config="$2" record temp launch_id="${IHAR_LAUNCH_ID:-$$}"
-  local destination egress="" owner_start vm_start config_sha256
+  local destination egress="" owner_start vm_start config_sha256 actual pinned
+  local config_canonical_sha256 kernel rootfs policy workspace state
+  local kernel_sha256 rootfs_sha256 rootfs_base_sha256 policy_sha256
+  local launch_config_sha256
+  local -a facts=()
   record="$(_ihar_microvm_network_evidence_path)" || return 1
   [[ "$vm_pid" =~ ^[1-9][0-9]*$ && "${IHAR_MICROVM_TAP:-}" =~ ^[A-Za-z0-9_-]{1,15}$ \
     && "${IHAR_MICROVM_CHAIN:-}" =~ ^[A-Za-z0-9_]{1,25}$ \
@@ -173,16 +181,40 @@ ihar_microvm_network_evidence_write() { # <firecracker-pid> <vm-config>
   vm_start="$(_ihar_microvm_process_start_time "$vm_pid")" || return 1
   [[ "$owner_start" =~ ^[0-9]+$ && "$vm_start" =~ ^[0-9]+$ ]] || return 1
   config_sha256="$(sha256sum "$config" | cut -d' ' -f1)" || return 1
+  mapfile -t facts < <(_ihar_microvm_config_facts "$config" "$IHAR_MICROVM_TAP" \
+    "$IHAR_MICROVM_GUEST_IP" "$IHAR_MICROVM_HOST_IP")
+  (( ${#facts[@]} == 6 )) || return 1
+  config_canonical_sha256="${facts[0]}"; kernel="${facts[1]}"; rootfs="${facts[2]}"
+  policy="${facts[3]}"; workspace="${facts[4]}"; state="${facts[5]}"
+  [[ -f "$kernel" && ! -L "$kernel" && -f "$rootfs" && ! -L "$rootfs" \
+    && -f "$policy" && ! -L "$policy" && -f "$workspace" && ! -L "$workspace" \
+    && -f "$state" && ! -L "$state" ]] || return 1
+  kernel_sha256="$(sha256sum "$kernel" | cut -d' ' -f1)" || return 1
+  rootfs_sha256="$(sha256sum "$rootfs" | cut -d' ' -f1)" || return 1
+  policy_sha256="$(sha256sum "$policy" | cut -d' ' -f1)" || return 1
+  pinned="$(ihar_lockfile_get microvm.kernel 2>/dev/null)" || return 1
+  [[ -n "$pinned" && "$kernel_sha256" == "$pinned" ]] || return 1
+  rootfs_base_sha256="$(ihar_lockfile_get microvm.rootfs 2>/dev/null)" || return 1
+  [[ -n "$rootfs_base_sha256" ]] || return 1
+  actual="$(sha256sum "$IHAR_STORE/bin/rootfs.ext4" | cut -d' ' -f1)" || return 1
+  [[ "$actual" == "$rootfs_base_sha256" ]] || return 1
   for destination in ${IHAR_MICROVM_MCP_EGRESS:-}; do
     [[ "$destination" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[1-9][0-9]*$ ]] || return 1
     (( ${destination##*:} <= 65535 )) || return 1
     egress+="${egress:+,}$destination"
   done
+  launch_config_sha256="$(_ihar_microvm_launch_config_digest \
+    "$$" "$owner_start" "$vm_pid" "$vm_start" "$IHAR_MICROVM_TAP" \
+    "$IHAR_MICROVM_CHAIN" "$IHAR_MICROVM_GUEST_IP" "$IHAR_MICROVM_HOST_IP" \
+    "$IHAR_GATEWAY_ACTIVE_PORT" "$launch_id" "$egress" "$config" "$config_sha256" \
+    "$config_canonical_sha256" "$kernel" "$kernel_sha256" "$rootfs" \
+    "$rootfs_sha256" "$rootfs_base_sha256" "$policy" "$policy_sha256" \
+    "$workspace" "$state" deny)" || return 1
   mkdir -p "$(dirname "$record")" || return 1
   temp="$(mktemp "${record}.XXXXXX")" || return 1
   chmod 600 "$temp" || { rm -f -- "$temp"; return 1; }
   {
-    printf 'schema=1\n'
+    printf 'schema=2\n'
     printf 'owner_pid=%s\n' "$$"
     printf 'owner_start=%s\n' "$owner_start"
     printf 'vm_pid=%s\n' "$vm_pid"
@@ -196,6 +228,17 @@ ihar_microvm_network_evidence_write() { # <firecracker-pid> <vm-config>
     printf 'egress=%s\n' "$egress"
     printf 'config_path=%s\n' "$config"
     printf 'config_sha256=%s\n' "$config_sha256"
+    printf 'config_canonical_sha256=%s\n' "$config_canonical_sha256"
+    printf 'kernel_path=%s\n' "$kernel"
+    printf 'kernel_sha256=%s\n' "$kernel_sha256"
+    printf 'rootfs_path=%s\n' "$rootfs"
+    printf 'rootfs_sha256=%s\n' "$rootfs_sha256"
+    printf 'rootfs_base_sha256=%s\n' "$rootfs_base_sha256"
+    printf 'policy_path=%s\n' "$policy"
+    printf 'policy_sha256=%s\n' "$policy_sha256"
+    printf 'workspace_path=%s\n' "$workspace"
+    printf 'state_path=%s\n' "$state"
+    printf 'launch_config_sha256=%s\n' "$launch_config_sha256"
     printf 'default=deny\n'
   } > "$temp" || { rm -f -- "$temp"; return 1; }
   mv -f -- "$temp" "$record" || { rm -f -- "$temp"; return 1; }
@@ -213,8 +256,8 @@ _ihar_microvm_network_evidence_read() {
   record="$(_ihar_microvm_network_evidence_path)" || return 1
   [[ -f "$record" && ! -L "$record" ]] || return 1
   mapfile -t lines < "$record" || return 1
-  (( ${#lines[@]} == 15 )) || return 1
-  [[ "${lines[0]}" == schema=1 ]] || return 1
+  (( ${#lines[@]} == 26 )) || return 1
+  [[ "${lines[0]}" == schema=2 ]] || return 1
   _IHAR_MICROVM_EVIDENCE_OWNER="${lines[1]#owner_pid=}"
   _IHAR_MICROVM_EVIDENCE_OWNER_START="${lines[2]#owner_start=}"
   _IHAR_MICROVM_EVIDENCE_VM="${lines[3]#vm_pid=}"
@@ -228,7 +271,18 @@ _ihar_microvm_network_evidence_read() {
   _IHAR_MICROVM_EVIDENCE_EGRESS="${lines[11]#egress=}"
   _IHAR_MICROVM_EVIDENCE_CONFIG="${lines[12]#config_path=}"
   _IHAR_MICROVM_EVIDENCE_CONFIG_SHA256="${lines[13]#config_sha256=}"
-  _IHAR_MICROVM_EVIDENCE_DEFAULT="${lines[14]#default=}"
+  _IHAR_MICROVM_EVIDENCE_CONFIG_CANONICAL_SHA256="${lines[14]#config_canonical_sha256=}"
+  _IHAR_MICROVM_EVIDENCE_KERNEL="${lines[15]#kernel_path=}"
+  _IHAR_MICROVM_EVIDENCE_KERNEL_SHA256="${lines[16]#kernel_sha256=}"
+  _IHAR_MICROVM_EVIDENCE_ROOTFS="${lines[17]#rootfs_path=}"
+  _IHAR_MICROVM_EVIDENCE_ROOTFS_SHA256="${lines[18]#rootfs_sha256=}"
+  _IHAR_MICROVM_EVIDENCE_ROOTFS_BASE_SHA256="${lines[19]#rootfs_base_sha256=}"
+  _IHAR_MICROVM_EVIDENCE_POLICY="${lines[20]#policy_path=}"
+  _IHAR_MICROVM_EVIDENCE_POLICY_SHA256="${lines[21]#policy_sha256=}"
+  _IHAR_MICROVM_EVIDENCE_WORKSPACE="${lines[22]#workspace_path=}"
+  _IHAR_MICROVM_EVIDENCE_STATE="${lines[23]#state_path=}"
+  _IHAR_MICROVM_EVIDENCE_LAUNCH_CONFIG_SHA256="${lines[24]#launch_config_sha256=}"
+  _IHAR_MICROVM_EVIDENCE_DEFAULT="${lines[25]#default=}"
   [[ "${lines[1]}" == owner_pid="$_IHAR_MICROVM_EVIDENCE_OWNER" \
     && "${lines[2]}" == owner_start="$_IHAR_MICROVM_EVIDENCE_OWNER_START" \
     && "${lines[3]}" == vm_pid="$_IHAR_MICROVM_EVIDENCE_VM" \
@@ -242,7 +296,18 @@ _ihar_microvm_network_evidence_read() {
     && "${lines[11]}" == egress="$_IHAR_MICROVM_EVIDENCE_EGRESS" \
     && "${lines[12]}" == config_path="$_IHAR_MICROVM_EVIDENCE_CONFIG" \
     && "${lines[13]}" == config_sha256="$_IHAR_MICROVM_EVIDENCE_CONFIG_SHA256" \
-    && "${lines[14]}" == default=deny ]] || return 1
+    && "${lines[14]}" == config_canonical_sha256="$_IHAR_MICROVM_EVIDENCE_CONFIG_CANONICAL_SHA256" \
+    && "${lines[15]}" == kernel_path="$_IHAR_MICROVM_EVIDENCE_KERNEL" \
+    && "${lines[16]}" == kernel_sha256="$_IHAR_MICROVM_EVIDENCE_KERNEL_SHA256" \
+    && "${lines[17]}" == rootfs_path="$_IHAR_MICROVM_EVIDENCE_ROOTFS" \
+    && "${lines[18]}" == rootfs_sha256="$_IHAR_MICROVM_EVIDENCE_ROOTFS_SHA256" \
+    && "${lines[19]}" == rootfs_base_sha256="$_IHAR_MICROVM_EVIDENCE_ROOTFS_BASE_SHA256" \
+    && "${lines[20]}" == policy_path="$_IHAR_MICROVM_EVIDENCE_POLICY" \
+    && "${lines[21]}" == policy_sha256="$_IHAR_MICROVM_EVIDENCE_POLICY_SHA256" \
+    && "${lines[22]}" == workspace_path="$_IHAR_MICROVM_EVIDENCE_WORKSPACE" \
+    && "${lines[23]}" == state_path="$_IHAR_MICROVM_EVIDENCE_STATE" \
+    && "${lines[24]}" == launch_config_sha256="$_IHAR_MICROVM_EVIDENCE_LAUNCH_CONFIG_SHA256" \
+    && "${lines[25]}" == default=deny ]] || return 1
   [[ "$_IHAR_MICROVM_EVIDENCE_OWNER" =~ ^[1-9][0-9]*$ \
     && "$_IHAR_MICROVM_EVIDENCE_OWNER_START" =~ ^[0-9]+$ \
     && "$_IHAR_MICROVM_EVIDENCE_VM" =~ ^[1-9][0-9]*$ \
@@ -256,7 +321,40 @@ _ihar_microvm_network_evidence_read() {
     && "$_IHAR_MICROVM_EVIDENCE_CONFIG" != *$'\n'* \
     && "$_IHAR_MICROVM_EVIDENCE_CONFIG" != *$'\t'* \
     && "$_IHAR_MICROVM_EVIDENCE_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ \
+    && "$_IHAR_MICROVM_EVIDENCE_CONFIG_CANONICAL_SHA256" =~ ^[0-9a-f]{64}$ \
+    && "$_IHAR_MICROVM_EVIDENCE_KERNEL" != *$'\n'* \
+    && "$_IHAR_MICROVM_EVIDENCE_KERNEL" != *$'\t'* \
+    && "$_IHAR_MICROVM_EVIDENCE_KERNEL_SHA256" =~ ^[0-9a-f]{64}$ \
+    && "$_IHAR_MICROVM_EVIDENCE_ROOTFS" != *$'\n'* \
+    && "$_IHAR_MICROVM_EVIDENCE_ROOTFS" != *$'\t'* \
+    && "$_IHAR_MICROVM_EVIDENCE_ROOTFS_SHA256" =~ ^[0-9a-f]{64}$ \
+    && "$_IHAR_MICROVM_EVIDENCE_ROOTFS_BASE_SHA256" =~ ^[0-9a-f]{64}$ \
+    && "$_IHAR_MICROVM_EVIDENCE_POLICY" != *$'\n'* \
+    && "$_IHAR_MICROVM_EVIDENCE_POLICY" != *$'\t'* \
+    && "$_IHAR_MICROVM_EVIDENCE_POLICY_SHA256" =~ ^[0-9a-f]{64}$ \
+    && "$_IHAR_MICROVM_EVIDENCE_WORKSPACE" != *$'\n'* \
+    && "$_IHAR_MICROVM_EVIDENCE_WORKSPACE" != *$'\t'* \
+    && "$_IHAR_MICROVM_EVIDENCE_STATE" != *$'\n'* \
+    && "$_IHAR_MICROVM_EVIDENCE_STATE" != *$'\t'* \
+    && "$_IHAR_MICROVM_EVIDENCE_LAUNCH_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ \
     && "$_IHAR_MICROVM_EVIDENCE_DEFAULT" == deny ]] || return 1
+  local launch_config_sha256
+  launch_config_sha256="$(_ihar_microvm_launch_config_digest \
+    "$_IHAR_MICROVM_EVIDENCE_OWNER" "$_IHAR_MICROVM_EVIDENCE_OWNER_START" \
+    "$_IHAR_MICROVM_EVIDENCE_VM" "$_IHAR_MICROVM_EVIDENCE_VM_START" \
+    "$_IHAR_MICROVM_EVIDENCE_TAP" "$_IHAR_MICROVM_EVIDENCE_CHAIN" \
+    "$_IHAR_MICROVM_EVIDENCE_GUEST" "$_IHAR_MICROVM_EVIDENCE_HOST" \
+    "$_IHAR_MICROVM_EVIDENCE_PORT" "$_IHAR_MICROVM_EVIDENCE_LAUNCH" \
+    "$_IHAR_MICROVM_EVIDENCE_EGRESS" "$_IHAR_MICROVM_EVIDENCE_CONFIG" \
+    "$_IHAR_MICROVM_EVIDENCE_CONFIG_SHA256" \
+    "$_IHAR_MICROVM_EVIDENCE_CONFIG_CANONICAL_SHA256" \
+    "$_IHAR_MICROVM_EVIDENCE_KERNEL" "$_IHAR_MICROVM_EVIDENCE_KERNEL_SHA256" \
+    "$_IHAR_MICROVM_EVIDENCE_ROOTFS" "$_IHAR_MICROVM_EVIDENCE_ROOTFS_SHA256" \
+    "$_IHAR_MICROVM_EVIDENCE_ROOTFS_BASE_SHA256" "$_IHAR_MICROVM_EVIDENCE_POLICY" \
+    "$_IHAR_MICROVM_EVIDENCE_POLICY_SHA256" "$_IHAR_MICROVM_EVIDENCE_WORKSPACE" \
+    "$_IHAR_MICROVM_EVIDENCE_STATE" deny)" || return 1
+  [[ "$launch_config_sha256" == "$_IHAR_MICROVM_EVIDENCE_LAUNCH_CONFIG_SHA256" ]] \
+    || return 1
   local destination
   IFS=',' read -r -a _IHAR_MICROVM_EVIDENCE_EGRESS_ITEMS <<< \
     "$_IHAR_MICROVM_EVIDENCE_EGRESS"
@@ -285,33 +383,109 @@ _ihar_microvm_process_uses_config() {
   return 1
 }
 
+_ihar_microvm_config_facts() { # <config> <tap> <guest-ip> <host-ip>
+  python3 - "$1" "$2" "$3" "$4" "$IHAR_STORE/bin/vmlinux" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+config, tap, guest, host, kernel = sys.argv[1:]
+try:
+    with open(config, encoding="utf-8") as stream:
+        data = json.load(stream)
+except (OSError, TypeError, ValueError):
+    raise SystemExit(1)
+
+directory = os.path.dirname(config)
+paths = {
+    "rootfs": os.path.join(directory, "rootfs.ext4"),
+    "policy": os.path.join(directory, "policy.ext4"),
+    "workspace": os.path.join(directory, "workspace.ext4"),
+    "state": os.path.join(directory, "state.ext4"),
+}
+suffix = tap.rsplit("-", 1)[-1]
+mac_octet = int(suffix) if suffix.isdigit() else 1
+boot_args = (
+    "console=ttyS0 reboot=k panic=1 pci=off nomodules "
+    f"ip={guest}::{host}:255.255.255.252::eth0:off"
+)
+expected_drives = [
+    {"drive_id": "rootfs", "path_on_host": paths["rootfs"],
+     "is_root_device": True, "is_read_only": False},
+    {"drive_id": "policy", "path_on_host": paths["policy"],
+     "is_root_device": False, "is_read_only": True},
+    {"drive_id": "workspace", "path_on_host": paths["workspace"],
+     "is_root_device": False, "is_read_only": False},
+    {"drive_id": "state", "path_on_host": paths["state"],
+     "is_root_device": False, "is_read_only": False},
+]
+valid = (
+    isinstance(data, dict)
+    and set(data) == {"boot-source", "drives", "machine-config", "network-interfaces"}
+    and data.get("boot-source") == {
+        "kernel_image_path": kernel,
+        "boot_args": boot_args,
+    }
+    and data.get("drives") == expected_drives
+    and isinstance(data.get("machine-config"), dict)
+    and set(data["machine-config"]) == {"vcpu_count", "mem_size_mib"}
+    and all(
+        isinstance(data["machine-config"][key], int)
+        and not isinstance(data["machine-config"][key], bool)
+        and data["machine-config"][key] > 0
+        for key in ("vcpu_count", "mem_size_mib")
+    )
+    and data.get("network-interfaces") == [{
+        "iface_id": "eth0",
+        "guest_mac": f"AA:FC:00:00:00:{mac_octet:02X}",
+        "host_dev_name": tap,
+    }]
+)
+if not valid:
+    raise SystemExit(1)
+for value in (config, kernel, *paths.values()):
+    if any(character in value for character in "\r\n\t"):
+        raise SystemExit(1)
+canonical = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+print(hashlib.sha256(canonical).hexdigest())
+print(kernel)
+for name in ("rootfs", "policy", "workspace", "state"):
+    print(paths[name])
+PY
+}
+
 _ihar_microvm_config_matches_evidence() {
-  local actual
+  local actual pinned
+  local -a facts=()
   [[ -f "$_IHAR_MICROVM_EVIDENCE_CONFIG" && ! -L "$_IHAR_MICROVM_EVIDENCE_CONFIG" ]] \
     || return 1
   actual="$(sha256sum "$_IHAR_MICROVM_EVIDENCE_CONFIG" | cut -d' ' -f1)" || return 1
   [[ "$actual" == "$_IHAR_MICROVM_EVIDENCE_CONFIG_SHA256" ]] || return 1
-  python3 - "$_IHAR_MICROVM_EVIDENCE_CONFIG" "$_IHAR_MICROVM_EVIDENCE_TAP" \
-    "$_IHAR_MICROVM_EVIDENCE_GUEST" "$_IHAR_MICROVM_EVIDENCE_HOST" \
-    "$IHAR_STORE/bin/vmlinux" <<'PY'
-import json, sys
-
-try:
-    data = json.load(open(sys.argv[1], encoding="utf-8"))
-    boot = data["boot-source"]
-    interfaces = data["network-interfaces"]
-except (OSError, KeyError, TypeError, ValueError):
-    raise SystemExit(1)
-
-expected_ip = f"ip={sys.argv[3]}::{sys.argv[4]}:255.255.255.252::eth0:off"
-valid = (
-    boot.get("kernel_image_path") == sys.argv[5]
-    and expected_ip in boot.get("boot_args", "").split()
-    and len(interfaces) == 1
-    and interfaces[0].get("host_dev_name") == sys.argv[2]
-)
-raise SystemExit(0 if valid else 1)
-PY
+  mapfile -t facts < <(_ihar_microvm_config_facts \
+    "$_IHAR_MICROVM_EVIDENCE_CONFIG" "$_IHAR_MICROVM_EVIDENCE_TAP" \
+    "$_IHAR_MICROVM_EVIDENCE_GUEST" "$_IHAR_MICROVM_EVIDENCE_HOST")
+  (( ${#facts[@]} == 6 )) || return 1
+  [[ "${facts[0]}" == "$_IHAR_MICROVM_EVIDENCE_CONFIG_CANONICAL_SHA256" \
+    && "${facts[1]}" == "$_IHAR_MICROVM_EVIDENCE_KERNEL" \
+    && "${facts[2]}" == "$_IHAR_MICROVM_EVIDENCE_ROOTFS" \
+    && "${facts[3]}" == "$_IHAR_MICROVM_EVIDENCE_POLICY" \
+    && "${facts[4]}" == "$_IHAR_MICROVM_EVIDENCE_WORKSPACE" \
+    && "${facts[5]}" == "$_IHAR_MICROVM_EVIDENCE_STATE" ]] || return 1
+  [[ -f "$_IHAR_MICROVM_EVIDENCE_KERNEL" && ! -L "$_IHAR_MICROVM_EVIDENCE_KERNEL" \
+    && -f "$_IHAR_MICROVM_EVIDENCE_ROOTFS" && ! -L "$_IHAR_MICROVM_EVIDENCE_ROOTFS" \
+    && -f "$_IHAR_MICROVM_EVIDENCE_POLICY" && ! -L "$_IHAR_MICROVM_EVIDENCE_POLICY" \
+    && -f "$_IHAR_MICROVM_EVIDENCE_WORKSPACE" && ! -L "$_IHAR_MICROVM_EVIDENCE_WORKSPACE" \
+    && -f "$_IHAR_MICROVM_EVIDENCE_STATE" && ! -L "$_IHAR_MICROVM_EVIDENCE_STATE" ]] \
+    || return 1
+  actual="$(sha256sum "$_IHAR_MICROVM_EVIDENCE_KERNEL" | cut -d' ' -f1)" || return 1
+  [[ "$actual" == "$_IHAR_MICROVM_EVIDENCE_KERNEL_SHA256" ]] || return 1
+  pinned="$(ihar_lockfile_get microvm.kernel 2>/dev/null)" || return 1
+  [[ "$pinned" == "$_IHAR_MICROVM_EVIDENCE_KERNEL_SHA256" ]] || return 1
+  pinned="$(ihar_lockfile_get microvm.rootfs 2>/dev/null)" || return 1
+  [[ "$pinned" == "$_IHAR_MICROVM_EVIDENCE_ROOTFS_BASE_SHA256" ]] || return 1
+  actual="$(sha256sum "$_IHAR_MICROVM_EVIDENCE_POLICY" | cut -d' ' -f1)" || return 1
+  [[ "$actual" == "$_IHAR_MICROVM_EVIDENCE_POLICY_SHA256" ]]
 }
 
 _ihar_microvm_network_rules_verified() {

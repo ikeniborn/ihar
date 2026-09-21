@@ -190,23 +190,132 @@ _ihar_microvm_iptables() {
   if [[ "$1" == -S ]]; then cat "$IHAR_TEST_TMP/filter-$2"; return; fi
   grep -qxF -- "$*" "$IHAR_TEST_TMP/rules-active"
 }
-evidence_config="$session/evidence-vmconfig.json"
-python3 - "$evidence_config" "$IHAR_STORE/bin/vmlinux" <<'PY'
-import json, sys
-json.dump({
-    "boot-source": {
-        "kernel_image_path": sys.argv[2],
-        "boot_args": "ip=172.31.0.2::172.31.0.1:255.255.255.252::eth0:off",
-    },
-    "network-interfaces": [{"host_dev_name": "tap-ihar-1"}],
-}, open(sys.argv[1], "w", encoding="utf-8"))
-PY
+evidence_dir="$session/evidence"
+mkdir -p "$evidence_dir"
+cp "$IHAR_STORE/bin/rootfs.ext4" "$evidence_dir/rootfs.ext4"
+: > "$evidence_dir/policy.ext4"
+: > "$evidence_dir/workspace.ext4"
+: > "$evidence_dir/state.ext4"
+evidence_config="$(ihar_microvm_write_config "$evidence_dir" tap-ihar-1 172.31.0.2 \
+  "$evidence_dir/rootfs.ext4" "$evidence_dir/policy.ext4" \
+  "$evidence_dir/workspace.ext4" "$evidence_dir/state.ext4")"
+cp "$evidence_config" "$evidence_config.valid"
 "$IHAR_STORE/bin/firecracker" -c 'while :; do sleep 60; done' -- \
   --config-file "$evidence_config" & evidence_vm_pid=$!
+publish_valid_evidence() {
+  cp "$evidence_config.valid" "$evidence_config"
+  ihar_microvm_network_evidence_write "$evidence_vm_pid" "$evidence_config"
+}
+refresh_recorded_config_digest() {
+  local digest
+  digest="$(sha256sum "$evidence_config" | cut -d' ' -f1)"
+  sed -i "s/^config_sha256=.*/config_sha256=$digest/" \
+    "$IHAR_STATE/.launch-guard/network-boundary"
+  python3 - "$IHAR_STATE/.launch-guard/network-boundary" <<'PY'
+import hashlib, pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text().splitlines()
+values = dict(line.split("=", 1) for line in lines)
+keys = (
+    "owner_pid", "owner_start", "vm_pid", "vm_start", "tap", "chain",
+    "guest_ip", "host_ip", "gateway_port", "launch_id", "egress",
+    "config_path", "config_sha256", "config_canonical_sha256", "kernel_path",
+    "kernel_sha256", "rootfs_path", "rootfs_sha256", "rootfs_base_sha256",
+    "policy_path", "policy_sha256", "workspace_path", "state_path",
+)
+digest = hashlib.sha256(b"".join(values[key].encode() + b"\0" for key in keys) + b"deny\0").hexdigest()
+lines[24] = f"launch_config_sha256={digest}"
+path.write_text("\n".join(lines) + "\n")
+PY
+}
+mutate_evidence_config() {
+  python3 - "$evidence_config" "$@" <<'PY'
+import json, sys
+
+path, mutation = sys.argv[1:3]
+data = json.load(open(path, encoding="utf-8"))
+if mutation == "machine-content":
+    data["machine-config"]["mem_size_mib"] += 1
+elif mutation == "rootfs-path":
+    data["drives"][0]["path_on_host"] = sys.argv[3]
+elif mutation == "policy-path":
+    data["drives"][1]["path_on_host"] = sys.argv[3]
+elif mutation == "rootfs-read-only":
+    data["drives"][0]["is_read_only"] = True
+elif mutation == "policy-writable":
+    data["drives"][1]["is_read_only"] = False
+elif mutation == "extra-drive":
+    data["drives"].append({
+        "drive_id": "secret", "path_on_host": sys.argv[3],
+        "is_root_device": False, "is_read_only": False,
+    })
+elif mutation == "missing-drive":
+    data["drives"] = [drive for drive in data["drives"] if drive["drive_id"] != "state"]
+elif mutation == "wrong-drive-id":
+    data["drives"][2]["drive_id"] = "work"
+elif mutation == "kernel-path":
+    data["boot-source"]["kernel_image_path"] = sys.argv[3]
+elif mutation == "tap-missing":
+    data["network-interfaces"] = []
+elif mutation == "tap-wrong":
+    data["network-interfaces"][0]["host_dev_name"] = "tap-ihar-2"
+else:
+    raise SystemExit(f"unknown mutation: {mutation}")
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(data, stream)
+PY
+  refresh_recorded_config_digest
+}
+assert_not_verified() {
+  local name="$1" current
+  current="$(ihar_microvm_network_evidence)"
+  assert_eq "$name" "True" \
+    "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["configured"] and not d["verified"])' <<<"$current")"
+}
 ihar_microvm_network_evidence_write "$evidence_vm_pid" "$evidence_config"
 evidence="$(ihar_microvm_network_evidence)"
 assert_eq "live guest evidence verifies the configured boundary" "True" \
   "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d == {"configured":True,"available":True,"active":True,"verified":True})' <<<"$evidence")"
+recorded_evidence="$(cat "$IHAR_STATE/.launch-guard/network-boundary")"
+assert_contains "launch evidence records a canonical config digest" "$recorded_evidence" \
+  'config_canonical_sha256='
+assert_contains "launch evidence records the configured rootfs digest" "$recorded_evidence" \
+  'rootfs_sha256='
+assert_contains "launch evidence records the pinned rootfs base digest" "$recorded_evidence" \
+  "rootfs_base_sha256=$(ihar_lockfile_get microvm.rootfs)"
+sed -i 's/^config_sha256=.*/config_sha256=0000000000000000000000000000000000000000000000000000000000000000/' \
+  "$IHAR_STATE/.launch-guard/network-boundary"
+assert_not_verified "a mismatched recorded config digest invalidates evidence"
+publish_valid_evidence
+for mutation in machine-content rootfs-read-only policy-writable tap-missing tap-wrong \
+    missing-drive wrong-drive-id; do
+  mutate_evidence_config "$mutation"
+  assert_not_verified "$mutation config evidence is rejected"
+  publish_valid_evidence
+done
+: > "$evidence_dir/other.ext4"
+for mutation in rootfs-path policy-path extra-drive kernel-path; do
+  mutate_evidence_config "$mutation" "$evidence_dir/other.ext4"
+  assert_not_verified "$mutation config evidence is rejected"
+  publish_valid_evidence
+done
+sed -i 's/^kernel_sha256=.*/kernel_sha256=0000000000000000000000000000000000000000000000000000000000000000/' \
+  "$IHAR_STATE/.launch-guard/network-boundary"
+assert_not_verified "a mismatched configured kernel digest is rejected"
+publish_valid_evidence
+sed -i 's/^rootfs_base_sha256=.*/rootfs_base_sha256=0000000000000000000000000000000000000000000000000000000000000000/' \
+  "$IHAR_STATE/.launch-guard/network-boundary"
+assert_not_verified "a mismatched pinned rootfs digest is rejected"
+publish_valid_evidence
+sed -i 's/^rootfs_sha256=.*/rootfs_sha256=0000000000000000000000000000000000000000000000000000000000000000/' \
+  "$IHAR_STATE/.launch-guard/network-boundary"
+assert_not_verified "a rootfs digest detached from the launched process is rejected"
+publish_valid_evidence
+printf 'mutation' >> "$evidence_dir/policy.ext4"
+assert_not_verified "a changed read-only policy image is rejected"
+: > "$evidence_dir/policy.ext4"
+publish_valid_evidence
 sed -i 's/^vm_start=.*/vm_start=1/' "$IHAR_STATE/.launch-guard/network-boundary"
 evidence="$(ihar_microvm_network_evidence)"
 assert_eq "reused PID without the recorded process identity is inactive" "True" \
@@ -217,6 +326,17 @@ evidence="$(ihar_microvm_network_evidence)"
 assert_eq "an early broad ACCEPT invalidates the observed boundary" "True" \
   "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["active"] and not d["verified"])' <<<"$evidence")"
 sed -i '/^-A IHAR_TEST -j ACCEPT$/d' "$IHAR_TEST_TMP/filter-IHAR_TEST"
+for mutation in prerouting-missing prerouting-wrong postrouting-missing postrouting-wrong; do
+  cp "$IHAR_TEST_TMP/rules-active" "$IHAR_TEST_TMP/rules-active.valid"
+  case "$mutation" in
+    prerouting-missing) sed -i '/nat -C PREROUTING/d' "$IHAR_TEST_TMP/rules-active" ;;
+    prerouting-wrong) sed -i '/nat -C PREROUTING/s/127\.0\.0\.1:43123/127.0.0.1:43124/' "$IHAR_TEST_TMP/rules-active" ;;
+    postrouting-missing) sed -i '/nat -C POSTROUTING/d' "$IHAR_TEST_TMP/rules-active" ;;
+    postrouting-wrong) sed -i '/nat -C POSTROUTING/s/203\.0\.113\.8/203.0.113.9/' "$IHAR_TEST_TMP/rules-active" ;;
+  esac
+  assert_not_verified "$mutation firewall evidence is rejected"
+  mv "$IHAR_TEST_TMP/rules-active.valid" "$IHAR_TEST_TMP/rules-active"
+done
 mv "$IHAR_STORE/bin/rootfs.ext4" "$IHAR_STORE/bin/rootfs.ext4.missing"
 evidence="$(ihar_microvm_network_evidence)"
 assert_eq "missing required asset prevents enforcement" "True" \
