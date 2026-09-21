@@ -537,9 +537,11 @@ assert_migration_stage_observed() { # <scenario>
 reset_active_generation() {
   mkdir -p "$IHAR_STORE/hooks" "$(dirname "$IHAR_CODEX_BIN")" "$(dirname "$IHAR_CLAUDE_BIN")"
   printf 'old hook\n' > "$IHAR_STORE/hooks/security-pretool.py"
+  rm -f -- "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
   printf '#!/bin/sh\necho old claude\n' > "$IHAR_CLAUDE_BIN"
   printf '#!/bin/sh\necho old codex\n' > "$IHAR_CODEX_BIN"
   chmod +x "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
+  rm -f -- "$IHAR_STORE/install-receipt.json"
   printf '%s\n' "$OLD_RECEIPT" > "$IHAR_STORE/install-receipt.json"
 }
 
@@ -562,9 +564,24 @@ wait_for_install_barrier() { # <path>
   return 1
 }
 
-run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activation|rollback> [install|update]
+run_install_scenario() ( # <scenario> [install|update]
   local scenario="$1" operation="${2:-install}" migration_observation
   export IHAR_ACTIVE_TEST_STORE="$IHAR_STORE"
+  case "$scenario" in
+    bootstrap-*|receipt-only|receipt-link-only|executable-only-*|executable-link-codex)
+      case "$scenario" in
+        bootstrap-*|executable-only-*|executable-link-codex)
+          rm -f -- "$IHAR_STORE/install-receipt.json" ;;
+      esac
+      case "$scenario" in
+        bootstrap-*|receipt-only|receipt-link-only)
+          rm -f -- "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN" ;;
+        executable-only-claude) rm -f -- "$IHAR_CODEX_BIN" ;;
+        executable-only-codex) rm -f -- "$IHAR_CLAUDE_BIN" ;;
+        executable-link-codex) rm -f -- "$IHAR_CLAUDE_BIN" ;;
+      esac
+      ;;
+  esac
   if [[ "$scenario" == migration-* ]]; then
     export IHAR_FLAG_MIGRATE_STORE=true IHAR_LEGACY_STORE="$COMMAND_LEGACY_STORE"
     migration_observation="$(migration_stage_observation "$scenario")"
@@ -598,42 +615,91 @@ run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activati
     printf '#!/bin/sh\necho new claude\n' > "$IHAR_CLAUDE_BIN"
     chmod +x "$IHAR_CLAUDE_BIN"
   }
-  ihar_install_conformance() {
-    [[ "$scenario" != *conformance ]] || return 36
-    grep -q 'new hook' "$IHAR_STORE/hooks/security-pretool.py" || return 40
-    grep -q 'new claude' "$IHAR_CLAUDE_BIN" || return 40
-    grep -q 'new codex' "$IHAR_CODEX_BIN" || return 40
-    if [[ "$scenario" == migration-late-mutation ||
-          "$scenario" == migration-late-consumer ]]; then
-      : > "$IHAR_TEST_TMP/$scenario.conformance-entered"
-      wait_for_install_barrier "$IHAR_TEST_TMP/$scenario.conformance-release" || return 43
-    fi
-    if [[ "$scenario" == paths ]]; then
-      [[ "${1:-}" == "$IHAR_ACTIVE_TEST_STORE" ]] || return 41
-      [[ "$IHAR_STORE" == */.ihar-store-stage-* ]] || return 42
-      [[ "$IHAR_CLAUDE_BIN" == */.ihar-nvm-stage-*/npm-global/bin/claude ]] || return 42
-      [[ "$IHAR_CODEX_BIN" == */.ihar-store-stage-*/bin/codex ]] || return 42
-    fi
-    if [[ "$scenario" == ownership ]]; then
-      if [[ -e "$IHAR_STORE/auth/claude/concurrent" ||
-            -e "$IHAR_STORE/plugins/claude/concurrent" ||
-            -e "$IHAR_STORE/vendor-data/concurrent" ]]; then
-        printf 'copied\n' > "$IHAR_TEST_TMP/ownership-stage-observation"
-      else
-        printf 'clean\n' > "$IHAR_TEST_TMP/ownership-stage-observation"
+  if [[ "$scenario" == bootstrap-* || "$scenario" == receipt-only ||
+        "$scenario" == receipt-link-only || "$scenario" == executable-only-* ||
+        "$scenario" == executable-link-codex ]]; then
+    ihar_python() {
+      if [[ "$1" == ihar.conformance.run ]]; then
+        printf '%s\n' "$2" >> "$IHAR_TEST_TMP/$scenario.conformance-runs"
+        [[ "$scenario" != bootstrap-prerecord ]] || return 3
+        [[ "$scenario" != bootstrap-missing-record ]] || return 1
+        python3 - "$2" "$3" "$4" "$5" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+from ihar import jsonio
+from ihar.conformance import REQUIRED_CASES
+from ihar.conformance.run import version_slug
+
+vendor, binary, store, manifest = sys.argv[1:]
+with open(binary, "rb") as stream:
+    binary_digest = hashlib.sha256(stream.read()).hexdigest()
+with open(manifest, "rb") as stream:
+    manifest_digest = hashlib.sha256(stream.read()).hexdigest()
+version = f"new-{vendor}"
+record = {
+    "schema": 1, "vendor": vendor, "version": version,
+    "binary_sha256": binary_digest, "manifest_digest": manifest_digest,
+    "created_at": "2026-09-21T00:00:00Z",
+    "cases": {
+        name: {"status": "failed" if name == "deny-blocks-the-tool" else "passed"}
+        for name in REQUIRED_CASES[vendor]
+    },
+}
+target = os.path.join(store, "verification", f"{vendor}-{version_slug(version)}.json")
+os.makedirs(os.path.dirname(target), exist_ok=True)
+if os.environ["IHAR_TEST_SCENARIO"] == "bootstrap-invalid-record":
+    del record["cases"]["deny-blocks-the-tool"]
+    with open(target, "w", encoding="utf-8") as stream:
+        json.dump(record, stream)
+else:
+    jsonio.write("conformance", target, record)
+PY
+        return 1
       fi
-      printf 'concurrent auth\n' > "$IHAR_ACTIVE_TEST_STORE/auth/claude/concurrent"
-      printf 'concurrent plugin\n' > "$IHAR_ACTIVE_TEST_STORE/plugins/claude/concurrent"
-      printf 'concurrent vendor data\n' > "$IHAR_ACTIVE_TEST_STORE/vendor-data/concurrent"
-    fi
-  }
+      PYTHONPATH="$ROOT/lib/python" python3 -m "$@"
+    }
+  else
+    ihar_install_conformance() {
+      [[ "$scenario" != *conformance ]] || return 36
+      grep -q 'new hook' "$IHAR_STORE/hooks/security-pretool.py" || return 40
+      grep -q 'new claude' "$IHAR_CLAUDE_BIN" || return 40
+      grep -q 'new codex' "$IHAR_CODEX_BIN" || return 40
+      if [[ "$scenario" == migration-late-mutation ||
+            "$scenario" == migration-late-consumer ]]; then
+        : > "$IHAR_TEST_TMP/$scenario.conformance-entered"
+        wait_for_install_barrier "$IHAR_TEST_TMP/$scenario.conformance-release" || return 43
+      fi
+      if [[ "$scenario" == paths ]]; then
+        [[ "${1:-}" == "$IHAR_ACTIVE_TEST_STORE" ]] || return 41
+        [[ "$IHAR_STORE" == */.ihar-store-stage-* ]] || return 42
+        [[ "$IHAR_CLAUDE_BIN" == */.ihar-nvm-stage-*/npm-global/bin/claude ]] || return 42
+        [[ "$IHAR_CODEX_BIN" == */.ihar-store-stage-*/bin/codex ]] || return 42
+      fi
+      if [[ "$scenario" == ownership ]]; then
+        if [[ -e "$IHAR_STORE/auth/claude/concurrent" ||
+              -e "$IHAR_STORE/plugins/claude/concurrent" ||
+              -e "$IHAR_STORE/vendor-data/concurrent" ]]; then
+          printf 'copied\n' > "$IHAR_TEST_TMP/ownership-stage-observation"
+        else
+          printf 'clean\n' > "$IHAR_TEST_TMP/ownership-stage-observation"
+        fi
+        printf 'concurrent auth\n' > "$IHAR_ACTIVE_TEST_STORE/auth/claude/concurrent"
+        printf 'concurrent plugin\n' > "$IHAR_ACTIVE_TEST_STORE/plugins/claude/concurrent"
+        printf 'concurrent vendor data\n' > "$IHAR_ACTIVE_TEST_STORE/vendor-data/concurrent"
+      fi
+    }
+  fi
+  export IHAR_TEST_SCENARIO="$scenario"
   ihar_publish_install_receipt() {
-    [[ "$scenario" != *receipt ]] || return 37
+    [[ "$scenario" != *receipt && "$scenario" != bootstrap-receipt ]] || return 37
     ihar_python ihar.install_receipt build "$IHAR_LOCKFILE" \
       "$IHAR_STORE/install-receipt.json" "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
   }
   ihar_install_move() {
-    if [[ ( "$scenario" == activation || "$scenario" == rollback ||
+    if [[ ( "$scenario" == activation || "$scenario" == bootstrap-activation || "$scenario" == rollback ||
             "$scenario" == migration-rollback ) &&
           "$1" == */.ihar-store-stage-*/install-receipt.json &&
           "$2" == "$IHAR_ACTIVE_TEST_STORE/install-receipt.json" ]]; then
@@ -654,6 +720,99 @@ run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activati
     _ihar_install_all
   fi
 )
+
+transaction_fingerprint() {
+  printf '%s\n%s\n' \
+    "$(mutable_tree_fingerprint "$IHAR_STORE")" \
+    "$(mutable_tree_fingerprint "$IHAR_NVM")"
+}
+
+assert_bootstrap_published_nothing() { # <scenario>
+  local scenario="$1"
+  assert_exit "$scenario publishes no receipt" 1 test -e "$IHAR_STORE/install-receipt.json"
+  assert_exit "$scenario publishes no Claude executable" 1 test -e "$IHAR_CLAUDE_BIN"
+  assert_exit "$scenario publishes no Codex executable" 1 test -e "$IHAR_CODEX_BIN"
+  assert_contains "$scenario preserves pre-existing hook bytes" \
+    "$(cat "$IHAR_STORE/hooks/security-pretool.py")" "old hook"
+  assert_exit "$scenario leaks no store stage" 1 \
+    compgen -G "$(dirname "$IHAR_STORE")/.ihar-store-stage-*"
+  assert_exit "$scenario leaks no NVM stage" 1 \
+    compgen -G "$(dirname "$IHAR_NVM")/.ihar-nvm-stage-*"
+  assert_exit "$scenario leaks no backup" 1 \
+    compgen -G "$(dirname "$IHAR_STORE")/.ihar-install-backup-*"
+}
+
+reset_active_generation
+bootstrap_output="$(run_install_scenario bootstrap-failed 2>&1)"
+bootstrap_status=$?
+assert_eq "complete failed cases permit first bootstrap" "0" "$bootstrap_status"
+assert_exit "first bootstrap publishes receipt" 0 test -f "$IHAR_STORE/install-receipt.json"
+assert_contains "first bootstrap activates Claude" "$(cat "$IHAR_CLAUDE_BIN")" "new claude"
+assert_contains "first bootstrap activates Codex" "$(cat "$IHAR_CODEX_BIN")" "new codex"
+for vendor in claude codex; do
+  assert_exit "failed $vendor proof is not published" 1 \
+    test -e "$IHAR_STORE/verification/$vendor-new-$vendor.json"
+  assert_contains "first bootstrap names unproven $vendor" "$bootstrap_output" "$vendor"
+done
+assert_contains "first bootstrap directs post-auth proof" \
+  "$bootstrap_output" "ihar check --conformance"
+
+for scenario in receipt-only executable-only-claude executable-only-codex; do
+  reset_active_generation
+  case "$scenario" in
+    receipt-only) rm -f -- "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN" ;;
+    executable-only-claude) rm -f -- "$IHAR_STORE/install-receipt.json" "$IHAR_CODEX_BIN" ;;
+    executable-only-codex) rm -f -- "$IHAR_STORE/install-receipt.json" "$IHAR_CLAUDE_BIN" ;;
+  esac
+  before_generation="$(transaction_fingerprint)"
+  assert_exit "$scenario rejects failed conformance" 1 run_install_scenario "$scenario"
+  assert_eq "$scenario preserves active bytes" \
+    "$before_generation" "$(transaction_fingerprint)"
+done
+
+reset_active_generation
+rm -f -- "$IHAR_STORE/install-receipt.json" "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
+ln -s missing-codex "$IHAR_CODEX_BIN"
+before_generation="$(transaction_fingerprint)"
+assert_exit "dangling vendor executable path prevents bootstrap" 1 \
+  run_install_scenario executable-link-codex
+assert_eq "dangling executable remains unchanged" \
+  "$before_generation" "$(transaction_fingerprint)"
+
+reset_active_generation
+rm -f -- "$IHAR_STORE/install-receipt.json" "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
+ln -s missing-receipt.json "$IHAR_STORE/install-receipt.json"
+before_generation="$(transaction_fingerprint)"
+assert_exit "dangling receipt path prevents bootstrap" 1 \
+  run_install_scenario receipt-link-only
+assert_eq "dangling receipt remains unchanged" \
+  "$before_generation" "$(transaction_fingerprint)"
+
+reset_active_generation
+printf 'malformed receipt\n' > "$IHAR_STORE/install-receipt.json"
+rm -f -- "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
+before_generation="$(transaction_fingerprint)"
+assert_exit "malformed receipt path prevents bootstrap" 1 \
+  run_install_scenario receipt-only
+assert_eq "malformed receipt remains unchanged" \
+  "$before_generation" "$(transaction_fingerprint)"
+
+for scenario in bootstrap-prerecord bootstrap-missing-record bootstrap-invalid-record \
+                bootstrap-receipt bootstrap-activation; do
+  reset_active_generation
+  rm -f -- "$IHAR_TEST_TMP/$scenario.conformance-runs"
+  case "$scenario" in
+    bootstrap-prerecord) expected_status=3 ;;
+    bootstrap-missing-record|bootstrap-invalid-record) expected_status=1 ;;
+    bootstrap-receipt) expected_status=37 ;;
+    bootstrap-activation) expected_status=39 ;;
+  esac
+  assert_exit "$scenario aborts install" "$expected_status" \
+    run_install_scenario "$scenario"
+  assert_bootstrap_published_nothing "$scenario"
+  assert_eq "$scenario attempts both installed vendor suites" \
+    $'claude\ncodex' "$(cat "$IHAR_TEST_TMP/$scenario.conformance-runs")"
+done
 
 before_lock="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
 for scenario in conformance receipt activation; do

@@ -142,12 +142,22 @@ _ihar_activate_generation() { # <store-stage> <nvm-stage> <backup>
   return 0
 }
 
+_ihar_install_is_bootstrap() { # <active-store> <active-nvm>
+  local path
+  for path in "$1/install-receipt.json" "$1/bin/codex" "$2/npm-global/bin/claude"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  done
+}
+
 ihar_install_transaction() { # <install|update>
-  local mode="$1" store_parent nvm_parent store_stage nvm_stage backup name status=0
+  local mode="$1" store_parent nvm_parent store_stage nvm_stage backup name status=0 bootstrap=false
   local active_store="$IHAR_STORE" active_nvm="$IHAR_NVM" active_npm="$IHAR_NPM_BIN"
   _IHAR_INSTALL_BACKUP_RETAIN=false
   ihar_asset_validate "$IHAR_ROOT/manifests/assets.json" || return 3
   ihar_prepare_mutable_store "$active_store" || return 3
+  if _ihar_install_is_bootstrap "$active_store" "$active_nvm"; then
+    bootstrap=true
+  fi
   store_parent="$(dirname "$active_store")"
   nvm_parent="$(dirname "$active_nvm")"
   mkdir -p "$store_parent" "$nvm_parent" || return 1
@@ -183,6 +193,7 @@ ihar_install_transaction() { # <install|update>
       export IHAR_CODEX_BIN="$store_stage/bin/codex"
       export IHAR_CLAUDE_ACP_BIN="$store_stage/acp/bin/claude-agent-acp"
       export IHAR_CODEX_ACP_BIN="$store_stage/acp/bin/codex-acp"
+      export IHAR_INSTALL_BOOTSTRAP="$bootstrap"
       if [[ "$active_npm" == "$active_nvm/bin/npm" ]]; then
         export IHAR_NPM_BIN="$nvm_stage/bin/npm"
       else
@@ -516,15 +527,31 @@ ihar_install_claude() {
 # ihar_install_conformance — the evidence an enforced profile needs, recorded before
 # anyone can select one (LLD 6.6).
 ihar_install_conformance() {
-  local protected_store="${1:-$IHAR_STORE}" vendor binary status=0
+  local protected_store="${1:-$IHAR_STORE}" vendor binary status=0 run_status record
   for vendor in claude codex; do
     binary="$(eval echo "\$IHAR_${vendor^^}_BIN")"
     [[ -x "$binary" ]] || continue
     ihar_python ihar.conformance.run "$vendor" "$binary" "$IHAR_STORE" \
       "$IHAR_ROOT/manifests/hooks.json" \
       --auth-store "$protected_store" --lockfile "$IHAR_LOCKFILE" \
-      --protected-store "$protected_store" >/dev/null \
-      || { ihar_warn "hook conformance did not pass for $vendor"; status=1; }
+      --protected-store "$protected_store" >/dev/null && continue
+    run_status=$?
+    if [[ "$run_status" == 1 && "${IHAR_INSTALL_BOOTSTRAP:-false}" == true ]]; then
+      record="$IHAR_STORE/verification/$vendor-$(ihar_version_slug "$binary").json"
+      if ihar_python ihar.conformance.check --failed-record "$record" "$binary" \
+        "$IHAR_ROOT/manifests/hooks.json" >/dev/null 2>&1; then
+        rm -f -- "$record" || {
+          ihar_warn "cannot discard failed conformance record for $vendor"
+          return 3
+        }
+        ihar_warn "hook conformance unproven for $vendor; run 'ihar check --conformance' after authentication"
+        continue
+      fi
+    fi
+    ihar_warn "hook conformance did not pass for $vendor"
+    if [[ "$run_status" == 3 || "$status" == 0 ]]; then
+      status="$run_status"
+    fi
   done
   return "$status"
 }
