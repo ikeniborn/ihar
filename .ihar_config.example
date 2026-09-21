@@ -7,7 +7,9 @@
 # Precedence is defaults < this file < command-line flags, with one exception: the
 # profile's masking level is a floor that neither this file nor a flag may lower.
 #
-# Every line below is commented out and shows the default.
+# Every line below is commented out and shows the default. Shell-style `${...}`
+# values are illustrations of a shell default only: this data-only parser does not
+# expand them. Before uncommenting one, replace it with a literal allowed value.
 
 # Which guarantees this project runs under. `ihar check` prints the text of each.
 # accepted: standard | protected | isolated

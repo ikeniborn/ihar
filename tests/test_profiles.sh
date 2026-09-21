@@ -78,7 +78,46 @@ PY_WRAPPER="$IHAR_TEST_TMP/check-python"
 VENDOR_STUB="$IHAR_TEST_TMP/vendor-stub"
 cat > "$PY_WRAPPER" <<'EOF'
 #!/usr/bin/env bash
-if [[ "$*" == *"ihar.conformance.run"* ]]; then : > "$IHAR_TEST_EVIDENCE"; exit 0; fi
+if [[ "$*" == *"ihar.conformance.run"* ]]; then
+  : > "$IHAR_TEST_EVIDENCE"
+  if [[ "$3" == "${IHAR_TEST_SETUP_FAIL_VENDOR:-}" ]]; then
+    printf 'ihar: conformance setup failed for %s: RuntimeError\n' "$3" >&2
+    exit 3
+  fi
+  if [[ "$3" == "${IHAR_TEST_FAIL_VENDOR:-}" ]]; then
+    printf 'failed live_hook\n'
+    exit 1
+  fi
+  if [[ "${IHAR_TEST_WRITE_PROOF:-false}" == true ]]; then
+    python3 - "$3" "$4" "$5" "$6" <<'PY'
+import hashlib
+import os
+import sys
+
+from ihar import jsonio
+from ihar.conformance import REQUIRED_CASES
+from ihar.conformance.run import version_slug
+
+vendor, binary, store, manifest = sys.argv[1:]
+def digest(path):
+    with open(path, "rb") as stream:
+        return hashlib.sha256(stream.read()).hexdigest()
+
+version = "vendor 1.0"
+record = {
+    "schema": 1, "vendor": vendor, "version": version,
+    "binary_sha256": digest(binary), "manifest_digest": digest(manifest),
+    "created_at": "2026-09-21T00:00:00Z",
+    "cases": {name: {"status": "passed"} for name in REQUIRED_CASES[vendor]},
+}
+target = os.path.join(store, "verification", f"{vendor}-{version_slug(version)}.json")
+os.makedirs(os.path.dirname(target), exist_ok=True)
+jsonio.write("conformance", target, record)
+PY
+    exit $?
+  fi
+  exit 0
+fi
 exec python3 "$@"
 EOF
 printf '#!/usr/bin/env bash\necho vendor 1.0\n' > "$VENDOR_STUB"
@@ -92,6 +131,88 @@ assert_exit "diff does not run conformance" 1 test -e "$EVIDENCE"
 IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
   IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$VENDOR_STUB" ihar check --conformance >/dev/null
 assert_exit "only conformance mode invokes live evidence" 0 test -e "$EVIDENCE"
+
+text_status=0
+text_output="$(IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
+  IHAR_TEST_FAIL_VENDOR=claude IHAR_CLAUDE_BIN="$VENDOR_STUB" \
+  IHAR_CODEX_BIN="$VENDOR_STUB" ihar check --conformance)" || text_status=$?
+assert_eq "failed conformance retains nonzero status after text rendering" 1 "$text_status"
+assert_contains "failed conformance still renders text status" "$text_output" "profile      standard"
+json_stdout="$IHAR_TEST_TMP/check-conformance-stdout.json"
+json_stderr="$IHAR_TEST_TMP/check-conformance-stderr"
+json_status=0
+( cd "$PROJECT" && IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
+    IHAR_TEST_FAIL_VENDOR=claude IHAR_CLAUDE_BIN="$VENDOR_STUB" \
+    IHAR_CODEX_BIN="$VENDOR_STUB" "$ROOT/ihar.sh" --json check --conformance \
+    > "$json_stdout" 2> "$json_stderr" ) || json_status=$?
+assert_eq "failed conformance retains nonzero status after JSON rendering" 1 "$json_status"
+assert_exit "conformance JSON stdout is one status object" 0 python3 -m json.tool "$json_stdout"
+assert_eq "conformance JSON stdout contains no case diagnostics" 0 \
+  "$(grep -c 'failed live_hook' "$json_stdout")"
+assert_contains "conformance JSON stderr identifies the vendor" \
+  "$(cat "$json_stderr")" "claude conformance"
+assert_contains "conformance JSON stderr retains bounded case diagnostics" \
+  "$(cat "$json_stderr")" "failed live_hook"
+
+# A failed explicit retry must not leave an older passing record eligible at the
+# enforced launch gate. The other vendor's managed proof is outside this retry.
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" IHAR_TEST_WRITE_PROOF=true \
+  IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$VENDOR_STUB" \
+  ihar check --conformance >/dev/null
+CLAUDE_PROOF="$IHAR_STORE/verification/claude-vendor-1.0.json"
+CODEX_PROOF="$IHAR_STORE/verification/codex-vendor-1.0.json"
+printf 'user note\n' > "$IHAR_STORE/verification/claude-notes.txt"
+assert_exit "passing explicit check writes Claude proof" 0 test -f "$CLAUDE_PROOF"
+assert_exit "passing explicit check writes Codex proof" 0 test -f "$CODEX_PROOF"
+codex_proof_before="$(sha256sum "$CODEX_PROOF" | cut -d' ' -f1)"
+IHAR_ROOT="$ROOT"; export IHAR_ROOT
+source "$ROOT/lib/core/logging.sh"
+source "$ROOT/lib/core/init.sh"
+source "$ROOT/lib/store/lockfile.sh"
+enforced_claude_gate() (
+  IHAR_PROFILE_HOOKS=enforced IHAR_PROFILE=protected IHAR_VENDOR=claude
+  IHAR_CLAUDE_BIN="$VENDOR_STUB"
+  ihar_store_verify_conformance true
+)
+assert_exit "seeded proof permits enforced Claude gate" 0 enforced_claude_gate
+retry_status=0
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
+  IHAR_TEST_SETUP_FAIL_VENDOR=claude IHAR_CLAUDE_BIN="$VENDOR_STUB" \
+  IHAR_CODEX_BIN="$IHAR_TEST_TMP/no-codex" ihar check --conformance >/dev/null \
+  || retry_status=$?
+assert_eq "pre-record retry fails" 3 "$retry_status"
+assert_exit "pre-record retry revokes old Claude proof" 1 test -e "$CLAUDE_PROOF"
+assert_exit "pre-record retry cannot pass enforced Claude gate" 3 enforced_claude_gate
+assert_eq "Claude retry leaves Codex proof untouched" "$codex_proof_before" \
+  "$(sha256sum "$CODEX_PROOF" | cut -d' ' -f1)"
+assert_eq "Claude retry leaves non-JSON note untouched" "user note" \
+  "$(cat "$IHAR_STORE/verification/claude-notes.txt")"
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" IHAR_TEST_WRITE_PROOF=true \
+  IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$IHAR_TEST_TMP/no-codex" \
+  ihar check --conformance >/dev/null
+assert_exit "passing retry writes fresh Claude proof" 0 test -f "$CLAUDE_PROOF"
+assert_exit "fresh proof permits enforced Claude gate" 0 enforced_claude_gate
+assert_eq "passing Claude retry leaves Codex proof untouched" "$codex_proof_before" \
+  "$(sha256sum "$CODEX_PROOF" | cut -d' ' -f1)"
+ln -s "$IHAR_TEST_TMP/symlink-target" "$IHAR_STORE/verification/claude-trap.json"
+rm -f -- "$EVIDENCE"
+symlink_retry_status=0
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" IHAR_TEST_WRITE_PROOF=true \
+  IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$IHAR_TEST_TMP/no-codex" \
+  ihar check --conformance >/dev/null || symlink_retry_status=$?
+assert_eq "symlink proof blocks explicit retry" 3 "$symlink_retry_status"
+assert_exit "symlink proof aborts before live runner" 1 test -e "$EVIDENCE"
+assert_exit "symlink proof remains untouched" 0 test -L "$IHAR_STORE/verification/claude-trap.json"
+assert_exit "failed revocation cannot reuse old Claude proof" 3 enforced_claude_gate
+assert_exit "failed revocation keeps Claude recheck pending" 0 \
+  test -d "$IHAR_STORE/verification/.recheck-claude"
+rm -f -- "$IHAR_STORE/verification/claude-trap.json"
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" IHAR_TEST_WRITE_PROOF=true \
+  IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$IHAR_TEST_TMP/no-codex" \
+  ihar check --conformance >/dev/null
+assert_exit "passing retry clears Claude recheck marker" 1 \
+  test -e "$IHAR_STORE/verification/.recheck-claude"
+assert_exit "passing retry restores enforced Claude gate" 0 enforced_claude_gate
 
 # --- the masking floor may be tightened, never loosened ------------------------------
 #
@@ -326,6 +447,39 @@ printf 'wrong newest\n' > "$CHECK_STATE/r/ffffffff/codex/config.toml"
 touch "$CHECK_STATE/r/ffffffff"
 exact_diff="$(ihar --profile protected check --diff)"
 assert_eq "diff uses exact desired runtime and real gateway inputs" "no differences" "$exact_diff"
+combined_status=0
+combined_output="$(IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
+  IHAR_TEST_FAIL_VENDOR=claude IHAR_CLAUDE_BIN="$VENDOR_STUB" \
+  IHAR_CODEX_BIN="$VENDOR_STUB" ihar --profile protected check --diff --conformance)" \
+  || combined_status=$?
+assert_eq "clean diff retains failed conformance status" 1 "$combined_status"
+assert_eq "combined flags still render the clean diff" "no differences" \
+  "$(tail -n 1 <<<"$combined_output")"
+
+# The render directory is created, but its mkdir reports failure. A plain render
+# must stop there; invoking the whole diff under `||` disables errexit in its body.
+RENDER_FAIL_BIN="$IHAR_TEST_TMP/render-fail-bin"
+mkdir -p "$RENDER_FAIL_BIN"
+cat > "$RENDER_FAIL_BIN/mkdir" <<'EOF'
+#!/usr/bin/env bash
+"$IHAR_TEST_REAL_MKDIR" "$@" || exit $?
+for target in "$@"; do :; done
+if [[ "$target" == */ihar-check-diff-*/claude ]]; then
+  printf 'injected early render failure\n' >&2
+  exit 3
+fi
+EOF
+chmod +x "$RENDER_FAIL_BIN/mkdir"
+render_fail_status=0
+render_fail_output="$(cd "$PROJECT" && env PATH="$RENDER_FAIL_BIN:$PATH" \
+  IHAR_TEST_REAL_MKDIR="$(command -v mkdir)" IHAR_STORE="$IHAR_STORE" \
+  IHAR_STATE_ROOT="$IHAR_STATE_ROOT" "$ROOT/ihar.sh" --profile protected check --diff 2>&1)" \
+  || render_fail_status=$?
+assert_contains "diff reaches the injected early render failure" \
+  "$render_fail_output" "injected early render failure"
+assert_eq "early render failure remains nonzero" 3 "$render_fail_status"
+assert_eq "early render failure cannot claim no differences" 0 \
+  "$(grep -cF 'no differences' <<<"$render_fail_output")"
 
 FAIL_TMP="$IHAR_TEST_TMP/check-failure-temp"
 FAIL_PY="$IHAR_TEST_TMP/fail-check-python"

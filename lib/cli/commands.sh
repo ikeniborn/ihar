@@ -240,15 +240,69 @@ ihar_dry_run() {
 }
 
 # ihar_cmd_conformance — run the live suite and record the result (LLD 6.6).
+ihar_conformance_revoke_vendor() { # <vendor>
+  local vendor="$1" directory="$IHAR_STORE/verification" record name
+  local -a records=()
+  case "$vendor" in claude|codex) ;; *) return 3 ;; esac
+  [[ -e "$directory" || -L "$directory" ]] || return 0
+  [[ -d "$directory" && ! -L "$directory" && -r "$directory" && -x "$directory" ]] || return 3
+  for record in "$directory/$vendor-"*.json; do
+    [[ -e "$record" || -L "$record" ]] || continue
+    name="${record##*/}"
+    [[ "$name" =~ ^${vendor}-[A-Za-z0-9._-]+\.json$ && -f "$record" && ! -L "$record" ]] || return 3
+    records+=("$record")
+  done
+  for record in "${records[@]}"; do
+    rm -f -- "$record" || return 3
+  done
+}
+
 ihar_cmd_conformance() {
-  local vendor binary status=0
+  local vendor binary status=0 run_status directory="$IHAR_STORE/verification" marker
   for vendor in claude codex; do
     binary="$(eval echo "\$IHAR_${vendor^^}_BIN")"
     [[ -x "$binary" ]] || continue
+    marker="$directory/.recheck-$vendor"
+    if [[ ! -e "$directory" && ! -L "$directory" ]]; then
+      mkdir -- "$directory" || {
+        ihar_warn "cannot begin conformance recheck for $vendor"
+        status=3
+        continue
+      }
+    fi
+    if [[ ! -d "$directory" || -L "$directory" ]]; then
+      ihar_warn "cannot begin conformance recheck for $vendor"
+      status=3
+      continue
+    fi
+    if [[ -e "$marker" || -L "$marker" ]]; then
+      if [[ ! -d "$marker" || -L "$marker" ]]; then
+        ihar_warn "cannot begin conformance recheck for $vendor"
+        status=3
+        continue
+      fi
+    elif ! mkdir -- "$marker"; then
+      ihar_warn "cannot begin conformance recheck for $vendor"
+      status=3
+      continue
+    fi
+    if ! ihar_conformance_revoke_vendor "$vendor"; then
+      ihar_warn "cannot revoke conformance proof for $vendor"
+      status=3
+      continue
+    fi
     printf '\n%s conformance\n' "$vendor"
-    ihar_python ihar.conformance.run "$vendor" "$binary" "$IHAR_STORE" \
+    if ihar_python ihar.conformance.run "$vendor" "$binary" "$IHAR_STORE" \
       "$IHAR_ROOT/manifests/hooks.json" \
-      --auth-store "$IHAR_STORE" --lockfile "$IHAR_LOCKFILE" || status=$?
+      --auth-store "$IHAR_STORE" --lockfile "$IHAR_LOCKFILE"; then
+      rmdir -- "$marker" || {
+        ihar_warn "cannot complete conformance recheck for $vendor"
+        status=3
+      }
+    else
+      run_status=$?
+      if [[ "$run_status" == 3 || "$status" == 0 ]]; then status="$run_status"; fi
+    fi
   done
   return "$status"
 }
