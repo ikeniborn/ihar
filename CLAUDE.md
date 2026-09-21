@@ -147,6 +147,9 @@ A profile that has not passed its gate is absent from `manifests/profiles/` — 
 | G3 | explicit gateway | `protected` |
 | G4 | transparent spike | no-go: `remote-protected` dropped by user decision in S11 |
 | G5 | microVM and guest network | `isolated` |
+| G6 | multi-session console | `console: allow` in a shipped profile |
+
+G6 applies the rule above to a field rather than a whole profile, because `console: allow` authorises a local surface that starts launches as the user. It passes when a non-loopback bind is refused, a request without the token cookie or with a foreign `Origin` is refused, a tab writes no terminal output to disk, a tab receives the base environment only, and `ihar check` states the cross-project reach.
 
 Never implement a later phase's enforcement to unblock an earlier one. **If a gate cannot be met, stop and report the evidence.** Dropping a profile is the user's decision, not yours, because it removes a capability they may be relying on; weakening one to pass its gate is never an option, because the profile's name is the guarantee.
 
