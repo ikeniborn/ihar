@@ -1,18 +1,29 @@
 # ihar
 
-One control and security plane for native coding agents.
+[Read in Russian](docs/README.ru.md)
+
+`ihar` is a local control layer for using Claude Code and Codex CLI under one project
+policy. It is for developers and teams that want to move between agents without
+maintaining two separate sets of security rules, MCP connections and session
+bookmarks.
 
 `ihar` launches the vendors' own `claude` and `codex` binaries — it does not wrap, patch
-or replace them. What it adds is the part the vendors leave to you: one place that decides
-what an agent may reach, proves the decision is actually in force before the agent starts,
-and refuses to launch when it cannot.
+or replace them. The vendors keep their own accounts, authentication and transcripts;
+`ihar` supplies the shared setup around them. There is no separate ihar account or
+hosted agent service.
 
-## Why
+## Why use it
 
-Two agents, two configuration formats, two hook systems, two sandbox models. Keeping a
-security rule true in both by hand is how it quietly stops being true in one. `ihar`
-renders both configurations from a single profile, verifies the vendor accepted them, and
-makes an unproven guarantee a failure rather than a footnote.
+Two agents normally mean two configuration formats, hook systems and sandbox models.
+`ihar` gives a project one entry point for both, a common session index, and a bounded,
+sanitised handoff when work moves from one agent to the other. Shared profiles render
+the relevant security settings for each vendor. An enforced profile must prove its
+guarantees before launch or stop; the `standard` profile intentionally offers no such
+security guarantee.
+
+The practical result is less duplicate setup and less risk of policy drift, while
+keeping the native agent experience. `ihar` is not a new model, an agent runtime, a
+transcript store or a replacement for vendor subscriptions.
 
 ## What a profile guarantees
 
@@ -34,7 +45,7 @@ launch needs passwordless `sudo` for its short-lived TAP and per-launch firewall
 the rules and interface are removed when the launch ends.
 
 ```bash
-git clone <this repository> ihar
+git clone https://github.com/ikeniborn/ihar.git ihar
 cd ihar
 ./ihar.sh install
 ```
@@ -93,11 +104,27 @@ current session, links both canonical session records, and launches the other ve
 Claude carries the package in its initial prompt; Codex consumes the remainder once
 through its SessionStart hook.
 
-`ihar web claude|codex` and the equivalent launch `--web` flag use each vendor's
-native remote bridge. Claude Remote Control is available only in profiles that list
-Claude under `remote`; Codex starts its managed app-server daemon, prints a pairing
-code, and attaches the TUI to that daemon. For an authenticated LAN listener, pass
-Codex's own `app-server --listen` and `--ws-auth` arguments after `--`.
+## Web access today
+
+Run `ihar web` on the computer that owns the project and vendor login. For now,
+`ihar` is a local launcher/client, not a standalone website or a hosted ihar service.
+The command starts the vendor's own remote surface; use the vendor's pairing or
+browser flow to access the same native session.
+
+```bash
+ihar web claude
+ihar web codex
+```
+
+`ihar claude --web` and `ihar codex --web` are equivalent. Claude Remote Control
+works with `standard` only; `protected` refuses it because its model gateway is
+incompatible with that vendor feature. Codex works with `standard` and `protected`:
+`ihar` starts its managed app-server daemon, prints a pairing code, and attaches
+the terminal client to it. The `isolated` profile offers neither web surface.
+
+This is not a separate ihar browser UI, and `ihar` does not issue web credentials.
+For the vendor-specific flow and the optional authenticated Codex LAN listener,
+see [Native web surfaces](docs/manual/web-surfaces.md).
 
 ## Configure
 
@@ -112,6 +139,11 @@ The file is parsed, never sourced: only `IHAR_*` assignments are accepted, an un
 is an error, and a value is data rather than something to execute. Precedence is defaults,
 then this file, then command-line flags — with one exception: a profile's masking level is
 a floor, and neither the file nor a flag may lower it.
+
+All entries in the generated example are commented out. Values such as `${…}`, `unset`
+and `the profile's floor` describe defaults; replace them with concrete allowed values
+before uncommenting a line. The example covers every accepted project configuration key;
+installation-only environment variables such as `IHAR_MICROVM_SOURCE_DIR` are separate.
 
 ## Update
 
@@ -134,4 +166,5 @@ Linux or macOS, Bash 5, Python 3.11 or newer, `flock`, and `curl` or `wget`.
 
 - `docs/hld/unified-harness.md` — what the system is for and what it guarantees
 - `docs/lld/unified-harness.md` — how it is built
+- `docs/manual/web-surfaces.md` — vendor-native web access and its limits
 - `CLAUDE.md` — the development and testing rules for this repository
