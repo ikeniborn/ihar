@@ -364,6 +364,31 @@ assert_eq "clean diff retains failed conformance status" 1 "$combined_status"
 assert_eq "combined flags still render the clean diff" "no differences" \
   "$(tail -n 1 <<<"$combined_output")"
 
+# The render directory is created, but its mkdir reports failure. A plain render
+# must stop there; invoking the whole diff under `||` disables errexit in its body.
+RENDER_FAIL_BIN="$IHAR_TEST_TMP/render-fail-bin"
+mkdir -p "$RENDER_FAIL_BIN"
+cat > "$RENDER_FAIL_BIN/mkdir" <<'EOF'
+#!/usr/bin/env bash
+"$IHAR_TEST_REAL_MKDIR" "$@" || exit $?
+for target in "$@"; do :; done
+if [[ "$target" == */ihar-check-diff-*/claude ]]; then
+  printf 'injected early render failure\n' >&2
+  exit 3
+fi
+EOF
+chmod +x "$RENDER_FAIL_BIN/mkdir"
+render_fail_status=0
+render_fail_output="$(cd "$PROJECT" && env PATH="$RENDER_FAIL_BIN:$PATH" \
+  IHAR_TEST_REAL_MKDIR="$(command -v mkdir)" IHAR_STORE="$IHAR_STORE" \
+  IHAR_STATE_ROOT="$IHAR_STATE_ROOT" "$ROOT/ihar.sh" --profile protected check --diff 2>&1)" \
+  || render_fail_status=$?
+assert_contains "diff reaches the injected early render failure" \
+  "$render_fail_output" "injected early render failure"
+assert_eq "early render failure remains nonzero" 3 "$render_fail_status"
+assert_eq "early render failure cannot claim no differences" 0 \
+  "$(grep -cF 'no differences' <<<"$render_fail_output")"
+
 FAIL_TMP="$IHAR_TEST_TMP/check-failure-temp"
 FAIL_PY="$IHAR_TEST_TMP/fail-check-python"
 mkdir -p "$FAIL_TMP"

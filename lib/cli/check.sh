@@ -134,7 +134,10 @@ ihar_cmd_check() (
     fi
   fi
   if [[ "$IHAR_FLAG_DIFF" == true ]]; then
-    ihar_check_diff || return $?
+    # An OR-list here would disable errexit inside the entire diff renderer.
+    ihar_check_diff
+    status=$?
+    (( status == 0 )) || return "$status"
     return "$conformance_status"
   fi
   result="$(mktemp "${TMPDIR:-/tmp}/ihar-check-result-XXXXXX.json")" || return 1
