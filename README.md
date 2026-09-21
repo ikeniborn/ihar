@@ -52,8 +52,18 @@ cd ihar
 
 That builds the store, links `ihar` into `~/.local/bin`, creates the Python environment,
 installs pinned component versions, verifies the Codex archive against its recorded
-digest, and runs the hook conformance suite the enforced profiles require. The
-Node/Claude installation is version-pinned but has no archive digest in the lockfile.
+digest, and attempts the full live hook-conformance suite. The Node/Claude installation
+is version-pinned but has no archive digest in the lockfile.
+
+On a first bootstrap, missing native vendor authentication can leave one or more vendors
+unproven after otherwise valid installation. The installer activates that bootstrap, names
+the affected vendor and failed required case names without printing vendor output or
+credentials, and tells you to run `ihar check --conformance` after signing in through the
+vendor's own flow. `standard` can still launch with its native authentication behavior;
+an enforced profile refuses before vendor execution until a complete matching conformance
+record exists. An install or update of an existing generation is different: failed or
+incomplete live conformance aborts activation and keeps the prior generation, receipt and
+proof records.
 
 The specialised Firecracker guest comes from a compatible, locally built asset directory.
 Its `firecracker`, `vmlinux` and `rootfs.ext4` files are checked against lockfile
@@ -157,6 +167,8 @@ vendor binary, but every run still validates topology, stages and copies declare
 re-runs conformance, rebuilds the receipt, and activates the staged generation. Bumping a
 pin upgrades the component; an unchanged lockfile does not make the command a no-op. A new
 vendor binary must earn new conformance evidence because the record is keyed by its digest.
+Only a first bootstrap may activate without proof as described above; an existing
+generation always rolls back on failed or incomplete conformance.
 
 ## Requirements
 
