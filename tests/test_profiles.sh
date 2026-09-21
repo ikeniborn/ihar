@@ -78,7 +78,14 @@ PY_WRAPPER="$IHAR_TEST_TMP/check-python"
 VENDOR_STUB="$IHAR_TEST_TMP/vendor-stub"
 cat > "$PY_WRAPPER" <<'EOF'
 #!/usr/bin/env bash
-if [[ "$*" == *"ihar.conformance.run"* ]]; then : > "$IHAR_TEST_EVIDENCE"; exit 0; fi
+if [[ "$*" == *"ihar.conformance.run"* ]]; then
+  : > "$IHAR_TEST_EVIDENCE"
+  if [[ "$3" == "${IHAR_TEST_FAIL_VENDOR:-}" ]]; then
+    printf 'failed live_hook\n'
+    exit 1
+  fi
+  exit 0
+fi
 exec python3 "$@"
 EOF
 printf '#!/usr/bin/env bash\necho vendor 1.0\n' > "$VENDOR_STUB"
@@ -92,6 +99,28 @@ assert_exit "diff does not run conformance" 1 test -e "$EVIDENCE"
 IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
   IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$VENDOR_STUB" ihar check --conformance >/dev/null
 assert_exit "only conformance mode invokes live evidence" 0 test -e "$EVIDENCE"
+
+text_status=0
+text_output="$(IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
+  IHAR_TEST_FAIL_VENDOR=claude IHAR_CLAUDE_BIN="$VENDOR_STUB" \
+  IHAR_CODEX_BIN="$VENDOR_STUB" ihar check --conformance)" || text_status=$?
+assert_eq "failed conformance retains nonzero status after text rendering" 1 "$text_status"
+assert_contains "failed conformance still renders text status" "$text_output" "profile      standard"
+json_stdout="$IHAR_TEST_TMP/check-conformance-stdout.json"
+json_stderr="$IHAR_TEST_TMP/check-conformance-stderr"
+json_status=0
+( cd "$PROJECT" && IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
+    IHAR_TEST_FAIL_VENDOR=claude IHAR_CLAUDE_BIN="$VENDOR_STUB" \
+    IHAR_CODEX_BIN="$VENDOR_STUB" "$ROOT/ihar.sh" --json check --conformance \
+    > "$json_stdout" 2> "$json_stderr" ) || json_status=$?
+assert_eq "failed conformance retains nonzero status after JSON rendering" 1 "$json_status"
+assert_exit "conformance JSON stdout is one status object" 0 python3 -m json.tool "$json_stdout"
+assert_eq "conformance JSON stdout contains no case diagnostics" 0 \
+  "$(grep -c 'failed live_hook' "$json_stdout")"
+assert_contains "conformance JSON stderr identifies the vendor" \
+  "$(cat "$json_stderr")" "claude conformance"
+assert_contains "conformance JSON stderr retains bounded case diagnostics" \
+  "$(cat "$json_stderr")" "failed live_hook"
 
 # --- the masking floor may be tightened, never loosened ------------------------------
 #

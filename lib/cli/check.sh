@@ -124,19 +124,23 @@ ihar_check_diff() (
 )
 
 ihar_cmd_check() (
-  local result=""
+  local result="" conformance_status=0 status=0
   trap '[[ -z "$result" ]] || rm -f -- "$result"' EXIT
   if [[ "$IHAR_FLAG_CONFORMANCE" == true ]]; then
-    if [[ "$IHAR_FLAG_JSON" == true ]]; then ihar_cmd_conformance >/dev/null; else ihar_cmd_conformance; fi
+    if [[ "$IHAR_FLAG_JSON" == true ]]; then
+      ihar_cmd_conformance >&2 || conformance_status=$?
+    else
+      ihar_cmd_conformance || conformance_status=$?
+    fi
   fi
   if [[ "$IHAR_FLAG_DIFF" == true ]]; then ihar_check_diff; return $?; fi
   result="$(mktemp "${TMPDIR:-/tmp}/ihar-check-result-XXXXXX.json")" || return 1
   ihar_check_collect "$result" || return $?
-  local status=0
   if [[ "$IHAR_FLAG_JSON" == true ]]; then
     ihar_python ihar.check_result json "$result" || status=$?
   else
     ihar_python ihar.check_result text "$result" || status=$?
   fi
-  return "$status"
+  (( status == 0 )) || return "$status"
+  return "$conformance_status"
 )
