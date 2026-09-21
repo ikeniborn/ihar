@@ -615,7 +615,7 @@ run_install_scenario() ( # <scenario> [install|update]
     printf '#!/bin/sh\necho new claude\n' > "$IHAR_CLAUDE_BIN"
     chmod +x "$IHAR_CLAUDE_BIN"
   }
-  if [[ "$scenario" == bootstrap-* || "$scenario" == receipt-only ||
+  if [[ "$scenario" == bootstrap-* || "$scenario" == existing-failed || "$scenario" == receipt-only ||
         "$scenario" == receipt-link-only || "$scenario" == executable-only-* ||
         "$scenario" == executable-link-codex ]]; then
     ihar_python() {
@@ -623,6 +623,7 @@ run_install_scenario() ( # <scenario> [install|update]
         printf '%s\n' "$2" >> "$IHAR_TEST_TMP/$scenario.conformance-runs"
         [[ "$scenario" != bootstrap-prerecord ]] || return 3
         [[ "$scenario" != bootstrap-missing-record ]] || return 1
+        printf 'failed deny-blocks-the-tool\n'
         python3 - "$2" "$3" "$4" "$5" <<'PY'
 import hashlib
 import json
@@ -646,7 +647,8 @@ record = {
     "binary_sha256": binary_digest, "manifest_digest": manifest_digest,
     "created_at": "2026-09-21T00:00:00Z",
     "cases": {
-        name: {"status": "failed" if name == "deny-blocks-the-tool" else "passed"}
+        name: {"status": "failed" if name == "deny-blocks-the-tool" else "passed",
+               "detail": "SECRET-SENTINEL"}
         for name in REQUIRED_CASES[record_vendor]
     },
 }
@@ -758,6 +760,22 @@ for vendor in claude codex; do
 done
 assert_contains "first bootstrap directs post-auth proof" \
   "$bootstrap_output" "ihar check --conformance"
+assert_contains "first bootstrap reports bounded failed case" \
+  "$bootstrap_output" "failed deny-blocks-the-tool"
+assert_eq "first bootstrap does not print record detail" 0 \
+  "$(grep -cF 'SECRET-SENTINEL' <<<"$bootstrap_output")"
+
+reset_active_generation
+before_generation="$(transaction_fingerprint)"
+existing_output="$(run_install_scenario existing-failed update 2>&1)"
+existing_status=$?
+assert_eq "failed existing-generation conformance aborts update" 1 "$existing_status"
+assert_contains "failed update reports bounded failed case" \
+  "$existing_output" "failed deny-blocks-the-tool"
+assert_eq "failed update does not print record detail" 0 \
+  "$(grep -cF 'SECRET-SENTINEL' <<<"$existing_output")"
+assert_eq "failed update preserves previous active generation" \
+  "$before_generation" "$(transaction_fingerprint)"
 
 for scenario in receipt-only executable-only-claude executable-only-codex; do
   reset_active_generation

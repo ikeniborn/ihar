@@ -539,7 +539,7 @@ ihar_install_conformance() {
     ihar_python ihar.conformance.run "$vendor" "$binary" "$IHAR_STORE" \
       "$IHAR_ROOT/manifests/hooks.json" \
       --auth-store "$protected_store" --lockfile "$IHAR_LOCKFILE" \
-      --protected-store "$protected_store" >/dev/null && continue
+      --protected-store "$protected_store" 1>&2 && continue
     run_status=$?
     if [[ "$run_status" == 1 && "${IHAR_INSTALL_BOOTSTRAP:-false}" == true ]]; then
       record="$IHAR_STORE/verification/$vendor-$(ihar_version_slug "$binary").json"

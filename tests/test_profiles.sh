@@ -80,9 +80,41 @@ cat > "$PY_WRAPPER" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$*" == *"ihar.conformance.run"* ]]; then
   : > "$IHAR_TEST_EVIDENCE"
+  if [[ "$3" == "${IHAR_TEST_SETUP_FAIL_VENDOR:-}" ]]; then
+    printf 'ihar: conformance setup failed for %s: RuntimeError\n' "$3" >&2
+    exit 3
+  fi
   if [[ "$3" == "${IHAR_TEST_FAIL_VENDOR:-}" ]]; then
     printf 'failed live_hook\n'
     exit 1
+  fi
+  if [[ "${IHAR_TEST_WRITE_PROOF:-false}" == true ]]; then
+    python3 - "$3" "$4" "$5" "$6" <<'PY'
+import hashlib
+import os
+import sys
+
+from ihar import jsonio
+from ihar.conformance import REQUIRED_CASES
+from ihar.conformance.run import version_slug
+
+vendor, binary, store, manifest = sys.argv[1:]
+def digest(path):
+    with open(path, "rb") as stream:
+        return hashlib.sha256(stream.read()).hexdigest()
+
+version = "vendor 1.0"
+record = {
+    "schema": 1, "vendor": vendor, "version": version,
+    "binary_sha256": digest(binary), "manifest_digest": digest(manifest),
+    "created_at": "2026-09-21T00:00:00Z",
+    "cases": {name: {"status": "passed"} for name in REQUIRED_CASES[vendor]},
+}
+target = os.path.join(store, "verification", f"{vendor}-{version_slug(version)}.json")
+os.makedirs(os.path.dirname(target), exist_ok=True)
+jsonio.write("conformance", target, record)
+PY
+    exit $?
   fi
   exit 0
 fi
@@ -121,6 +153,57 @@ assert_contains "conformance JSON stderr identifies the vendor" \
   "$(cat "$json_stderr")" "claude conformance"
 assert_contains "conformance JSON stderr retains bounded case diagnostics" \
   "$(cat "$json_stderr")" "failed live_hook"
+
+# A failed explicit retry must not leave an older passing record eligible at the
+# enforced launch gate. The other vendor's managed proof is outside this retry.
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" IHAR_TEST_WRITE_PROOF=true \
+  IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$VENDOR_STUB" \
+  ihar check --conformance >/dev/null
+CLAUDE_PROOF="$IHAR_STORE/verification/claude-vendor-1.0.json"
+CODEX_PROOF="$IHAR_STORE/verification/codex-vendor-1.0.json"
+printf 'user note\n' > "$IHAR_STORE/verification/claude-notes.txt"
+assert_exit "passing explicit check writes Claude proof" 0 test -f "$CLAUDE_PROOF"
+assert_exit "passing explicit check writes Codex proof" 0 test -f "$CODEX_PROOF"
+codex_proof_before="$(sha256sum "$CODEX_PROOF" | cut -d' ' -f1)"
+IHAR_ROOT="$ROOT"; export IHAR_ROOT
+source "$ROOT/lib/core/logging.sh"
+source "$ROOT/lib/core/init.sh"
+source "$ROOT/lib/store/lockfile.sh"
+enforced_claude_gate() (
+  IHAR_PROFILE_HOOKS=enforced IHAR_PROFILE=protected IHAR_VENDOR=claude
+  IHAR_CLAUDE_BIN="$VENDOR_STUB"
+  ihar_store_verify_conformance true
+)
+assert_exit "seeded proof permits enforced Claude gate" 0 enforced_claude_gate
+retry_status=0
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
+  IHAR_TEST_SETUP_FAIL_VENDOR=claude IHAR_CLAUDE_BIN="$VENDOR_STUB" \
+  IHAR_CODEX_BIN="$IHAR_TEST_TMP/no-codex" ihar check --conformance >/dev/null \
+  || retry_status=$?
+assert_eq "pre-record retry fails" 3 "$retry_status"
+assert_exit "pre-record retry revokes old Claude proof" 1 test -e "$CLAUDE_PROOF"
+assert_exit "pre-record retry cannot pass enforced Claude gate" 3 enforced_claude_gate
+assert_eq "Claude retry leaves Codex proof untouched" "$codex_proof_before" \
+  "$(sha256sum "$CODEX_PROOF" | cut -d' ' -f1)"
+assert_eq "Claude retry leaves non-JSON note untouched" "user note" \
+  "$(cat "$IHAR_STORE/verification/claude-notes.txt")"
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" IHAR_TEST_WRITE_PROOF=true \
+  IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$IHAR_TEST_TMP/no-codex" \
+  ihar check --conformance >/dev/null
+assert_exit "passing retry writes fresh Claude proof" 0 test -f "$CLAUDE_PROOF"
+assert_exit "fresh proof permits enforced Claude gate" 0 enforced_claude_gate
+assert_eq "passing Claude retry leaves Codex proof untouched" "$codex_proof_before" \
+  "$(sha256sum "$CODEX_PROOF" | cut -d' ' -f1)"
+ln -s "$IHAR_TEST_TMP/symlink-target" "$IHAR_STORE/verification/claude-trap.json"
+rm -f -- "$EVIDENCE"
+symlink_retry_status=0
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" IHAR_TEST_WRITE_PROOF=true \
+  IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$IHAR_TEST_TMP/no-codex" \
+  ihar check --conformance >/dev/null || symlink_retry_status=$?
+assert_eq "symlink proof blocks explicit retry" 3 "$symlink_retry_status"
+assert_exit "symlink proof aborts before live runner" 1 test -e "$EVIDENCE"
+assert_exit "symlink proof remains untouched" 0 test -L "$IHAR_STORE/verification/claude-trap.json"
+rm -f -- "$IHAR_STORE/verification/claude-trap.json"
 
 # --- the masking floor may be tightened, never loosened ------------------------------
 #
