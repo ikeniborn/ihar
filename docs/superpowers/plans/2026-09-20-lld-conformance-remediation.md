@@ -1,5 +1,12 @@
 ---
 status: approved
+result_check:
+  verdict: OK
+  source: plan
+  plan_hash: af450391d25c08d6
+  last_run: 2026-09-21
+  reviewed: true
+  docs_checked: true
 review:
   plan_hash: af450391d25c08d6
   last_run: 2026-09-20
