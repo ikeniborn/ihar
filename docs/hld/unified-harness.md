@@ -2,8 +2,8 @@
 
 | Field | Value |
 |-------|-------|
-| Status | reviewed draft, revision 3 (`remote-protected` dropped after the transparent-gateway no-go) |
-| Date | 2026-09-18 |
+| Status | reviewed draft, revision 4 (multi-session console as §6.10, R9 and R10; handoff history modes in §6.7) |
+| Date | 2026-09-21 |
 | Verified against | Claude Code 2.1.274, Codex CLI 0.154.0, claude-agent-acp 0.79.0, codex-acp @ 6ec22f3, Toad 0.6.20, ACP schema v1.22.0 |
 | Based on | research page `ihar/concept/unified-harness-options` (options A–D) |
 | Decision | Option A (native launcher) is the core; Option B (ACP) is an optional presentation layer of the same core |
@@ -14,7 +14,7 @@
 
 `ihar` is not a new agent, not a conversation runtime, not a transcript format, not a replacement for Claude Code or Codex, and not an authentication provider. Claude Code and Codex keep their own binaries, authentication, native session storage and execution semantics. The property this buys: adding a new agent requires a new adapter and renderers, not changes to security, sessions, handoff, MCP or project isolation.
 
-In scope: everything the two wrappers do today, plus the session index, handoff, security profiles and unified launch surfaces. Out of scope: reimplementing an agent loop, a custom chat UI, or any authentication path that is not the vendor's own binary or SDK.
+In scope: everything the two wrappers do today, plus the session index, handoff, security profiles and unified launch surfaces, including a local console that presents several of those sessions in one window (§6.10). Out of scope: reimplementing an agent loop, owning a conversation store, or any authentication path that is not the vendor's own binary or SDK. A presentation surface is in scope only while it renders what an adapter reads and drives what an adapter launches; the moment a surface would need `ihar` to assemble a model request or persist a transcript of its own, it is out of scope by the same rule that rejected Option C.
 
 ## 2. Requirements
 
@@ -30,6 +30,8 @@ Functional requirements, each traceable to a section below.
 | R6 | One MCP registry rendered for both agents | §6.3, §6.4 |
 | R7 | Terminal and web access to the same session | §6.8 web surfaces, §8 profiles |
 | R8 | Switch harness (Claude Code ⇄ Codex) or model to continue work | §6.7 handoff, adapter `switch_model` |
+| R9 | One window over several concurrent sessions across projects: launch, switch, live status | §6.10 multi-session console, §8 profiles |
+| R10 | Continuous reading of work that crossed a vendor switch | §6.10 thread projection over §6.6 links |
 
 Non-functional: keep vendor subscription auth inside vendor binaries (policy); fail-closed for security layers (an enabled gateway or sandbox that cannot start aborts the launch with a message, never runs unprotected); fail-soft for convenience layers (index, statusline, telemetry, handoff export warn and continue); no new session file format that vendors must read; Bash-first with Python helpers as in the existing wrappers.
 
@@ -234,7 +236,9 @@ sequenceDiagram
     T-->>U: continues with the packaged context
 ```
 
-Deterministic core (always present): source vendor and session id, project, cwd, git branch, HEAD, diff stat, changed files, open tasks from the task ledger when present, explicit decisions and recent relevant messages extracted by the adapter's `export_context()`. Optional distillation: a template-driven summary produced by the source agent on a fork of its own session (`claude -p --resume <id> --fork-session` or `codex exec fork <id>`, so the source transcript is never mutated) or by a local rule-based extractor. The summary enriches the package; it is never the only carrier of state, because git state, paths and explicit items survive a lossy summary and a summary does not. Sanitisation runs the PII policy over the whole package before it is written. Injection goes through the target adapter: initial prompt argument for Claude (optionally `--append-system-prompt`), initial `[PROMPT]` or a SessionStart hook `additionalContext` that reads `<home>/handoff/latest.md` once and clears it for Codex. The package is bounded (target under 8 kB) and points at files rather than inlining them. Model switch inside a harness needs no handoff: adapter `switch_model()` maps to `--model`, `/model`, `--effort`, `-m`, `model_reasoning_effort`, profiles.
+Deterministic core (always present): source vendor and session id, project, cwd, git branch, HEAD, diff stat, changed files, open tasks from the task ledger when present, explicit decisions and recent relevant messages extracted by the adapter's `export_context()`. Optional distillation: a template-driven summary produced by the source agent on a fork of its own session (`claude -p --resume <id> --fork-session` or `codex exec fork <id>`, so the source transcript is never mutated) or by a local rule-based extractor. The summary enriches the package; it is never the only carrier of state, because git state, paths and explicit items survive a lossy summary and a summary does not. Sanitisation runs the PII policy over the whole package before it is written. Injection goes through the target adapter: initial prompt argument for Claude (optionally `--append-system-prompt`), initial `[PROMPT]` or a SessionStart hook `additionalContext` that reads `<home>/handoff/latest.md` once and clears it for Codex. The package is bounded (target under 8 kB) and points at files rather than inlining them.
+
+How much of the conversation travels is a choice with two settings. `summary` — the default — ships the deterministic core and the distilled summary, and nothing else. `transcript` additionally renders the source session into a masked file beside the package and names that path in the injected text, so the target agent can read the history with its own file tool when it needs it. This is the only way more than a summary crosses a vendor boundary: constraint 1 forbids seeding a vendor session with foreign history, so a transcript can arrive as content the target may read but never as state it resumes. `ihar` still assembles no model request; the reading is the agent's own action, paid in its own tokens and bounded by its own context window. Routing history through the model egress gateway instead was rejected: the gateway would have to author payloads the vendor then records as conversation, which desynchronises the vendor's own transcript and contradicts §1. Model switch inside a harness needs no handoff: adapter `switch_model()` maps to `--model`, `/model`, `--effort`, `-m`, `model_reasoning_effort`, profiles.
 
 The same export feeds the wiki task ledger and an acdc-style git cross-check; existing tools (acdc, claude-mem, claude-code-log) are references, not dependencies.
 
@@ -252,6 +256,41 @@ Terminal and web on the same session (R7) use the vendor's own bridge, because t
 An optional, experimental presentation layer. Dependency direction: ACP client → `ihar acp <agent>` → `ihar` policies and profile → vendor adapter → native agent. Core functionality never depends on ACP adapter capabilities.
 
 `ihar acp claude` and `ihar acp codex` print nothing and exec the adapter with the same environment a native launch would get: `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_EXECUTABLE` (pinned binary), gateway wiring per profile, `CODEX_HOME`, `CODEX_PATH`, rendered hooks and MCP. Toad (`toad acp "ihar acp claude"`) and Zed (`agent_servers` custom entry) consume it. Profiles that require hooks or a sandbox contract refuse ACP mode until claude-agent-acp #144 (hooks) and codex-acp #310/#477 (sandbox overrides) are resolved; `ihar check` reports both as known gaps.
+
+### 6.10 Multi-session console
+
+§6.8 gives one session a web surface; R9 asks for the opposite direction — several sessions, one window. The console is a local broker that launches ordinary `ihar` sessions and presents them as tabs beside a sidebar. It is a presentation layer over the control plane, not a second launcher: a tab is a launch that went through the whole lifecycle of §6.1, and a tab that fails a profile gate shows that failure instead of a terminal.
+
+What it is not, restated because the boundary is the design: the console never assembles a model request, never holds vendor credentials, and never stores a conversation. The sidebar is built from the session index (§6.6), which is metadata; the transcript stays in the vendor store and is read through the adapters on demand.
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {'background': '#1e1e2e', 'primaryColor': '#313244', 'primaryTextColor': '#cdd6f4', 'primaryBorderColor': '#89b4fa', 'lineColor': '#888888', 'secondaryColor': '#181825', 'tertiaryColor': '#45475a'}}}%%
+flowchart LR
+    B["Browser: sidebar, tabs, history pane"] -->|loopback WebSocket, token| CB["Console broker"]
+    CB --> LC["Launch lifecycle per project"]
+    LC --> S1["Session: claude, project A"]
+    LC --> S2["Session: codex, project B"]
+    S1 --> HK["Status hook events"]
+    S2 --> HK
+    HK --> CB
+    IDX["Session index"] --> CB
+    AD["Adapters: get_session"] --> CB
+
+    classDef control fill:#89b4fa,color:#1e1e2e,stroke:#74c7ec,stroke-width:2px
+    classDef exec fill:#585b70,color:#cdd6f4,stroke:#6c7086
+    class CB,LC,IDX,AD control
+    class B,S1,S2,HK exec
+```
+
+**Broker, not a foreground process.** The console runs as a managed daemon so a session outlives the terminal that started the console and survives a browser reload; `ihar console start|status|stop|restart` is its surface and `ihar update` stops and restarts it, exactly as the Codex daemon is handled today (§6.4 adapters, LLD §5.5). The alternative — tying every PTY to the console process — makes an ordinary `ihar update` destructive, which is why it was rejected.
+
+**Cross-project by design, and that is the cost.** One window lists sessions from every project state on the machine, so one token authorises launching agents in every one of them. That reach is new: until now a launch was scoped to the checkout the user stood in. It is bounded by loopback-only binding, a per-daemon token readable by the owner alone, and the console field of the profile; it is not bounded by anything the network can see, so remote access is an SSH tunnel and never a network bind.
+
+**Tabs come in two kinds.** A PTY tab runs the vendor's own TUI, so every guarantee of the selected profile holds unchanged; this is the shipped kind. An ACP tab renders a chat over `ihar acp <vendor>` and is available only where the profile already permits ACP, because `claude-agent-acp` does not fire settings hooks (#144) and `codex-acp` replaces sandbox and approval policy (#310, #477). The two kinds are not equivalent and the UI says which one a tab is.
+
+**Status comes from hooks, not from guessing at the terminal.** A convenience hook reports `SessionStart` as running, `PermissionRequest` as waiting for approval, `Stop` as idle and `SessionEnd` as stopped. These four events exist on both vendors (§3.3); nothing is attached to `PreToolUse`, where two hooks already run and a third would be paid on every tool call. The hook is fail-soft: losing it costs the badge, never the session.
+
+**One conversation stays one vendor.** Constraint 1 of the research page is a vendor decision: Claude resumes only its own jsonl and Codex `thread/start` accepts no initial items. The console therefore offers an explicit handoff button (R8) rather than an illusion of a thread that changes vendor, and a read-only history pane projects the chain of linked sessions — built on the fly from `handoff_from`/`handoff_to` and the adapters' `get_session()`, marked where each handoff cut the context. The projection makes the work continuous to read. It cannot make it continuous for the model, and storing a transcript in `ihar` would not change that.
 
 ## 7. Security and PII policy
 
@@ -286,17 +325,19 @@ Layers, each independent:
 | 4 Model egress | PII, secrets, outbound model payload | explicit gateway, fail-closed |
 | 5 Handoff sanitisation | data crossing Claude ⇄ Codex | PII policy over the package, mode 600 inside the home, never in the repository |
 
-Auth boundary: Claude OAuth is used only by the `claude` binary or the Agent SDK inside `claude-agent-acp`; `ihar` never calls a model API itself. Codex auth stays in `auth.json` under the vendor process. Web: Claude Remote Control and the Codex hosted relay are vendor-authenticated; `toad serve` and `codex --remote ws://` are bound to loopback or require token auth.
+Auth boundary: Claude OAuth is used only by the `claude` binary or the Agent SDK inside `claude-agent-acp`; `ihar` never calls a model API itself. Codex auth stays in `auth.json` under the vendor process. Web: Claude Remote Control and the Codex hosted relay are vendor-authenticated; `toad serve` and `codex --remote ws://` are bound to loopback or require token auth. The console (§6.10) authenticates nobody to a vendor: it holds a token of its own that authorises driving local launches, and because a launch runs commands as the user, that token is a local credential of the same weight as shell access and is treated as one.
 
 ## 8. Security profiles
 
 A profile selects which enforcement points are mandatory. The transparent-interception experiment failed because the approved design had no privileged redirect boundary; the user chose to drop `remote-protected` rather than weaken it or add a root-owned component.
 
-| Profile | Hooks | Gateway | Sandbox | Remote surfaces |
-|---------|-------|---------|---------|-----------------|
-| `standard` | on | off | vendor sandbox optional | native, both vendors |
-| `protected` | on | explicit | vendor sandbox on | Codex native; Claude Remote Control unavailable |
-| `isolated` | on | explicit inside the guest | microVM plus vendor sandbox | per profile setting |
+| Profile | Hooks | Gateway | Sandbox | Remote surfaces | Console |
+|---------|-------|---------|---------|-----------------|---------|
+| `standard` | on | off | vendor sandbox optional | native, both vendors | PTY and ACP tabs |
+| `protected` | on | explicit | vendor sandbox on | Codex native; Claude Remote Control unavailable | PTY tabs only |
+| `isolated` | on | explicit inside the guest | microVM plus vendor sandbox | per profile setting | refused |
+
+`isolated` refuses the console because its session lives inside the guest and a terminal crossing that boundary is a hole in the boundary the profile is named for; carrying a PTY into the guest is separate work with its own gate (§11). Under `protected` only PTY tabs are offered, since an ACP tab cannot promise the hooks that profile depends on.
 
 Profile is chosen per launch (`--profile`), defaulted per project in `.ihar_config`, and recorded in the session index. A profile whose mandatory enforcement point cannot start aborts the launch. `ihar check` prints the effective profile and which points are active.
 
@@ -308,14 +349,18 @@ Contracts owned by `ihar`; vendors never read them.
 - Hook manifest entry: `{event, tools, script, timeout, vendors, profiles, claude_only?: {type, extra}}`.
 - MCP registry entry: `{name, transport: stdio|http, command?, args?, url?, env_names?, headers?, scope: user|project, profiles}`.
 - Session index record as in §6.6.
-- Handoff package: `handoff.md` plus `handoff.json` with `source_vendor, source_session_id, target_vendor, created_at, git: {branch, head, dirty, diff_stat}, files_touched[], open_items[], decisions[], summary?, masked: true`.
-- Profile definition: `{name, hooks: on, gateway: off|explicit, sandbox: none|vendor|microvm, remote: allowed vendors}`.
+- Handoff package: `handoff.md` plus `handoff.json` with `source_vendor, source_session_id, target_vendor, created_at, git: {branch, head, dirty, diff_stat}, files_touched[], open_items[], decisions[], summary?, masked: true, history: {mode: summary|transcript, file?, messages, bytes, truncated}`.
+- Profile definition: `{name, hooks: on, gateway: off|explicit, sandbox: none|vendor|microvm, remote: allowed vendors, console: allow|refuse}`.
+- Console daemon record and console session record: broker identity and per-tab launch state, both metadata only, never a transcript (LLD §13.2).
+- Session status record: `{ihar_id, state: running|waiting-approval|idle|stopped, at}`, written by the convenience hook and read by the sidebar.
 
 ## 10. Failure modes and limits
 
 Named in advance, including the ones caused by using the design correctly.
 
 - A switch is a package, not a resume. Details outside the deterministic core and the optional summary are lost; the transcript stays in the source vendor's store and can be resumed there.
+- `transcript` mode narrows that loss without removing it. The target agent may decline to read the file, its context window may not hold it, and what it reads is a rendering rather than the vendor's own state, so tool results and internal structure do not survive the crossing.
+- A transcript export is a copy of conversation content that `ihar` itself writes. It is masked, mode 600 and outside the checkout, and by decision it is kept indefinitely, so a project that switches often accumulates an archive that no retention rule removes and only the user deletes.
 - Claude Remote Control cannot be combined with the masking guarantee. The transparent spike required an undefined root/CAP_NET_ADMIN boundary, so the corresponding profile was dropped.
 - Vendor session formats change without notice; adapters read official APIs first and treat file readers as best effort with a version guard.
 - Hook parity covers the shared event subset only; Claude-only events and hook types do not run under Codex, and no hook is guaranteed under ACP mode today.
@@ -323,6 +368,12 @@ Named in advance, including the ones caused by using the design correctly.
 - MCP egress is policy, not interception: a registered server can still send whatever the agent gives it; the hook on `mcp__*` inputs is the only content check.
 - Subscription policy on both sides can change abruptly; the design isolates that risk to the vendor binaries but cannot remove it.
 - Codex `/import` and Claude `import` are vendor-controlled and unavailable in daemon or remote sessions; `ihar` does not depend on them.
+- The console token reaches every project state on the machine. Compromising it is equivalent to shell access as the user in all of those checkouts, which is a wider blast radius than a single launch had before R9 existed. Loopback binding and file mode bound it; nothing bounds it against someone who already runs code as this user.
+- The console cannot adopt a session it did not start. A vendor TUI running in another terminal keeps its own PTY; the sidebar lists it from the index and offers resume, not attachment.
+- Closing a tab detaches; it does not stop the agent. Stopping is an explicit action, because a background agent that dies when a browser tab is closed loses work that nothing recorded.
+- An ACP tab does not carry the hook and sandbox guarantees of a PTY tab, and a profile that depends on them refuses it. Two tab kinds that look alike and guarantee differently is a real confusion risk, mitigated only by labelling.
+- The history pane is a projection, so it shows what the vendor stores still hold. A rotated or deleted vendor session leaves a gap that `ihar` cannot fill, because it kept no copy — the deliberate consequence of not owning transcripts.
+- A projected thread is continuous to read and discontinuous to the model: each handoff marker is a point where the next agent received a bounded package, not the preceding messages.
 
 ## 11. Delivery plan
 
@@ -341,6 +392,9 @@ Ordered by risk and dependency; each slice has its own verification command in t
 | S9 | Web flags over native remote surfaces (`start_remote`) | manual protocol; Codex daemon under project home verified with `codex agents` |
 | S10 | `isolated` profile: microVM image with both binaries | `tests/test_microvm.sh` extended with a Codex boot |
 | S11 | ACP launcher mode, experimental | `tests/test_acp.sh`: env and paths reach the adapters; profile refusal and hook gap reported by `ihar check` |
+| S12 | Multi-session console: broker daemon, PTY tabs, cross-project sidebar, status hook, history projection, check panel, rename, handoff button | `tests/test_console.sh`, `tests/test_console.py`: non-loopback bind and missing token refused; a tab spawn runs the full lifecycle; no terminal output reaches disk; projection assembles a handoff chain |
+| S13 | ACP chat tab inside the console, experimental | `tests/test_console_acp.sh`: offered only where the profile allows ACP; the tab kind and its missing guarantees are labelled and reported by `ihar check` |
+| S14 | Handoff history modes: `transcript` export beside the package, masked and budgeted, selected by `--history` and by the console button | `tests/test_handoff_history.py`: default stays `summary`; a planted secret never reaches the rendered file; a masking failure degrades to `summary` instead of writing one |
 
 Workflow route for implementation: chain (new module, public contracts in §9, security-relevant hook and gateway behaviour). Branch `dev-unified-harness` on this repository once the intent is approved.
 
@@ -348,6 +402,8 @@ Workflow route for implementation: chain (new module, public contracts in §9, s
 
 - Will Anthropic keep Agent SDK use on subscriptions? Decides whether ACP mode can ever leave experimental status.
 - Which distiller runs by default when the source agent is alive: forked-session summary (faithful, costs tokens) or local extractor (free, coarser)? Proposed: forked session, with the local extractor as fallback; the deterministic core is present either way.
+- What promotes the ACP tab (S13) out of experimental status? Proposed criterion, measured rather than assumed: claude-agent-acp #144 closed and settings hooks observed firing under the adapter, plus codex-acp #310 and #477 closed so `config.toml` sandbox and approval survive. Until then the tab exists only where the profile already allows ACP.
+- Does a PTY carried into the `isolated` guest belong to this design at all? It would make the console available under the profile that most needs remote observation, and it would open the boundary that profile is named for. Deferred, not rejected; it belongs to a gate of its own.
 - Keep `icodex` run-mode presets as ihar flags, or fold them into the profile's sandbox setting with a rendering table? Proposed: profile-owned `sandbox: none|vendor|microvm` rendered per vendor, presets kept only as `ConfigRenderer` detail.
 
 ## 13. References
