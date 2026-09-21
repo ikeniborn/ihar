@@ -8,6 +8,7 @@ ihar_sandbox
 
 PROJECT="$IHAR_TEST_TMP/proj"
 mkdir -p "$PROJECT"
+cp -R "$ROOT/hooks" "$ROOT/manifests" "$ROOT/skills" "$IHAR_STORE/"
 
 CLAUDE_ACP="$IHAR_TEST_TMP/claude-agent-acp"
 CODEX_ACP="$IHAR_TEST_TMP/codex-acp"
@@ -15,7 +16,7 @@ CLAUDE_BIN="$IHAR_TEST_TMP/claude"
 CODEX_BIN="$IHAR_TEST_TMP/codex"
 RECORD="$IHAR_TEST_TMP/acp-record"
 IHAR_LOCKFILE="$IHAR_TEST_TMP/.ihar-lockfile.json"
-printf '%s\n' '{"schema":1,"installedAt":"2026-09-19T00:00:00Z","acp":{"claude-agent-acp":"0.79.0","codex-acp":"6ec22f3"}}' > "$IHAR_LOCKFILE"
+printf '%s\n' '{"schema":1,"claude":{"version":"2.1.274"},"codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"acp":{"claude-agent-acp":"0.79.0","codex-acp":"6ec22f3"}}' > "$IHAR_LOCKFILE"
 
 for binary in "$CLAUDE_ACP" "$CODEX_ACP" "$CLAUDE_BIN" "$CODEX_BIN"; do
   cp "$ROOT/tests/fakes/record-exec.sh" "$binary"
@@ -27,8 +28,15 @@ printf 'claude-agent-acp\t%s\ncodex-acp\t%s\n' \
   "$(sha256sum "$CLAUDE_ACP" | cut -d' ' -f1)" \
   "$(sha256sum "$CODEX_ACP" | cut -d' ' -f1)" > "$IHAR_STORE/acp/.digests"
 
+write_receipt() {
+  PYTHONPATH="$ROOT/lib/python" python3 -m ihar.install_receipt build \
+    "$IHAR_LOCKFILE" "$IHAR_STORE/install-receipt.json" "$CLAUDE_BIN" "$CODEX_BIN"
+}
+write_receipt
+
 ihar() {
-  ( cd "$PROJECT" && \
+  local test_root="${IHAR_TEST_ROOT:-$ROOT}"
+  ( cd "$PROJECT" && IHAR_ROOT="$test_root" \
       IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
       IHAR_LOCKFILE="$IHAR_LOCKFILE" \
       IHAR_CLAUDE_BIN="$CLAUDE_BIN" IHAR_CODEX_BIN="$CODEX_BIN" \
@@ -81,6 +89,55 @@ assert_eq "ACP creates no native launch claims" "0" \
   "$(find "$IHAR_STATE_ROOT" -path '*/launches/*' -type f 2>/dev/null | wc -l)"
 assert_eq "ACP starts no managed Codex daemon" "0" \
   "$(find "$IHAR_STATE_ROOT" -path '*/daemons/*' -type f 2>/dev/null | wc -l)"
+
+# A non-standard test profile keeps ACP allowed while making receipt failure
+# fail-closed. This isolates receipt ordering from the shipped protected/isolated
+# ACP refusal without inventing receipt fields for the adapter itself.
+ACP_TEST_ROOT="$IHAR_TEST_TMP/acp-root"
+mkdir -p "$ACP_TEST_ROOT"
+cp -R "$ROOT/manifests" "$ACP_TEST_ROOT/"
+ln -s "$ROOT/lib" "$ACP_TEST_ROOT/lib"
+ln -s "$ROOT/hooks" "$ACP_TEST_ROOT/hooks"
+ln -s "$ROOT/skills" "$ACP_TEST_ROOT/skills"
+cat > "$ACP_TEST_ROOT/manifests/profiles/receipt-acp.json" <<'JSON'
+{
+  "acp": "allow",
+  "env_passthrough": [],
+  "gateway": "off",
+  "guarantee": "Receipt-order test profile.",
+  "handoff": {"system_prompt": false},
+  "hooks": "best-effort",
+  "masking_level": "off",
+  "mcp": {"strict": false},
+  "name": "receipt-acp",
+  "netpolicy": null,
+  "remote": [],
+  "sandbox": "vendor-default",
+  "schema": 1
+}
+JSON
+
+printf '# tampered native CLI\n' >> "$CLAUDE_BIN"
+rm -f "$RECORD"
+tampered_status=0
+tampered_out="$(IHAR_TEST_ROOT="$ACP_TEST_ROOT" ihar --profile receipt-acp acp claude)" \
+  || tampered_status=$?
+assert_eq "ACP rejects a tampered selected native executable" "3" "$tampered_status"
+assert_contains "ACP tamper refusal names receipt verification" "$tampered_out" "install receipt"
+assert_exit "ACP tamper refusal occurs before the adapter starts" 1 test -e "$RECORD"
+
+cp "$ROOT/tests/fakes/record-exec.sh" "$CLAUDE_BIN"
+chmod +x "$CLAUDE_BIN"
+write_receipt
+rm -f "$IHAR_STORE/install-receipt.json" "$RECORD"
+missing_status=0
+missing_out="$(IHAR_TEST_ROOT="$ACP_TEST_ROOT" ihar --profile receipt-acp acp codex)" \
+  || missing_status=$?
+assert_eq "ACP rejects a missing native install receipt" "3" "$missing_status"
+assert_contains "ACP missing receipt refusal names receipt verification" \
+  "$missing_out" "missing receipt"
+assert_exit "ACP missing receipt refusal occurs before the adapter starts" 1 test -e "$RECORD"
+write_receipt
 
 printf '# replaced\n' >> "$CODEX_ACP"
 assert_exit "a replaced ACP adapter is fail-closed" 3 ihar acp codex

@@ -10,14 +10,43 @@
 #
 # Failure class: fail-closed. A drifted runtime home aborts the launch (exit 3).
 
+# ihar_state_manifest_digest — print the validated semantic state-manifest SHA-256.
+# Returns non-zero when the manifest cannot be read or validated.
+ihar_state_manifest_digest() {
+  ihar_python ihar.inventory state-digest "$IHAR_ROOT/manifests/state.json" all
+}
+
+# ihar_asset_manifest_identity — print the validated semantic identity of every
+# runtime-affecting asset plus the store-source topology the linker will consume.
+ihar_asset_manifest_identity() {
+  ihar_python ihar.inventory asset-identity \
+    "$IHAR_ROOT/manifests/assets.json" all "$IHAR_STORE"
+}
+
+# ihar_upgrade_runtime_state <vendor> <state-dir> [candidate-generation] — migrate
+# one unambiguous pre-manifest runtime owner. With a candidate, do nothing unless
+# that generation itself owns materialized state. The caller holds the state lock.
+ihar_upgrade_runtime_state() {
+  local -a arguments=("$IHAR_ROOT/manifests/state.json" "$2" "$1")
+  [[ -z "${3:-}" ]] || arguments+=("$3")
+  ihar_python ihar.runtime_state_upgrade "${arguments[@]}" \
+    || ihar_die 3 "cannot migrate materialized $1 runtime state"
+}
+
 # ihar_config_hash <profile> <masking> <gateway> <sandbox> <mcp-strict>
 #                  <hooks-digest> <registry-digest> <vendor-version>
-# The eight inputs that decide how the vendor behaves. Anything that changes vendor
-# behaviour belongs here; anything that does not must stay out, or every launch would
-# build a new home.
+# The eight explicit inputs plus validated persistent-state and tracked-asset
+# identities decide how the vendor behaves. Folding both link inventories into the
+# generation prevents a runtime built for older topology from being reused.
 ihar_config_hash() {
   (( $# == 8 )) || ihar_die 2 "ihar_config_hash: expected 8 inputs, got $#"
-  printf '%s\n' "$@" | sha256sum | cut -c1-8
+  local state_manifest_digest asset_manifest_identity
+  state_manifest_digest="$(ihar_state_manifest_digest)" \
+    || ihar_die 3 "cannot digest persistent-state manifest"
+  asset_manifest_identity="$(ihar_asset_manifest_identity)" \
+    || ihar_die 3 "cannot identify tracked-asset manifest"
+  printf '%s\n' "$@" "$state_manifest_digest" "$asset_manifest_identity" \
+    | sha256sum | cut -c1-8
 }
 
 # ihar_runtime_materialise <vendor> <hash> <render-dir> [immutable|writable]
@@ -30,8 +59,11 @@ ihar_runtime_materialise() {
   [[ -n "${IHAR_STATE:-}" ]] || ihar_die 1 "ihar_runtime_materialise: IHAR_STATE is not set"
 
   local runtime="$IHAR_STATE/r/$hash/$vendor"
+  local materialise_status=0
   ihar_with_lock --required "$IHAR_STATE/.ihar.lock" 30 \
-    _ihar_runtime_materialise "$vendor" "$hash" "$render" "$mode" "$runtime"
+    _ihar_runtime_materialise "$vendor" "$hash" "$render" "$mode" "$runtime" \
+    || materialise_status=$?
+  (( materialise_status == 0 )) || return "$materialise_status"
 
   IHAR_RUNTIME="$runtime"
   export IHAR_RUNTIME
@@ -43,8 +75,25 @@ _ihar_runtime_materialise() {
 
   if [[ -d "$runtime" ]]; then
     _ihar_runtime_verify "$runtime" "$render"
+    # Verify immutable store links before state reconciliation. A bad security asset
+    # must fail without creating or repairing a persistent-state path.
+    ihar_verify_runtime_asset_links "$vendor" "$runtime" || return
+    ihar_verify_runtime_mutable_links "$vendor" "$runtime" || return
+    ihar_upgrade_runtime_state "$vendor" "$IHAR_STATE" || return
+    # State inventory may gain entries after this immutable render was published,
+    # and runtime-local vendor writes may replace or remove a link. Verify rendered
+    # files first so configuration drift still fails closed, then reconcile state.
+    ihar_verify_runtime_state_links "$vendor" "$runtime" "$IHAR_STATE" || return
+    _ihar_runtime_touch_marker "$vendor" "$hash"
     return 0
   fi
+
+  # A manifest change selects a new generation. Before building it, recover state
+  # materialized in exactly one older pre-manifest runtime, if present.
+  # Validate required store topology first: an invalid release asset must not cause
+  # persistent-state migration or any other runtime mutation.
+  ihar_validate_runtime_asset_sources "$vendor" || return
+  ihar_upgrade_runtime_state "$vendor" "$IHAR_STATE" || return
 
   local staging
   staging="$(mktemp -d "$IHAR_STATE/r/.staging-XXXXXX")" \
@@ -57,7 +106,12 @@ _ihar_runtime_materialise() {
     cp -R "$render/." "$build/" || ihar_die 1 "cannot copy the render into $build"
   fi
 
-  ihar_link_runtime "$vendor" "$build" "$IHAR_STATE"
+  local link_status=0
+  ihar_link_runtime "$vendor" "$build" "$IHAR_STATE" || link_status=$?
+  if (( link_status != 0 )); then
+    rm -rf -- "$staging"
+    return "$link_status"
+  fi
 
   mkdir -p "$IHAR_STATE/r/$hash"
   if ! mv "$build" "$runtime" 2>/dev/null; then
@@ -66,6 +120,7 @@ _ihar_runtime_materialise() {
     rm -rf "$staging"
     [[ -d "$runtime" ]] || ihar_die 1 "cannot publish the runtime home at $runtime"
     _ihar_runtime_verify "$runtime" "$render"
+    _ihar_runtime_touch_marker "$vendor" "$hash"
     return 0
   fi
   rm -rf "$staging"
@@ -79,6 +134,15 @@ _ihar_runtime_materialise() {
   fi
 
   _ihar_runtime_freeze "$runtime" "$render" "$mode"
+  _ihar_runtime_touch_marker "$vendor" "$hash"
+}
+
+_ihar_runtime_touch_marker() {
+  local vendor="$1" hash="$2"
+  [[ -f "$IHAR_STATE/home.json" ]] || return 0
+  ihar_python ihar.state_marker --touch-runtime \
+    "$IHAR_STATE/home.json" "$hash" "${IHAR_PROFILE:-standard}" "$vendor" \
+    || ihar_die 3 "cannot refresh authoritative runtime use for $hash"
 }
 
 # _ihar_runtime_freeze <runtime> <render> <mode> — seal what ihar rendered, and only

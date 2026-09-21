@@ -7,7 +7,12 @@
 ihar_render_config() {
   local vendor="$1" render="$2"
   case "$vendor" in
-    claude) _ihar_render_claude_config "$render" ;;
+    claude)
+      local runtime
+      runtime="$(_ihar_claude_runtime_path)" \
+        || ihar_die 3 "cannot select the Claude runtime path"
+      _ihar_render_claude_config "$render" "$runtime"
+      ;;
     codex)  _ihar_render_codex_config "$render" ;;
   esac
 }
@@ -16,14 +21,21 @@ ihar_render_config() {
 # Claude
 # --------------------------------------------------------------------------- #
 
-_ihar_render_claude_config() {
-  local render="$1" sandbox_json="null" base_url=""
+_ihar_claude_runtime_path() {
+  local version hash
+  version="$(ihar_vendor_version claude)" || return
+  hash="$(ihar_config_hash \
+    "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
+    "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
+    "$(ihar_manifest_digest)" "$(ihar_registry_digest)" "$version")" || return
+  printf '%s/r/%s/claude\n' "$IHAR_STATE" "$hash"
+}
 
-  case "$IHAR_PROFILE_SANDBOX" in
-    vendor-default) sandbox_json="null" ;;
-    read-only)      sandbox_json='{"enabled": true, "filesystem": "read-only"}' ;;
-    vendor|microvm) sandbox_json='{"enabled": true, "filesystem": "workspace-write"}' ;;
-  esac
+_ihar_render_claude_config() {
+  local render="$1" runtime="$2" protected_roots_json base_url=""
+  protected_roots_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' \
+    "$IHAR_STORE" "$IHAR_STATE_ROOT" "$runtime")" \
+    || ihar_die 3 "cannot encode the Claude protected roots"
 
   if [[ "${IHAR_GATEWAY_MODE:-off}" == "explicit" ]]; then
     local gateway_host=127.0.0.1
@@ -32,7 +44,7 @@ _ihar_render_claude_config() {
   fi
 
   ihar_python ihar.render.claude_settings \
-    "$render/settings.json" "$sandbox_json" "$base_url" \
+    "$render/settings.json" "$IHAR_PROFILE_SANDBOX" "$protected_roots_json" "$base_url" \
     || ihar_die 3 "cannot render the Claude managed settings"
 }
 

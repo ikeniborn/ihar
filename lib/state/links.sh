@@ -3,47 +3,197 @@
 #
 # The repair rules are lifted from iclaude:lib/config/isolated.sh:link_shared_assets:
 # a correct link is untouched, a wrong link or a materialised real copy is replaced
-# with a warning, a stale link into a since-removed entry is pruned, an absent source
-# is skipped, and the source is never mutated.
+# with a warning, and the source is never mutated. Absent store sources are skipped;
+# declared state files intentionally retain dangling links until the vendor creates
+# their canonical targets.
 #
-# Failure class: fail-soft for a link that cannot be made, because the vendor may not
-# need that entry; a caller whose profile depends on one verifies it separately.
+# Failure class: fail-closed for an invalid published runtime link or a declared
+# required store asset; fail-soft while initially linking an absent optional asset.
 
-# Store entries, as `<store-relative source>:<runtime-relative name>`.
-_IHAR_STORE_LINKS_CLAUDE=(
-  "skills:skills"
-  "hooks:hooks"
-  "manifests/config/claude/commands:commands"
-  "manifests/config/claude/agents:agents"
-  "manifests/config/claude/scripts:scripts"
-  "manifests/config/claude/CLAUDE.md:CLAUDE.md"
-  "manifests/config/claude/router.json:router.json"
-  "plugins/claude:plugins"
-  "auth/claude/.credentials.json:.credentials.json"
-)
+ihar_state_inventory() {
+  ihar_python ihar.inventory state "$IHAR_ROOT/manifests/state.json" "$1"
+}
 
-_IHAR_STORE_LINKS_CODEX=(
-  "skills:skills"
-  "hooks:hooks"
-  "manifests/config/codex/rules:rules"
-  "manifests/config/codex/agents:agents"
-  "manifests/config/codex/profiles:profiles"
-  "plugins/codex:plugins"
-  "auth/codex/auth.json:auth.json"
-)
+# _ihar_reconcile_runtime_mutable_links <vendor> <runtime-dir> <inventory> —
+# validate every target before creating any link. A materialised or wrong target
+# may contain the only auth/plugin bytes from an older layout, so preserve it and
+# fail with a recovery instruction instead of repairing over it.
+_ihar_reconcile_runtime_mutable_links() {
+  local vendor="$1" runtime="$2" inventory="$3"
+  local source name kind target
 
-# Vendor state directories, which persist across every profile switch. Files the
-# vendor seeds itself, such as .claude.json and history.jsonl, are not linked here:
-# a dangling link would break the vendor, and only the adapter knows what valid
-# initial content is. S4 owns that seeding.
-_IHAR_STATE_DIRS_CLAUDE=(projects sessions session-env file-history)
-_IHAR_STATE_DIRS_CODEX=(sessions app-server-control)
+  while IFS=$'\t' read -r source name kind; do
+    [[ -n "$source" ]] || continue
+    source="$IHAR_STORE/$source"
+    target="$runtime/$name"
+    if [[ -L "$target" ]]; then
+      if [[ "$(readlink "$target")" != "$source" ]]; then
+        ihar_die 3 "runtime mutable link $target points to $(readlink "$target"), not $source, and was preserved; remove or recover the wrong link, then retry"
+      fi
+    elif [[ -e "$target" ]]; then
+      ihar_die 3 "runtime mutable entry $target is materialised and was preserved; move it to a recovery location, then retry so ihar can link $source"
+    fi
+  done <<< "$inventory"
+
+  ihar_prepare_mutable_store "$IHAR_STORE" "$vendor" || return 3
+
+  while IFS=$'\t' read -r source name kind; do
+    [[ -n "$source" ]] || continue
+    source="$IHAR_STORE/$source"
+    target="$runtime/$name"
+    [[ -L "$target" ]] && continue
+    mkdir -p -- "$(dirname "$target")" \
+      || ihar_die 3 "cannot create runtime mutable parent for $target"
+    ln -s "$source" "$target" \
+      || ihar_die 3 "cannot link runtime mutable entry $target -> $source"
+  done <<< "$inventory"
+}
+
+ihar_verify_runtime_mutable_links() {
+  local vendor="$1" runtime="$2" inventory
+  inventory="$(ihar_mutable_inventory "$vendor")" || return 3
+  ihar_mutable_preflight "$IHAR_STORE" "$vendor" || return 3
+  _ihar_reconcile_runtime_mutable_links "$vendor" "$runtime" "$inventory"
+}
+
+# ihar_verify_runtime_asset_links <vendor> <runtime-dir> — verify store links
+# before reusing a published runtime. Reuse never repairs or removes an entry: a
+# wrong or materialised path may be the only evidence of runtime tampering.
+ihar_verify_runtime_asset_links() {
+  local vendor="$1" runtime="$2"
+  local inventory declared_source name kind required runtime_link topology source target
+
+  inventory="$(ihar_asset_topology_inventory "$vendor")" || return 3
+  while IFS=$'\t' read -r declared_source name kind required runtime_link topology; do
+    [[ "$runtime_link" == true ]] || continue
+    source="$IHAR_STORE/$declared_source"
+    target="$runtime/$name"
+
+    if [[ "$required" == true && "$topology" != "$kind" ]]; then
+      if [[ "$topology" == absent ]]; then
+        ihar_die 3 "required runtime asset is missing from the store: $source"
+      fi
+      ihar_die 3 "required runtime asset has topology $topology, expected $kind: $source"
+    fi
+  done <<< "$inventory"
+
+  while IFS=$'\t' read -r declared_source name kind required runtime_link topology; do
+    [[ "$runtime_link" == true ]] || continue
+    source="$IHAR_STORE/$declared_source"
+    target="$runtime/$name"
+
+    if [[ "$topology" != "$kind" ]]; then
+      if [[ -L "$target" ]]; then
+        ihar_die 3 "optional runtime asset link $target has store topology $topology, expected $kind, and was preserved; remove it, then retry"
+      fi
+      [[ -e "$target" ]] \
+        && ihar_die 3 "runtime asset entry $target is materialised and was preserved; move it to a recovery location, then retry"
+      continue
+    fi
+
+    if [[ -L "$target" ]]; then
+      if [[ "$(readlink "$target")" != "$source" ]]; then
+        ihar_die 3 "runtime asset link $target points to $(readlink "$target"), not $source, and was preserved; remove or recover the wrong link, then retry"
+      fi
+    elif [[ -e "$target" ]]; then
+      ihar_die 3 "runtime asset entry $target is materialised and was preserved; move it to a recovery location, then retry"
+    elif [[ "$required" == true ]]; then
+      ihar_die 3 "required runtime asset link is missing: $target; it was not repaired"
+    fi
+  done <<< "$inventory"
+}
+
+# ihar_validate_runtime_asset_sources <vendor> — reject invalid required store
+# topology before runtime-state migration or runtime-home mutation.
+ihar_validate_runtime_asset_sources() {
+  local vendor="$1" inventory source target kind required runtime_link topology
+  inventory="$(ihar_asset_topology_inventory "$vendor")" || return 3
+  while IFS=$'\t' read -r source target kind required runtime_link topology; do
+    [[ "$runtime_link" == true && "$required" == true ]] || continue
+    if [[ "$topology" == absent ]]; then
+      ihar_error "required runtime asset is missing from the store: $IHAR_STORE/$source"
+      return 3
+    fi
+    if [[ "$topology" != "$kind" ]]; then
+      ihar_error "required runtime asset has topology $topology, expected $kind: $IHAR_STORE/$source"
+      return 3
+    fi
+  done <<< "$inventory"
+}
+
+# ihar_verify_runtime_state_links <vendor> <runtime-dir> <state-dir> — reconcile
+# state links when reusing a published runtime. This never removes a materialised
+# runtime entry: that entry may contain the only copy of vendor state from an older
+# runtime.
+ihar_verify_runtime_state_links() {
+  local vendor="$1" runtime="$2" state="$3"
+  local name kind suffix inventory entry source target
+  local -a entries=()
+
+  inventory="$(ihar_state_inventory "$vendor")" \
+    || ihar_die 3 "cannot read $vendor state inventory"
+  while IFS=$'\t' read -r name kind; do
+    [[ -n "$name" ]] || continue
+    if [[ "$kind" == sqlite-family ]]; then
+      for suffix in '' -wal -shm; do entries+=("$name$suffix"$'\t'file); done
+    else
+      entries+=("$name"$'\t'"$kind")
+    fi
+  done <<< "$inventory"
+
+  # Validate the complete set before creating anything. A fail-closed result must
+  # not leave half the runtime linked while an unsafe state entry remains.
+  for entry in "${entries[@]}"; do
+    name="${entry%%$'\t'*}"
+    source="$state/st/$vendor/$name"
+    target="$runtime/$name"
+    if [[ -L "$target" ]]; then
+      if [[ "$(readlink "$target")" != "$source" ]]; then
+        ihar_die 3 "runtime state link $target points to $(readlink "$target"), not $source, and was preserved; remove or recover the wrong link, then retry"
+      fi
+    elif [[ -e "$target" ]]; then
+      ihar_die 3 "runtime state entry $target is materialised and was preserved; move it to a recovery location, then retry so ihar can link $source"
+    fi
+  done
+
+  for entry in "${entries[@]}"; do
+    name="${entry%%$'\t'*}"
+    kind="${entry#*$'\t'}"
+    source="$state/st/$vendor/$name"
+    target="$runtime/$name"
+
+    if [[ "$kind" == directory ]]; then
+      mkdir -p "$source" \
+        || ihar_die 3 "cannot create canonical state directory $source"
+    else
+      mkdir -p "$(dirname "$source")" \
+        || ihar_die 3 "cannot create canonical state parent for $source"
+    fi
+
+    # Recheck after validation: an active vendor may have changed the pathname.
+    # Never unlink during reuse; preserving a wrong or materialised entry is safer
+    # than racing a vendor write.
+    if [[ -L "$target" ]]; then
+      if [[ "$(readlink "$target")" != "$source" ]]; then
+        ihar_die 3 "runtime state link $target points to $(readlink "$target"), not $source, and was preserved; remove or recover the wrong link, then retry"
+      fi
+      continue
+    elif [[ -e "$target" ]]; then
+      ihar_die 3 "runtime state entry $target is materialised and was preserved; move it to a recovery location, then retry so ihar can link $source"
+    fi
+
+    mkdir -p "$(dirname "$target")" \
+      || ihar_die 3 "cannot create runtime state parent for $target"
+    ln -s "$source" "$target" \
+      || ihar_die 3 "cannot link runtime state $target -> $source"
+  done
+}
 
 # _ihar_link <source> <target> — idempotent, self-repairing.
 _ihar_link() {
-  local source="$1" target="$2"
+  local source="$1" target="$2" allow_missing="${3:-false}"
 
-  if [[ ! -e "$source" ]]; then
+  if [[ ! -e "$source" && "$allow_missing" != true ]]; then
     # A stale link into a source that has since been removed is pruned, so the
     # runtime home never carries a dangling entry.
     if [[ -L "$target" && ! -e "$target" ]]; then
@@ -68,19 +218,60 @@ _ihar_link() {
 
 # ihar_link_runtime <vendor> <runtime-dir> <state-dir> — wire one runtime home.
 ihar_link_runtime() {
-  local vendor="$1" runtime="$2" state="$3" entry source name
+  local vendor="$1" runtime="$2" state="$3" asset_inventory mutable_inventory source name kind required runtime_link topology suffix inventory
 
-  local -n store_links="_IHAR_STORE_LINKS_${vendor^^}"
-  for entry in "${store_links[@]}"; do
-    source="$IHAR_STORE/${entry%%:*}"
-    name="${entry##*:}"
-    _ihar_link "$source" "$runtime/$name"
-  done
+  ihar_validate_runtime_asset_sources "$vendor" || return 3
+  asset_inventory="$(ihar_asset_topology_inventory "$vendor")" || return 3
+  mutable_inventory="$(ihar_mutable_inventory "$vendor")" || return 3
+  ihar_mutable_preflight "$IHAR_STORE" "$vendor" || return 3
+  while IFS=$'\t' read -r source name kind required runtime_link topology; do
+    [[ "$runtime_link" == true ]] || continue
+    if [[ "$required" == true && "$topology" != "$kind" ]]; then
+      source="$IHAR_STORE/$source"
+      if [[ "$topology" == absent ]]; then
+        ihar_error "required runtime asset is missing from the store: $source"
+        return 3
+      fi
+      ihar_error "required runtime asset has topology $topology, expected $kind: $source"
+      return 3
+    fi
+  done <<< "$asset_inventory"
 
-  local -n state_dirs="_IHAR_STATE_DIRS_${vendor^^}"
-  for name in "${state_dirs[@]}"; do
-    source="$state/st/$vendor/$name"
-    mkdir -p "$source"
+  while IFS=$'\t' read -r source name kind required runtime_link topology; do
+    [[ "$runtime_link" == true ]] || continue
+    source="$IHAR_STORE/$source"
+    if [[ "$topology" != "$kind" ]]; then
+      ihar_warn "optional runtime asset has topology $topology, expected $kind: $source"
+      continue
+    fi
+    mkdir -p "$(dirname "$runtime/$name")"
     _ihar_link "$source" "$runtime/$name"
-  done
+  done <<< "$asset_inventory"
+
+  _ihar_reconcile_runtime_mutable_links "$vendor" "$runtime" "$mutable_inventory"
+
+  inventory="$(ihar_state_inventory "$vendor")" \
+    || { ihar_warn "cannot read $vendor state inventory"; return 3; }
+  while IFS=$'\t' read -r name kind; do
+    [[ -n "$name" ]] || continue
+    case "$kind" in
+      directory)
+        source="$state/st/$vendor/$name"
+        mkdir -p "$source" "$(dirname "$runtime/$name")"
+        _ihar_link "$source" "$runtime/$name" true
+        ;;
+      file)
+        source="$state/st/$vendor/$name"
+        mkdir -p "$(dirname "$source")" "$(dirname "$runtime/$name")"
+        _ihar_link "$source" "$runtime/$name" true
+        ;;
+      sqlite-family)
+        for suffix in '' -wal -shm; do
+          source="$state/st/$vendor/$name$suffix"
+          mkdir -p "$(dirname "$source")" "$(dirname "$runtime/$name$suffix")"
+          _ihar_link "$source" "$runtime/$name$suffix" true
+        done
+        ;;
+    esac
+  done <<< "$inventory"
 }

@@ -6,23 +6,11 @@ import hashlib
 import os
 import stat
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 
-ENTRIES = (
-    "projects",
-    "sessions",
-    "session-env",
-    "history.jsonl",
-    "file-history",
-    "state_5.sqlite",
-    "state_5.sqlite-wal",
-    "thread_history_1.sqlite",
-    "thread_history_1.sqlite-wal",
-)
-
-
-def fingerprint(root: Path) -> str:
+def fingerprint(root: Path, entries: Iterable[str]) -> str:
     digest = hashlib.sha256()
 
     def add(path: Path) -> None:
@@ -52,7 +40,7 @@ def fingerprint(root: Path) -> str:
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
 
-    for entry in ENTRIES:
+    for entry in entries:
         path = root / entry
         if path.exists() or path.is_symlink():
             add(path)
@@ -60,10 +48,10 @@ def fingerprint(root: Path) -> str:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 1:
+    if len(argv) < 2:
         return 2
     try:
-        print(fingerprint(Path(argv[0])))
+        print(fingerprint(Path(argv[0]), argv[1:]))
     except OSError as error:
         print(f"ihar: cannot fingerprint migration source {argv[0]}: {error}", file=sys.stderr)
         return 1

@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "entries": [
+    {"vendor":"common","source":"hooks","target":"hooks","kind":"directory","required":true,"runtime":true},
+    {"vendor":"common","source":"manifests","target":"manifests","kind":"directory","required":true,"runtime":false},
+    {"vendor":"common","source":"skills","target":"skills","kind":"directory","required":true,"runtime":true},
+    {"vendor":"claude","source":"manifests/config/claude/CLAUDE.md","target":"CLAUDE.md","kind":"file","required":true,"runtime":true},
+    {"vendor":"claude","source":"manifests/config/claude/commands","target":"commands","kind":"directory","required":false,"runtime":true},
+    {"vendor":"claude","source":"manifests/config/claude/agents","target":"agents","kind":"directory","required":false,"runtime":true},
+    {"vendor":"claude","source":"manifests/config/claude/scripts","target":"scripts","kind":"directory","required":false,"runtime":true},
+    {"vendor":"codex","source":"manifests/config/codex/AGENTS.md","target":"AGENTS.md","kind":"file","required":true,"runtime":true},
+    {"vendor":"codex","source":"manifests/config/codex/rules","target":"rules","kind":"directory","required":false,"runtime":true},
+    {"vendor":"codex","source":"manifests/config/codex/agents","target":"agents","kind":"directory","required":false,"runtime":true},
+    {"vendor":"codex","source":"manifests/config/codex/profiles","target":"profiles","kind":"directory","required":false,"runtime":true}
+  ]
+}

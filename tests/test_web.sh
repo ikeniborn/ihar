@@ -8,6 +8,7 @@ ihar_sandbox
 
 PROJECT="$IHAR_TEST_TMP/proj"
 mkdir -p "$PROJECT"
+cp -R "$ROOT/hooks" "$ROOT/manifests" "$ROOT/skills" "$IHAR_STORE/"
 
 ihar() {
   ( cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
@@ -15,7 +16,7 @@ ihar() {
 }
 
 argv() {
-  ihar --dry-run "$@" | python3 -c \
+  ihar --dry-run "$@" | sed -n '/^{/,$p' | python3 -c \
     'import json,sys; print(" ".join(json.load(sys.stdin)["argv"][1:]))'
 }
 

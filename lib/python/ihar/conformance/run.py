@@ -12,7 +12,9 @@ The record is keyed by vendor, version, binary digest and manifest digest, so an
 upgrade of either invalidates it rather than inheriting a pass.
 
 Usage:
-    python3 -m ihar.conformance.run <vendor> <binary> <store> <manifest> [--json]
+    python3 -m ihar.conformance.run <vendor> <binary> <store> <manifest>
+        --auth-store <active-store> --lockfile <release-lock>
+        [--protected-store <path>] [--json]
 """
 
 from __future__ import annotations
@@ -21,14 +23,97 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 from .. import jsonio
+from ..render import claude_settings
 from ..render import hooks as render_hooks
+from . import LIVE_CASES, REQUIRED_CASES
+
+
+_SESSION_CONTEXT = "IHAR-CONFORMANCE-SESSION-CONTEXT"
+_FAKE_SECRET = "sk-ant-abcdefghijklmnopqrstuvwxyz0123"
+_HOOK_TIMEOUT_SECONDS = 1
+_HOOK_TIMEOUT_TOLERANCE_SECONDS = 1.5
+_PROBE_SCRIPT = r'''#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+mode, marker = sys.argv[1:3]
+if mode == "watch":
+    parent = int(marker)
+    started, ended = float(sys.argv[3]), pathlib.Path(sys.argv[4])
+    while time.monotonic() - started < 8:
+        try:
+            os.kill(parent, 0)
+        except ProcessLookupError:
+            ended.write_text(str(time.monotonic() - started), encoding="utf-8")
+            raise SystemExit(0)
+        time.sleep(0.02)
+    ended.write_text("8", encoding="utf-8")
+    raise SystemExit(0)
+
+payload = sys.stdin.read()
+pathlib.Path(marker).write_text(payload, encoding="utf-8")
+if mode == "deny":
+    pathlib.Path(marker + ".decision").write_text("deny\n", encoding="utf-8")
+    json.dump({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                      "permissionDecision": "deny",
+                                      "permissionDecisionReason": "conformance deny probe"}},
+              sys.stdout)
+    sys.stdout.write("\n")
+    raise SystemExit(2)
+elif mode == "context":
+    json.dump({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                      "additionalContext": "IHAR-CONFORMANCE-SESSION-CONTEXT"}},
+              sys.stdout)
+    sys.stdout.write("\n")
+elif mode == "timeout":
+    started = time.monotonic()
+    subprocess.Popen(
+        [sys.executable, __file__, "watch", str(os.getpid()), str(started), marker + ".ended"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    time.sleep(5)
+    pathlib.Path(marker + ".completed").write_text("completed\n", encoding="utf-8")
+'''
+
+_MCP_SCRIPT = r'''#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+marker = sys.argv[1]
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if "id" not in request:
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": request.get("params", {}).get("protocolVersion"),
+                  "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "ihar-conformance", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "prove", "description": "Record conformance",
+                              "inputSchema": {"type": "object", "properties": {}}}]}
+    elif method == "tools/call":
+        pathlib.Path(marker).write_text("called\n", encoding="utf-8")
+        result = {"content": [{"type": "text", "text": "conformance proved"}]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+'''
 
 
 def _digest_file(path: str) -> str:
@@ -43,7 +128,15 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _stage(store: str, manifest_path: str, vendor: str, home: str) -> None:
+def _stage(
+    store: str,
+    manifest_path: str,
+    vendor: str,
+    home: str,
+    protected_roots: list[str] | None = None,
+    *,
+    auth_store: str,
+) -> None:
     """A throwaway vendor home carrying the rendered hooks and the scripts."""
     os.makedirs(os.path.join(home, "hooks"), exist_ok=True)
     manifest = jsonio.read("hook-manifest", manifest_path)
@@ -59,14 +152,38 @@ def _stage(store: str, manifest_path: str, vendor: str, home: str) -> None:
         else:
             shutil.copy2(source, target)
 
+    with open(os.path.join(home, "hooks", "conformance-probe.py"), "w", encoding="utf-8") as handle:
+        handle.write(_PROBE_SCRIPT)
+    with open(os.path.join(home, "mcp-conformance.py"), "w", encoding="utf-8") as handle:
+        handle.write(_MCP_SCRIPT)
+    with open(os.path.join(home, "ihar-policy.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "vendor": vendor,
+            "profile": "protected",
+            "hooks": "enforced",
+            "masking_level": "standard",
+            "protected_paths": protected_roots or [store, home],
+        }, handle, sort_keys=True)
+
+    auth_name = ".credentials.json" if vendor == "claude" else "auth.json"
+    auth_source = os.path.join(auth_store, "auth", vendor, auth_name)
+    if os.path.isfile(auth_source):
+        os.symlink(auth_source, os.path.join(home, auth_name))
+
     if vendor == "codex":
         with open(os.path.join(home, "hooks.json"), "w", encoding="utf-8") as handle:
             json.dump({"hooks": block}, handle, indent=2, sort_keys=True)
         with open(os.path.join(home, "config.toml"), "w", encoding="utf-8") as handle:
             handle.write("")
     else:
+        settings = {"hooks": block}
+        sandbox = claude_settings.render_sandbox(
+            "vendor", protected_roots or [store, home]
+        )
+        if sandbox is not None:
+            settings["sandbox"] = sandbox
         with open(os.path.join(home, "settings.json"), "w", encoding="utf-8") as handle:
-            json.dump({"hooks": block}, handle, indent=2, sort_keys=True)
+            json.dump(settings, handle, indent=2, sort_keys=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -124,66 +241,397 @@ def case_tampering_is_detected(vendor, binary, home, workdir):
            ("failed", "an edited hook still verified")
 
 
-def case_deny_blocks_the_tool(vendor, binary, home, workdir):
-    """The decision the hook returns is the decision the vendor enforces.
+def _hook_block(home: str, vendor: str) -> tuple[dict, str]:
+    path = os.path.join(home, "hooks.json" if vendor == "codex" else "settings.json")
+    with open(path, "r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    return document["hooks"], path
 
-    Driven through the hook itself rather than through a model turn: a turn needs
-    credentials and a network, which a conformance run must not require. What this
-    proves is that the contract on both sides agrees — the exit code the script uses
-    to block is the exit code this vendor's schema documents as a block.
-    """
-    script = os.path.join(home, "hooks", "security-pretool.py")
-    payload = json.dumps({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Read" if vendor == "claude" else "Read",
-        "tool_input": {"file_path": "/home/someone/.ssh/id_rsa"},
-    })
-    result = subprocess.run(
-        ["python3", "-I", script, "--vendor", vendor],
-        input=payload, capture_output=True, text=True, timeout=30,
+
+def _reset_probe_hooks(home: str, vendor: str) -> None:
+    block, path = _hook_block(home, vendor)
+    for event, groups in list(block.items()):
+        kept = []
+        for group in groups:
+            hooks = group.get("hooks", [])
+            if any("conformance-probe.py" in hook.get("command", "") for hook in hooks):
+                continue
+            kept.append(group)
+        block[event] = kept
+    with open(path, "r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    document["hooks"] = block
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=2, sort_keys=True)
+
+
+def _add_probe_hook(
+    home: str,
+    vendor: str,
+    event: str,
+    mode: str,
+    marker: str,
+    *,
+    matcher: str | None = None,
+    timeout: int = 10,
+) -> None:
+    block, path = _hook_block(home, vendor)
+    command = (
+        f'python3 -I "{home}/hooks/conformance-probe.py" '
+        f"{mode} {shlex.quote(marker)} --vendor {vendor}"
     )
-    if result.returncode != 2:
-        return "failed", f"the block exit code was {result.returncode}, not 2"
+    group = {"hooks": [{"type": "command", "command": command, "timeout": timeout}]}
+    if matcher is not None:
+        group["matcher"] = matcher
+    block.setdefault(event, []).append(group)
+    with open(path, "r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    document["hooks"] = block
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=2, sort_keys=True)
+
+
+def _prepare_codex_hooks(binary: str, home: str, workdir: str) -> tuple[bool, str]:
+    from ..codex import hooks_trust
+    config = os.path.join(home, "config.toml")
+    start = "# ihar:hook-trust:start"
+    end = "# ihar:hook-trust:end"
     try:
-        body = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
-        return "failed", "the hook emitted output the vendor cannot parse"
-    decision = body.get("hookSpecificOutput", {}).get("permissionDecision")
-    if decision != "deny":
-        return "failed", f"the decision was {decision!r}"
-    return "passed", "exit 2 with a deny decision"
+        with open(config, "r", encoding="utf-8") as handle:
+            content = handle.read()
+        if start in content:
+            before, remainder = content.split(start, 1)
+            if end not in remainder:
+                return False, "Codex config contains an incomplete hook trust region"
+            _, after = remainder.split(end, 1)
+            with open(config, "w", encoding="utf-8") as handle:
+                handle.write(before.rstrip() + "\n" + after.lstrip("\n"))
+    except OSError as error:
+        return False, f"cannot refresh Codex hook trust: {error}"
+    code, _ = hooks_trust.seal_quiet(binary, home, workdir)
+    return code == 0, "Codex did not trust the staged conformance hooks"
 
 
-def case_rewrite_is_emitted(vendor, binary, home, workdir):
-    """A redaction reaches the vendor as updatedInput, the key both accept."""
-    script = os.path.join(home, "hooks", "security-pretool.py")
-    payload = json.dumps({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Write",
-        "tool_input": {"file_path": "/repo/a.py",
-                       "content": 'k = "sk-ant-abcdefghijklmnopqrstuvwxyz0123"'},
-    })
-    result = subprocess.run(
-        ["python3", "-I", script, "--vendor", vendor],
-        input=payload, capture_output=True, text=True, timeout=30,
+def _vendor_turn(
+    vendor: str,
+    binary: str,
+    home: str,
+    workdir: str,
+    prompt: str,
+    *,
+    allowed_tool: str,
+    mcp_config: str | None = None,
+):
+    env = dict(os.environ)
+    if vendor == "claude":
+        env["CLAUDE_CONFIG_DIR"] = home
+        argv = [binary, "-p", "--output-format", "json", "--permission-mode", "dontAsk"]
+        argv.extend(["--allowedTools", allowed_tool])
+        if mcp_config:
+            argv.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
+        argv.append(prompt)
+    else:
+        env["CODEX_HOME"] = home
+        argv = [
+            binary, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+            "--sandbox", "workspace-write", "--ask-for-approval", "never", prompt,
+        ]
+    return subprocess.run(
+        argv,
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
     )
-    if result.returncode != 0:
-        return "failed", f"a redaction exited {result.returncode} instead of allowing"
-    body = json.loads(result.stdout or "{}")
-    updated = body.get("hookSpecificOutput", {}).get("updatedInput")
-    if not updated:
-        return "failed", "no updatedInput was emitted"
-    if "sk-ant-" in json.dumps(updated):
-        return "failed", "the secret survived the rewrite"
-    return "passed", "updatedInput carries the masked value"
+
+
+def _observed(marker: str) -> bool:
+    return os.path.isfile(marker) and os.path.getsize(marker) > 0
+
+
+def _configure_mcp(home: str, vendor: str, marker: str) -> str | None:
+    script = os.path.join(home, "mcp-conformance.py")
+    if vendor == "claude":
+        path = os.path.join(home, "mcp-conformance.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"mcpServers": {"ihar-conformance": {
+                "command": "python3", "args": ["-I", script, marker],
+            }}}, handle, indent=2, sort_keys=True)
+        return path
+    with open(os.path.join(home, "config.toml"), "a", encoding="utf-8") as handle:
+        handle.write("\n[mcp_servers.ihar-conformance]\n")
+        handle.write('command = "python3"\n')
+        handle.write(f"args = {json.dumps(['-I', script, marker])}\n")
+    return None
+
+
+def _run_live_case(vendor, binary, home, workdir, name):
+    """Drive one accepted case through the vendor's supported non-interactive CLI."""
+    _reset_probe_hooks(home, vendor)
+    observed = os.path.join(workdir, f".{name}-hook")
+    target = os.path.join(workdir, f".{name}-target")
+    _remove_probe(observed)
+    _remove_probe(target)
+    for suffix in (".decision", ".completed", ".ended"):
+        _remove_probe(observed + suffix)
+    mcp_config = None
+    allowed_tool = "Bash"
+
+    if name == "deny-blocks-the-tool":
+        sensitive = os.path.join(workdir, ".ssh", "id_rsa")
+        os.makedirs(os.path.dirname(sensitive), exist_ok=True)
+        _remove_probe(sensitive)
+        _add_probe_hook(home, vendor, "PreToolUse", "deny", observed, matcher="Bash")
+        prompt = (
+            "Use the Bash tool exactly once and run this command verbatim; do not use another "
+            f"tool: printf denied > {shlex.quote(sensitive)}"
+        )
+        target = sensitive
+    elif name == "rewrite-reaches-the-tool":
+        _add_probe_hook(home, vendor, "PreToolUse", "observe", observed, matcher="Bash")
+        prompt = (
+            "Use the Bash tool exactly once and run this command verbatim; do not use another "
+            f"tool: printf '%s' '{_FAKE_SECRET}' > {shlex.quote(target)}"
+        )
+    elif name == "session-start-context":
+        _add_probe_hook(home, vendor, "SessionStart", "context", observed)
+        prompt = (
+            "The SessionStart hook supplied one uppercase conformance token. Use the Bash tool "
+            f"exactly once to write only that token to {shlex.quote(target)}."
+        )
+    elif name == "mcp-matcher-fires":
+        called = os.path.join(workdir, ".mcp-tool-called")
+        _remove_probe(called)
+        _add_probe_hook(
+            home, vendor, "PreToolUse", "observe", observed,
+            matcher="mcp__ihar-conformance__prove",
+        )
+        mcp_config = _configure_mcp(home, vendor, called)
+        allowed_tool = "mcp__ihar-conformance__prove"
+        prompt = (
+            "Call the ihar-conformance MCP server's prove tool exactly once with an empty object, "
+            "then stop."
+        )
+        target = called
+    elif name == "timeout-behaviour":
+        _add_probe_hook(
+            home, vendor, "PreToolUse", "timeout", observed, matcher="Bash",
+            timeout=_HOOK_TIMEOUT_SECONDS,
+        )
+        prompt = (
+            "Use the Bash tool exactly once and run this command verbatim; do not use another "
+            f"tool: printf timeout > {shlex.quote(target)}"
+        )
+    else:
+        return "failed", f"unknown mandatory live case {name}"
+
+    if vendor == "codex":
+        ready, detail = _prepare_codex_hooks(binary, home, workdir)
+        if not ready:
+            return "failed", detail
+    try:
+        result = _vendor_turn(
+            vendor, binary, home, workdir, prompt,
+            allowed_tool=allowed_tool,
+            mcp_config=mcp_config,
+        )
+    except subprocess.TimeoutExpired:
+        return "failed", "the vendor turn exceeded 180 seconds"
+
+    if not _observed(observed):
+        return "failed", f"the vendor exited {result.returncode} without firing the probe hook"
+    if name != "timeout-behaviour" and result.returncode != 0:
+        return "failed", f"the vendor fired the hook but the turn exited {result.returncode}"
+    if name == "deny-blocks-the-tool":
+        decision = observed + ".decision"
+        try:
+            with open(decision, encoding="utf-8") as handle:
+                recorded_decision = handle.read().strip()
+        except OSError:
+            recorded_decision = ""
+        if recorded_decision != "deny":
+            return "failed", "the probe hook fired without recording an explicit deny decision"
+        if os.path.exists(target):
+            return "failed", "the denied Bash command created its sentinel"
+        return "passed", "vendor received an explicit deny and did not execute the command"
+    if name == "rewrite-reaches-the-tool":
+        try:
+            with open(target, encoding="utf-8") as handle:
+                content = handle.read()
+        except OSError as error:
+            return "failed", f"the rewritten command did not create its sentinel: {error}"
+        if _FAKE_SECRET in content or "REDACTED-" not in content:
+            return "failed", "the vendor executed the unrewritten secret"
+        return "passed", "vendor executed the hook-rewritten command"
+    if name == "session-start-context":
+        try:
+            with open(target, encoding="utf-8") as handle:
+                content = handle.read().strip()
+        except OSError as error:
+            return "failed", f"the model turn did not receive SessionStart context: {error}"
+        if content != _SESSION_CONTEXT:
+            return "failed", f"the model turn wrote {content!r}, not the SessionStart context"
+        return "passed", "SessionStart additionalContext reached the model turn"
+    if name == "mcp-matcher-fires":
+        if not os.path.isfile(target):
+            return "failed", "the MCP tool did not run"
+        return "passed", "vendor fired the MCP matcher and ran the stub MCP tool"
+
+    completed = observed + ".completed"
+    ended = observed + ".ended"
+    deadline = time.monotonic() + _HOOK_TIMEOUT_TOLERANCE_SECONDS
+    while not os.path.isfile(ended) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if os.path.isfile(completed):
+        return "failed", "the vendor ignored the hook timeout and let the 5s hook complete"
+    try:
+        with open(ended, encoding="utf-8") as handle:
+            elapsed = float(handle.read().strip())
+    except (OSError, ValueError) as error:
+        return "failed", f"the timeout probe did not record termination: {error}"
+    maximum = _HOOK_TIMEOUT_SECONDS + _HOOK_TIMEOUT_TOLERANCE_SECONDS
+    if elapsed > maximum:
+        return "failed", f"the hook timeout took {elapsed:.2f}s, above {maximum:.2f}s"
+    outcome = "executed" if os.path.isfile(target) else "blocked"
+    return "passed", f"vendor terminated the hook after {elapsed:.2f}s; tool was {outcome}"
+
+
+def _claude_protected_roots(home: str) -> list[str]:
+    with open(os.path.join(home, "settings.json"), "r", encoding="utf-8") as handle:
+        settings = json.load(handle)
+    roots = settings.get("sandbox", {}).get("filesystem", {}).get("denyWrite")
+    if not isinstance(roots, list) or not roots or not all(isinstance(root, str) for root in roots):
+        raise RuntimeError("Claude settings do not contain sandbox.filesystem.denyWrite")
+    return roots
+
+
+def _run_claude_shell(binary: str, home: str, workdir: str, command: str):
+    prompt = (
+        "Use the Bash tool exactly once to run this command verbatim. "
+        "Do not replace it with another tool or only describe it.\n"
+        f"<ihar-conformance-command>{command}</ihar-conformance-command>"
+    )
+    env = {**os.environ, "CLAUDE_CONFIG_DIR": home}
+    return subprocess.run(
+        [binary, "-p", "--output-format", "json", "--allowedTools", "Bash", prompt],
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def _remove_probe(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _case_sandbox_protected_write(vendor, binary, home, workdir, kind):
+    if vendor != "claude":
+        return "skipped", "native denyWrite probes are Claude-specific"
+
+    roots = _claude_protected_roots(home)
+    cleanup: list[str] = []
+    try:
+        for root in roots:
+            nonce = uuid.uuid4().hex
+            before = os.path.join(workdir, f".ihar-conformance-{kind}-before-{nonce}")
+            target = os.path.join(root, f".ihar-conformance-{kind}-write-{nonce}")
+            after = os.path.join(workdir, f".ihar-conformance-{kind}-after-{nonce}")
+            paths = (before, target, after)
+            if any(os.path.exists(path) for path in paths):
+                return "failed", "a unique sandbox probe path already exists"
+            cleanup.extend(paths)
+
+            if kind == "direct":
+                command = (
+                    f"printf 'ihar-conformance\\n' > {shlex.quote(before)}; "
+                    f"printf 'ihar-conformance\\n' > {shlex.quote(target)}; "
+                    "probe_status=$?; "
+                    f"printf '%s\\n' \"$probe_status\" > {shlex.quote(after)}"
+                )
+            else:
+                code = (
+                    "from pathlib import Path\n"
+                    f"Path({before!r}).write_text('ihar-conformance\\n')\n"
+                    "status = 0\n"
+                    "try:\n"
+                    f"    Path({target!r}).write_text('ihar-conformance\\n')\n"
+                    "except OSError:\n"
+                    "    status = 1\n"
+                    f"Path({after!r}).write_text(str(status) + '\\n')\n"
+                )
+                command = f"python3 -c {shlex.quote(code)}"
+
+            result = _run_claude_shell(binary, home, workdir, command)
+            if result.returncode != 0:
+                return "failed", f"Claude exited {result.returncode} while probing {root}"
+            if not os.path.isfile(before):
+                return "failed", f"Claude did not begin the {kind} probe for {root}"
+            try:
+                with open(after, "r", encoding="utf-8") as handle:
+                    status = int(handle.read().strip())
+            except (OSError, ValueError) as error:
+                return "failed", f"Claude did not finish the {kind} probe for {root}: {error}"
+            if status == 0:
+                return "failed", f"Claude reported that it wrote {target}"
+            if os.path.exists(target):
+                return "failed", f"Claude wrote {target} despite denyWrite"
+
+        return "passed", f"{kind} writes blocked in {len(roots)} protected roots"
+    finally:
+        for path in cleanup:
+            _remove_probe(path)
+
+
+def case_sandbox_direct_write(vendor, binary, home, workdir):
+    return _case_sandbox_protected_write(vendor, binary, home, workdir, "direct")
+
+
+def case_sandbox_child_write(vendor, binary, home, workdir):
+    return _case_sandbox_protected_write(vendor, binary, home, workdir, "child")
+
+
+def case_sandbox_workspace_write(vendor, binary, home, workdir):
+    if vendor != "claude":
+        return "skipped", "native sandbox probes are Claude-specific"
+    target = os.path.join(workdir, f".ihar-conformance-workspace-write-{uuid.uuid4().hex}")
+    if os.path.exists(target):
+        return "failed", "a unique workspace probe path already exists"
+    try:
+        command = f"printf 'ihar-conformance\\n' > {shlex.quote(target)}"
+        result = _run_claude_shell(binary, home, workdir, command)
+        if result.returncode != 0:
+            return "failed", f"Claude exited {result.returncode} during the workspace probe"
+        try:
+            with open(target, "r", encoding="utf-8") as handle:
+                content = handle.read()
+        except OSError as error:
+            return "failed", f"Claude did not write the workspace probe: {error}"
+        if content != "ihar-conformance\n":
+            return "failed", "Claude wrote unexpected workspace probe content"
+        return "passed", "workspace write succeeded"
+    finally:
+        _remove_probe(target)
 
 
 CASES = {
     "hook-is-loaded": case_hook_is_loaded,
     "trust-is-recordable": case_trust_is_recordable,
     "tampering-is-detected": case_tampering_is_detected,
-    "deny-blocks-the-tool": case_deny_blocks_the_tool,
-    "rewrite-is-emitted": case_rewrite_is_emitted,
+    "sandbox-direct-write": case_sandbox_direct_write,
+    "sandbox-child-write": case_sandbox_child_write,
+    "sandbox-workspace-write": case_sandbox_workspace_write,
+}
+
+CLAUDE_ONLY_CASES = {
+    "sandbox-direct-write",
+    "sandbox-child-write",
+    "sandbox-workspace-write",
 }
 
 
@@ -208,8 +656,32 @@ def vendor_version(vendor: str, binary: str) -> str:
     return (result.stdout or result.stderr).strip().splitlines()[0] if result.stdout or result.stderr else "unknown"
 
 
-def run(vendor: str, binary: str, store: str, manifest_path: str) -> dict:
+def _validate_release_pin(vendor: str, version: str, lockfile_path: str) -> None:
+    lockfile = jsonio.read("lockfile", lockfile_path)
+    pinned = lockfile[vendor]["version"]
+    if vendor == "codex":
+        pinned = pinned.removeprefix("rust-v")
+    match = re.search(r"\d+\.\d+\.\d+", version)
+    actual = match.group(0) if match else ""
+    if actual != pinned:
+        raise RuntimeError(
+            f"{vendor} binary version {version!r} does not match pinned release {pinned!r}"
+        )
+
+
+def run(
+    vendor: str,
+    binary: str,
+    store: str,
+    manifest_path: str,
+    *,
+    auth_store: str,
+    lockfile_path: str,
+    protected_store: str | None = None,
+) -> dict:
+    """Run staged hooks/binary while probing denial against the final store."""
     version = vendor_version(vendor, binary)
+    _validate_release_pin(vendor, version, lockfile_path)
     record = {
         "schema": 1,
         "vendor": vendor,
@@ -222,17 +694,32 @@ def run(vendor: str, binary: str, store: str, manifest_path: str) -> dict:
 
     workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
     home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    state_root = tempfile.mkdtemp(prefix="ihar-conf-state-")
     try:
-        _stage(store, manifest_path, vendor, home)
+        protected_roots = [protected_store or store, state_root, home] \
+            if vendor == "claude" else None
+        _stage(
+            store, manifest_path, vendor, home, protected_roots,
+            auth_store=auth_store,
+        )
         for name, case in CASES.items():
+            if name in CLAUDE_ONLY_CASES and vendor != "claude":
+                continue
             try:
                 status, detail = case(vendor, binary, home, workdir)
+            except Exception as error:             # noqa: BLE001
+                status, detail = "failed", f"{type(error).__name__}: {error}"
+            record["cases"][name] = {"status": status, "detail": detail}
+        for name in sorted(LIVE_CASES):
+            try:
+                status, detail = _run_live_case(vendor, binary, home, workdir, name)
             except Exception as error:             # noqa: BLE001
                 status, detail = "failed", f"{type(error).__name__}: {error}"
             record["cases"][name] = {"status": status, "detail": detail}
     finally:
         shutil.rmtree(home, ignore_errors=True)
         shutil.rmtree(workdir, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
 
     return record
 
@@ -242,8 +729,42 @@ def main(argv: list[str]) -> int:
         print(__doc__, file=sys.stderr)
         return 2
     vendor, binary, store, manifest_path = argv[:4]
+    options = argv[4:]
+    protected_store = None
+    auth_store = None
+    lockfile_path = None
+    if "--protected-store" in options:
+        index = options.index("--protected-store")
+        if index + 1 >= len(options):
+            print(__doc__, file=sys.stderr)
+            return 2
+        protected_store = options[index + 1]
+        del options[index:index + 2]
+    if "--auth-store" in options:
+        index = options.index("--auth-store")
+        if index + 1 >= len(options):
+            print(__doc__, file=sys.stderr)
+            return 2
+        auth_store = options[index + 1]
+        del options[index:index + 2]
+    if "--lockfile" in options:
+        index = options.index("--lockfile")
+        if index + 1 >= len(options):
+            print(__doc__, file=sys.stderr)
+            return 2
+        lockfile_path = options[index + 1]
+        del options[index:index + 2]
+    if auth_store is None or lockfile_path is None \
+            or any(option != "--json" for option in options):
+        print(__doc__, file=sys.stderr)
+        return 2
     try:
-        record = run(vendor, binary, store, manifest_path)
+        record = run(
+            vendor, binary, store, manifest_path,
+            auth_store=auth_store,
+            lockfile_path=lockfile_path,
+            protected_store=protected_store,
+        )
     except (RuntimeError, OSError, jsonio.SchemaError) as error:
         print(f"ihar: conformance could not run: {error}", file=sys.stderr)
         return 3
@@ -254,7 +775,7 @@ def main(argv: list[str]) -> int:
     jsonio.write("conformance", target, record, mode=0o644)
 
     failed = [name for name, case in record["cases"].items() if case["status"] == "failed"]
-    if "--json" in argv:
+    if "--json" in options:
         print(json.dumps(record, indent=2, sort_keys=True))
     else:
         for name, case in sorted(record["cases"].items()):

@@ -209,8 +209,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        log.record(request_id=request_id, event="local", method=method,
-                   path_class=log.path_class(self.path), status=200)
 
     def _local_body(self) -> dict:
         path = log.path_class(self.path)

@@ -7,6 +7,10 @@
 # Failure class: fail-soft. A migration that cannot run leaves a fresh state; the user
 # loses history, not the ability to launch.
 
+ihar_migration_inventory() {
+  ihar_python ihar.inventory state "$IHAR_ROOT/manifests/state.json" "$1"
+}
+
 # _ihar_legacy_candidates <vendor> <hash> — legacy homes whose id ends in the same
 # project hash. iclaude and icodex both key on sha256(project-root)[0:12] but sanitise
 # the basename differently, so the hash is the reliable half of the id.
@@ -144,20 +148,36 @@ ihar_migrate_vendor() {
   command -v rsync >/dev/null 2>&1 \
     || { ihar_warn "rsync is required to migrate legacy state"; return 1; }
 
-  local entry stage copied=false source_before source_after staged
-  source_before="$(ihar_python ihar.migration_fingerprint "$legacy")" \
+  local entry kind suffix inventory stage copied=false source_before source_after staged
+  local source_path target_path
+  local -a entries=()
+  inventory="$(ihar_migration_inventory "$vendor")" \
+    || { ihar_warn "cannot read $vendor state inventory"; return 1; }
+  while IFS=$'\t' read -r entry kind; do
+    [[ -n "$entry" ]] || continue
+    if [[ "$kind" == sqlite-family ]]; then
+      for suffix in '' -wal -shm; do entries+=("$entry$suffix"); done
+    else
+      entries+=("$entry")
+    fi
+  done <<< "$inventory"
+
+  source_before="$(ihar_python ihar.migration_fingerprint "$legacy" "${entries[@]}")" \
     || { ihar_warn "cannot fingerprint $vendor migration source $legacy"; return 1; }
   stage="$(mktemp -d "$state/st/.${vendor}-migrate-XXXXXX")" \
     || { ihar_warn "cannot stage $vendor migration"; return 1; }
-  for entry in projects sessions session-env history.jsonl file-history \
-               state_5.sqlite state_5.sqlite-wal \
-               thread_history_1.sqlite thread_history_1.sqlite-wal; do
+  for entry in "${entries[@]}"; do
     [[ -e "$legacy/$entry" ]] || continue
     # Never follow a legacy symlink: it points into the old store, which this
     # harness does not own and will not copy.
     [[ -L "$legacy/$entry" ]] && continue
+    mkdir -p "$(dirname "$stage/$entry")"
+    if [[ -d "$legacy/$entry" ]]; then mkdir -p "$stage/$entry"; fi
+    source_path="$legacy/$entry"
+    target_path="$stage/$entry"
+    if [[ -d "$source_path" ]]; then source_path="$source_path/"; target_path="$target_path/"; fi
     if ! rsync -a --no-links --no-specials --no-devices \
-      "$legacy/$entry" "$stage/" >/dev/null 2>&1; then
+      "$source_path" "$target_path" >/dev/null 2>&1; then
       rm -rf "$stage"
       ihar_warn "cannot migrate $entry from $legacy"
       return 1
@@ -166,9 +186,9 @@ ihar_migrate_vendor() {
   done
 
   if [[ "$copied" != true ]]; then rm -rf "$stage"; return 0; fi
-  source_after="$(ihar_python ihar.migration_fingerprint "$legacy")" \
+  source_after="$(ihar_python ihar.migration_fingerprint "$legacy" "${entries[@]}")" \
     || { rm -rf "$stage"; ihar_warn "cannot verify $vendor migration source $legacy"; return 1; }
-  staged="$(ihar_python ihar.migration_fingerprint "$stage")" \
+  staged="$(ihar_python ihar.migration_fingerprint "$stage" "${entries[@]}")" \
     || { rm -rf "$stage"; ihar_warn "cannot verify staged $vendor migration"; return 1; }
   if [[ "$source_before" != "$source_after" || "$source_after" != "$staged" ]]; then
     rm -rf "$stage"

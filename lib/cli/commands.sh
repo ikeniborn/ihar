@@ -35,7 +35,16 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
 
   # 3. store integrity, at the severity the profile asks for
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR
-  ihar_store_verify
+  local native_binary
+  case "$vendor" in
+    claude) native_binary="$IHAR_CLAUDE_BIN" ;;
+    codex)  native_binary="$IHAR_CODEX_BIN" ;;
+  esac
+  local verify_receipt=true
+  if [[ "$IHAR_FLAG_DRY_RUN" == true ]]; then
+    verify_receipt=false
+  fi
+  ihar_store_verify "$vendor" "$native_binary" "$verify_receipt"
 
   # 4. project state. Called directly rather than in a command substitution: the
   # setup exports IHAR_STATE, and a subshell would drop that export while still
@@ -230,77 +239,6 @@ ihar_dry_run() {
     "${#IHAR_ENV[@]}" "${IHAR_ENV_DROPPED[*]:-}" -- "${IHAR_ARGV[@]}"
 }
 
-# ihar_cmd_check — what is in force right now (LLD 12.4). Grows with every slice.
-ihar_cmd_check() {
-  ihar_state_setup "$IHAR_PROJECT_ROOT" >/dev/null
-  ihar_handoff_sweep
-  ihar_profile_resolve "$IHAR_FLAG_PROFILE"
-  printf 'profile      %s\n' "$IHAR_PROFILE"
-  printf 'guarantee    %s\n' "$IHAR_PROFILE_GUARANTEE"
-  printf 'hooks        %s\n' "$IHAR_PROFILE_HOOKS"
-  printf 'gateway      %s\n' "$IHAR_PROFILE_GATEWAY"
-  printf 'masking      %s (floor %s, engine %s)\n' \
-    "$IHAR_GATEWAY_MASKING_LEVEL" "$IHAR_PROFILE_MASKING_LEVEL" \
-    "$(ihar_python ihar.mask.describe "$IHAR_GATEWAY_MASKING_LEVEL" 2>/dev/null || echo unknown)"
-  printf 'sandbox      %s\n' "$IHAR_PROFILE_SANDBOX"
-  ihar_gateway_status
-  printf 'store        %s\n' "$IHAR_STORE"
-  printf 'state root   %s\n' "$IHAR_STATE_ROOT"
-  printf 'lockfile     %s\n' "$([[ -f "$IHAR_LOCKFILE" ]] && echo present || echo absent)"
-  printf 'acp          claude-agent-acp #144: settings hooks may not fire\n'
-  printf 'acp          codex-acp #310/#477: sandbox and approval policy are overridden\n'
-
-  local vendor binary version record
-  for vendor in claude codex; do
-    binary="$(eval echo "\$IHAR_${vendor^^}_BIN")"
-    if [[ ! -x "$binary" ]]; then
-      printf '%-12s not installed\n' "$vendor"
-      continue
-    fi
-    version="$("$binary" --version 2>/dev/null | head -1)"
-    record="$IHAR_STORE/verification/$vendor-$(ihar_version_slug "$binary").json"
-    if [[ -f "$record" ]]; then
-      if ihar_python ihar.conformance.check "$record" "$binary" \
-           "$IHAR_ROOT/manifests/hooks.json" >/dev/null 2>&1; then
-        printf '%-12s %s, hook enforcement proven\n' "$vendor" "$version"
-      else
-        printf '%-12s %s, conformance record is stale\n' "$vendor" "$version"
-      fi
-    else
-      printf '%-12s %s, hook enforcement unproven\n' "$vendor" "$version"
-    fi
-  done
-
-  ihar_check_mcp
-  ihar_check_daemon
-
-  if [[ "${IHAR_SUBCOMMAND:-}" == "--conformance" || "${IHAR_FLAG_CONFORMANCE:-false}" == true ]]; then
-    ihar_cmd_conformance
-  fi
-}
-
-# ihar_check_mcp — which registry entries this profile offers, and which it cannot.
-#
-# A skipped server is worth saying out loud: the profile's guarantee names an MCP
-# allowlist, and a user who believes a server is allowlisted when it was skipped for
-# a missing variable has a false picture of what is reachable.
-ihar_check_mcp() {
-  local registry="$IHAR_ROOT/manifests/mcp/registry.json"
-  [[ -f "$registry" ]] || { printf 'mcp          no registry\n'; return 0; }
-
-  local strict="not enforced"
-  [[ "${IHAR_PROFILE_MCP_STRICT:-false}" == true ]] && strict="strict: only registry servers load"
-
-  printf 'mcp          %s\n' "$strict"
-  local vendor notes
-  for vendor in claude codex; do
-    notes="$(ihar_python ihar.render.mcp "$vendor" "$IHAR_PROFILE" "$registry" --report 2>&1)" || true
-    while IFS= read -r note; do
-      [[ -n "$note" ]] && printf '             %s: %s\n' "$vendor" "$note"
-    done <<< "$notes"
-  done
-}
-
 # ihar_cmd_conformance — run the live suite and record the result (LLD 6.6).
 ihar_cmd_conformance() {
   local vendor binary status=0
@@ -309,7 +247,8 @@ ihar_cmd_conformance() {
     [[ -x "$binary" ]] || continue
     printf '\n%s conformance\n' "$vendor"
     ihar_python ihar.conformance.run "$vendor" "$binary" "$IHAR_STORE" \
-      "$IHAR_ROOT/manifests/hooks.json" || status=$?
+      "$IHAR_ROOT/manifests/hooks.json" \
+      --auth-store "$IHAR_STORE" --lockfile "$IHAR_LOCKFILE" || status=$?
   done
   return "$status"
 }
@@ -318,7 +257,34 @@ ihar_cmd_conformance() {
 ihar_cmd_homes() {
   case "${IHAR_SUBCOMMAND:-list}" in
     list)  ihar_state_list ;;
-    clean) ihar_state_clean_orphans >/dev/null ;;
+    clean)
+      (( ${#IHAR_ARGS[@]} <= 1 )) \
+        || ihar_die 2 "ihar homes clean accepts at most one state id"
+      local clean_state clean_id="${IHAR_ARGS[0]:-}"
+      if [[ -n "$clean_id" ]]; then
+        [[ "$clean_id" =~ ^[0-9a-f]{8}$ ]] \
+          || ihar_die 2 "invalid state id '$clean_id'"
+        clean_state="$IHAR_STATE_ROOT/$clean_id"
+        [[ -d "$clean_state" && -f "$clean_state/home.json" ]] \
+          || ihar_die 2 "unknown state id '$clean_id'"
+        local marker_root
+        marker_root="$(ihar_python ihar.state_marker --validate-root "$clean_state/home.json" 2>/dev/null)" \
+          || ihar_die 2 "state id '$clean_id' has an invalid marker"
+        [[ "$(ihar_home_id "$marker_root")" == "$clean_id" ]] \
+          || ihar_die 2 "state id '$clean_id' does not own marker project '$marker_root'"
+      else
+        clean_state="$IHAR_STATE_ROOT/$(ihar_home_id "$IHAR_PROJECT_ROOT")"
+        if [[ ! -d "$clean_state" ]]; then printf '0\n'; return 0; fi
+        [[ -f "$clean_state/home.json" ]] \
+          || ihar_die 2 "current state has no valid marker"
+        local marker_root
+        marker_root="$(ihar_python ihar.state_marker --validate-root "$clean_state/home.json" 2>/dev/null)" \
+          || ihar_die 2 "current state has an invalid marker"
+        [[ "$marker_root" == "$IHAR_PROJECT_ROOT" ]] \
+          || ihar_die 2 "current state marker belongs to '$marker_root', not '$IHAR_PROJECT_ROOT'"
+      fi
+      ihar_state_clean_runtimes 30 "$clean_state"
+      ;;
     migrate)
       (( ${#IHAR_ARGS[@]} == 0 )) \
         || ihar_die 2 "ihar homes migrate accepts no positional arguments"

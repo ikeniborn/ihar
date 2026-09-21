@@ -22,9 +22,12 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import tempfile
 from typing import Any, Mapping
+
+from .conformance import REQUIRED_CASES as REQUIRED_CONFORMANCE_CASES
 
 __all__ = ["SchemaError", "check", "read", "write", "merge_managed", "KINDS"]
 
@@ -282,6 +285,173 @@ def _conformance_rules(obj: Mapping[str, Any]) -> None:
         raise SchemaError(
             f"conformance {obj['vendor']} {obj['version']}: no cases recorded; "
             "an empty record would let an enforced profile launch unproven"
+        )
+    required = REQUIRED_CONFORMANCE_CASES[obj["vendor"]]
+    missing = sorted(required - obj["cases"].keys())
+    if missing:
+        raise SchemaError(
+            f"conformance {obj['vendor']} {obj['version']}: missing mandatory cases: "
+            f"{', '.join(missing)}"
+        )
+    incomplete = sorted(
+        name for name in required if obj["cases"][name]["status"] == "skipped"
+    )
+    if incomplete:
+        raise SchemaError(
+            f"conformance {obj['vendor']} {obj['version']}: mandatory cases were skipped: "
+            f"{', '.join(incomplete)}"
+        )
+
+
+def _state_manifest_rules(obj: Mapping[str, Any]) -> None:
+    keys: set[tuple[str, str]] = set()
+    paths: dict[str, list[str]] = {}
+    expanded: dict[tuple[str, str], str] = {}
+    for entry in obj["entries"]:
+        key = (entry["vendor"], entry["path"])
+        if key in keys:
+            raise SchemaError(
+                f"state manifest: duplicate entry for vendor {key[0]!r} and path {key[1]!r}"
+            )
+        keys.add(key)
+        expanded_paths = [entry["path"]]
+        if entry["kind"] == "sqlite-family":
+            expanded_paths.extend((entry["path"] + "-wal", entry["path"] + "-shm"))
+        for path in expanded_paths:
+            expanded_key = (entry["vendor"], path)
+            if expanded_key in expanded:
+                raise SchemaError(
+                    f"state manifest: expanded path {path!r} for vendor "
+                    f"{entry['vendor']!r} aliases {expanded[expanded_key]!r}"
+                )
+            expanded[expanded_key] = entry["path"]
+            paths.setdefault(entry["vendor"], []).append(path)
+    for vendor, vendor_paths in paths.items():
+        ordered = sorted(vendor_paths)
+        for index, path in enumerate(ordered):
+            for other in ordered[index + 1 :]:
+                if other.startswith(path + "/"):
+                    raise SchemaError(
+                        f"state manifest: overlapping paths for vendor {vendor!r}: "
+                        f"{path!r} and {other!r}"
+                    )
+
+
+def _asset_manifest_rules(obj: Mapping[str, Any]) -> None:
+    forbidden = {"auth", "cache", "caches", "plugins", "st", "transcripts"}
+    generated = {"settings.json", "config.toml", "router.json"}
+    keys: set[tuple[str, str]] = set()
+    for entry in obj["entries"]:
+        key = (entry["vendor"], entry["target"])
+        if key in keys:
+            raise SchemaError(
+                f"asset manifest: duplicate target for vendor {key[0]!r} and target {key[1]!r}"
+            )
+        keys.add(key)
+        parts = set(entry["source"].split("/")) | set(entry["target"].split("/"))
+        if forbidden & parts or any(part.endswith(".cache") for part in parts):
+            raise SchemaError("asset manifest: authentication, caches, plugins, transcripts and state are not tracked assets")
+        if generated & parts:
+            raise SchemaError("asset manifest: generated settings are not tracked assets")
+
+
+def _mutable_link_manifest_rules(obj: Mapping[str, Any]) -> None:
+    sources: set[str] = set()
+    targets: set[tuple[str, str]] = set()
+    for entry in obj["entries"]:
+        raw_source = entry["source"]
+        raw_target = entry["target"]
+        source = posixpath.normpath(raw_source)
+        target_path = posixpath.normpath(raw_target)
+        target = (entry["vendor"], target_path)
+        if source in sources:
+            raise SchemaError(f"mutable-link manifest: duplicate source {source!r}")
+        if target in targets:
+            raise SchemaError(
+                f"mutable-link manifest: duplicate target for vendor {target[0]!r} "
+                f"and path {target[1]!r}"
+            )
+        sources.add(source)
+        targets.add(target)
+
+        if "." in raw_source.split("/"):
+            raise SchemaError(
+                f"mutable-link manifest: source {raw_source!r} contains a non-canonical dot segment"
+            )
+        if "." in raw_target.split("/"):
+            raise SchemaError(
+                f"mutable-link manifest: target {raw_target!r} contains a non-canonical dot segment"
+            )
+        if source != raw_source:
+            raise SchemaError(
+                f"mutable-link manifest: source {raw_source!r} is not canonical; use {source!r}"
+            )
+        if target_path != raw_target:
+            raise SchemaError(
+                f"mutable-link manifest: target {raw_target!r} is not canonical; "
+                f"use {target_path!r}"
+            )
+
+        parts = source.split("/")
+        if len(parts) < 2 or parts[0] not in ("auth", "plugins") \
+                or parts[1] != entry["vendor"]:
+            raise SchemaError(
+                "mutable-link manifest: source must belong to vendor auth or plugins"
+            )
+        if parts[0] == "auth" and entry["kind"] != "file":
+            raise SchemaError("mutable-link manifest: auth entries must be files")
+        if parts[0] == "plugins" and (len(parts) != 2 or entry["kind"] != "directory"):
+            raise SchemaError("mutable-link manifest: plugin entries must be vendor directories")
+
+
+def _test_inventory_rules(obj: Mapping[str, Any]) -> None:
+    seen: set[str] = set()
+    for path in obj["paths"]:
+        if path in seen:
+            raise SchemaError(f"test inventory: duplicate path {path!r}")
+        seen.add(path)
+        if not re.fullmatch(r"tests/test_[A-Za-z0-9._-]+\.(sh|py)", path):
+            raise SchemaError(
+                f"test inventory: {path!r} is not a discovered tests/test_*.sh or tests/test_*.py path"
+            )
+
+
+def _check_result_rules(obj: Mapping[str, Any]) -> None:
+    for instance in obj["gateway"]["instances"]:
+        for name in ("port", "pid"):
+            if isinstance(instance[name], bool):
+                raise SchemaError(f"check result: gateway {name} must be an integer or null")
+        metrics = instance["metrics"]
+        metric_names = ("masked", "refused", "relayed", "uptime_seconds")
+        values = [metrics[name] for name in metric_names]
+        for name in metric_names:
+            if isinstance(metrics[name], bool):
+                raise SchemaError(f"check result: gateway metric {name} must be an integer or null")
+        if metrics["state"] == "available" and any(value is None for value in values):
+            raise SchemaError("check result: available metrics must carry every counter")
+        if metrics["state"] == "unavailable" and any(value is not None for value in values):
+            raise SchemaError("check result: unavailable metrics must not fabricate counters")
+    network = obj["network"]
+    expected_scope = "guest-boundary" if network["configured"] else "none"
+    if network["scope"] != expected_scope:
+        raise SchemaError(
+            f"check result: configured network boundary {network['configured']!r} "
+            f"requires scope {expected_scope!r}"
+        )
+    if network["available"] and not network["configured"]:
+        raise SchemaError("check result: an available network boundary must be configured")
+    if network["active"] and not network["configured"]:
+        raise SchemaError("check result: an active network boundary must be configured")
+    observed = all(network[name] for name in ("configured", "available", "active", "verified"))
+    if network["verified"] and (not observed or network["default"] != "deny"):
+        raise SchemaError(
+            "check result: verified network evidence requires a configured, available, "
+            "active deny-by-default boundary"
+        )
+    expected_state = "enforced" if observed else "not enforced"
+    if network["state"] != expected_state:
+        raise SchemaError(
+            f"check result: observed network evidence requires state {expected_state!r}"
         )
 
 
@@ -576,23 +746,13 @@ KINDS: dict[str, dict[str, Any]] = {
     "lockfile": {
         "fields": {
             "schema": {"type": int, "const": 1},
-            "installedAt": {"type": str, "pattern": _TS},
         },
         "optional": {
             "node": {"type": dict, "fields": {"version": {"type": str, "min_len": 1}}},
-            # The digest is of the installed binary, not of a published artefact, so
-            # it cannot be known before the install that produces it — requiring it
-            # made pinning a Claude version impossible, because no lockfile that
-            # named one could validate. Codex's `sha256` stays required: it is the
-            # release archive's digest, published with the release and checked
-            # before extraction.
             "claude": {
                 "type": dict,
                 "fields": {
                     "version": {"type": str, "min_len": 1},
-                },
-                "optional": {
-                    "binarySha256": {"type": str, "pattern": _SHA256},
                 },
             },
             "codex": {
@@ -614,6 +774,171 @@ KINDS: dict[str, dict[str, Any]] = {
             "microvm": {"type": dict, "values": {"type": str, "pattern": _SHA256}},
         },
         "rules": [],
+    },
+    # LLD 14.1: unlike the release lock above, this evidence is local to one store.
+    "install-receipt": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "release_lock_sha256": {"type": str, "pattern": _SHA256},
+            "installed_at": {"type": str, "pattern": _TS},
+            "components": {
+                "type": dict,
+                "fields": {},
+                "optional": {
+                    vendor: {
+                        "type": dict,
+                        "fields": {
+                            "version": {"type": str, "min_len": 1},
+                            "binary_sha256": {"type": str, "pattern": _SHA256},
+                        },
+                    }
+                    for vendor in _VENDOR
+                },
+            },
+        },
+        "rules": [],
+    },
+    # LLD 2.4
+    "state-manifest": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "entries": {
+                "type": list,
+                "items": {
+                    "type": dict,
+                    "fields": {
+                        "vendor": {"type": str, "enum": _VENDOR},
+                        "path": {"type": str, "pattern": _SAFE_REL},
+                        "kind": {
+                            "type": str,
+                            "enum": ("directory", "file", "sqlite-family"),
+                        },
+                    },
+                },
+            },
+        },
+        "rules": [_state_manifest_rules],
+    },
+    "asset-manifest": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "entries": {
+                "type": list,
+                "items": {
+                    "type": dict,
+                    "fields": {
+                        "vendor": {"type": str, "enum": ("common", *_VENDOR)},
+                        "source": {"type": str, "pattern": _SAFE_REL},
+                        "target": {"type": str, "pattern": _SAFE_REL},
+                        "kind": {"type": str, "enum": ("directory", "file")},
+                        "required": {"type": bool},
+                        "runtime": {"type": bool},
+                    },
+                },
+            },
+        },
+        "rules": [_asset_manifest_rules],
+    },
+    "mutable-link-manifest": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "entries": {
+                "type": list,
+                "items": {
+                    "type": dict,
+                    "fields": {
+                        "vendor": {"type": str, "enum": _VENDOR},
+                        "source": {"type": str, "pattern": _SAFE_REL},
+                        "target": {"type": str, "pattern": _SAFE_REL},
+                        "kind": {"type": str, "enum": ("directory", "file")},
+                    },
+                },
+            },
+        },
+        "rules": [_mutable_link_manifest_rules],
+    },
+    "test-inventory": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "paths": {
+                "type": list,
+                "items": {"type": str, "pattern": _SAFE_REL},
+            },
+        },
+        "rules": [_test_inventory_rules],
+    },
+    "check-result": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "profile": {"type": dict, "fields": {
+                "name": {"type": str, "pattern": _SLUG},
+                "guarantee": {"type": str, "min_len": 1},
+            }},
+            "masking": {"type": dict, "fields": {
+                "level": {"type": str, "enum": ("off", "secrets", "standard")},
+                "floor": {"type": str, "enum": ("off", "secrets", "standard")},
+                "engine": {"type": str, "min_len": 1},
+                "dropped_env": {"type": list, "items": {"type": str, "min_len": 1}},
+            }},
+            "gateway": {"type": dict, "fields": {
+                "mode": {"type": str, "enum": ("off", "explicit")},
+                "instances": {"type": list, "items": {"type": dict, "fields": {
+                    "key": {"type": str, "pattern": r"[0-9a-f]{12}"},
+                    "mode": {"type": str, "enum": ("explicit",)},
+                    "port": {"type": (int, type(None)), "min": 1, "max": 65535},
+                    "pid": {"type": (int, type(None)), "min": 1},
+                    "consumers": {"type": int, "min": 0},
+                    "healthy": {"type": bool},
+                    "metrics": {"type": dict, "fields": {
+                        "state": {"type": str, "enum": ("available", "unavailable")},
+                        "masked": {"type": (int, type(None)), "min": 0},
+                        "refused": {"type": (int, type(None)), "min": 0},
+                        "relayed": {"type": (int, type(None)), "min": 0},
+                        "uptime_seconds": {"type": (int, type(None)), "min": 0},
+                    }},
+                }}},
+            }},
+            "network": {"type": dict, "fields": {
+                "state": {"type": str, "enum": ("enforced", "not enforced")},
+                "scope": {"type": str, "enum": ("none", "guest-boundary")},
+                "default": {"type": str, "enum": ("allow", "deny")},
+                "configured": {"type": bool},
+                "available": {"type": bool},
+                "active": {"type": bool},
+                "verified": {"type": bool},
+            }},
+            "vendors": {"type": dict, "fields": {
+                vendor: {"type": dict, "fields": {
+                    "receipt": {"type": str, "enum": ("verified", "mismatched", "missing receipt")},
+                    "hooks": {"type": list, "items": {"type": dict, "fields": {
+                        "id": {"type": str, "pattern": _SLUG},
+                        "trust": {"type": str, "enum": ("configured", "trusted", "untrusted", "unavailable")},
+                        "trusted_hash": {"type": (str, type(None)), "pattern": r"sha256:[0-9a-f]{64}"},
+                        "trustStatus": {"type": (str, type(None))},
+                        "enabled": {"type": (bool, type(None))},
+                        "source": {"type": (str, type(None))},
+                        "currentHash": {"type": (str, type(None)), "pattern": r"sha256:[0-9a-f]{64}"},
+                    }}},
+                    "conformance": {"type": str, "enum": ("proven", "stale", "unproven", "not-installed")},
+                    "capabilities": {"type": list, "items": {"type": str, "min_len": 1}},
+                }} for vendor in _VENDOR
+            }},
+            "assets": {"type": list, "items": {"type": dict, "fields": {
+                "requirement": {"type": str, "enum": ("required", "optional")},
+                "presence": {"type": str, "enum": ("present", "missing")},
+                "source": {"type": str, "pattern": _SAFE_REL},
+                "target": {"type": str, "pattern": _SAFE_REL},
+            }}},
+            "mcp": {"type": dict, "fields": {
+                "strict": {"type": bool},
+                "notes": {"type": dict, "fields": {
+                    vendor: {"type": list, "items": {"type": str, "min_len": 1}}
+                    for vendor in _VENDOR
+                }},
+            }},
+            "known_gaps": {"type": list, "items": {"type": str, "min_len": 1}},
+        },
+        "rules": [_check_result_rules],
     },
 }
 

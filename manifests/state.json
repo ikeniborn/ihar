@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "entries": [
+    {"vendor": "claude", "path": ".claude.json", "kind": "file"},
+    {"vendor": "claude", "path": "history.jsonl", "kind": "file"},
+    {"vendor": "claude", "path": "projects", "kind": "directory"},
+    {"vendor": "claude", "path": "sessions", "kind": "directory"},
+    {"vendor": "claude", "path": "session-env", "kind": "directory"},
+    {"vendor": "claude", "path": "file-history", "kind": "directory"},
+    {"vendor": "codex", "path": "sessions", "kind": "directory"},
+    {"vendor": "codex", "path": "history.jsonl", "kind": "file"},
+    {"vendor": "codex", "path": "session_index.jsonl", "kind": "file"},
+    {"vendor": "codex", "path": "shell_snapshots", "kind": "directory"},
+    {"vendor": "codex", "path": "app-server-control", "kind": "directory"},
+    {"vendor": "codex", "path": "state_5.sqlite", "kind": "sqlite-family"},
+    {"vendor": "codex", "path": "goals_1.sqlite", "kind": "sqlite-family"},
+    {"vendor": "codex", "path": "memories_1.sqlite", "kind": "sqlite-family"},
+    {"vendor": "codex", "path": "logs_2.sqlite", "kind": "sqlite-family"}
+  ]
+}

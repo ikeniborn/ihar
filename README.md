@@ -40,12 +40,16 @@ cd ihar
 ```
 
 That builds the store, links `ihar` into `~/.local/bin`, creates the Python environment,
-downloads the components the lockfile pins — verifying each against its recorded digest —
-and runs the hook conformance suite the enforced profiles require.
+installs pinned component versions, verifies the Codex archive against its recorded
+digest, and runs the hook conformance suite the enforced profiles require. The
+Node/Claude installation is version-pinned but has no archive digest in the lockfile.
 
 The specialised Firecracker guest comes from a compatible, locally built asset directory.
-Its `firecracker`, `vmlinux`, `rootfs.ext4`, `client_key`, `client_key.pub` and
-`host_key.pub` files are all validated before one pinned version is activated atomically:
+Its `firecracker`, `vmlinux` and `rootfs.ext4` files are checked against lockfile
+digests. The three SSH key files are checked for their expected format and pairing;
+they have no lockfile digests. The version key derives from the three pinned image
+digests. A staged version is published, then its current pointer and command links
+are updated with rollback protection:
 
 ```bash
 IHAR_MICROVM_SOURCE_DIR=/path/to/assets ./ihar.sh install --microvm
@@ -115,11 +119,12 @@ a floor, and neither the file nor a flag may lower it.
 ihar update
 ```
 
-Install and update are the same operation. Each component compares the version the
-lockfile pins with the one recorded beside it, so bumping the lockfile is what upgrades and
-an unchanged lockfile makes the run a no-op. A vendor upgrade re-runs the conformance suite,
-because the record is keyed by the binary's digest — a new binary has not earned the old
-pass.
+Install and update use the same transaction, and the lockfile remains the immutable source
+of pinned versions. A matching version stamp may skip downloading or reinstalling that
+vendor binary, but every run still validates topology, stages and copies declared assets,
+re-runs conformance, rebuilds the receipt, and activates the staged generation. Bumping a
+pin upgrades the component; an unchanged lockfile does not make the command a no-op. A new
+vendor binary must earn new conformance evidence because the record is keyed by its digest.
 
 ## Requirements
 

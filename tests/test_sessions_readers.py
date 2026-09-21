@@ -4,9 +4,12 @@
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
+from ihar.migration_fingerprint import fingerprint
 from ihar.sessions import claude, codex, index
 
 
@@ -70,6 +73,33 @@ def main():
         assert [row["updated_at"] for row in merged] == sorted(
             [row["updated_at"] for row in merged], reverse=True)
         assert all("content" not in row for row in merged)
+
+        manifest = root / "state.json"
+        manifest.write_text(json.dumps({
+            "schema": 1,
+            "entries": [
+                {"vendor": "codex", "path": "sessions", "kind": "directory"},
+                {"vendor": "codex", "path": "state.sqlite", "kind": "sqlite-family"},
+                {"vendor": "claude", "path": "history.jsonl", "kind": "file"},
+            ],
+        }), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-m", "ihar.inventory", "state", str(manifest), "codex"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert result.stdout == "sessions\tdirectory\nstate.sqlite\tsqlite-family\n"
+
+        fingerprint_root = root / "fingerprint"
+        fingerprint_root.mkdir()
+        (fingerprint_root / "kept").write_text("one", encoding="utf-8")
+        (fingerprint_root / "ignored").write_text("outside scope", encoding="utf-8")
+        before = fingerprint(fingerprint_root, ["kept"])
+        (fingerprint_root / "ignored").write_text("changed", encoding="utf-8")
+        assert fingerprint(fingerprint_root, ["kept"]) == before
+        (fingerprint_root / "kept").write_text("two", encoding="utf-8")
+        assert fingerprint(fingerprint_root, ["kept"]) != before
 
     print("PASS sessions readers and index")
 

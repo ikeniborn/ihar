@@ -8,6 +8,7 @@ fire it, and honour what it decided?
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -15,20 +16,139 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "python"))
 
 from ihar import jsonio                     # noqa: E402
+from ihar.codex import hooks_trust          # noqa: E402
 from ihar.conformance import run as conformance   # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 MANIFEST = os.path.join(ROOT, "manifests", "hooks.json")
+LOCKFILE = os.path.join(ROOT, ".ihar-lockfile.json")
 CODEX = os.environ.get(
     "IHAR_CODEX_BIN",
     "/home/ikeniborn/Documents/Project/icodex/.codex-isolated/bin/codex",
 )
+
+EXPECTED_REQUIRED_CASES = {
+    "claude": {
+        "deny-blocks-the-tool",
+        "rewrite-reaches-the-tool",
+        "session-start-context",
+        "mcp-matcher-fires",
+        "timeout-behaviour",
+        "sandbox-direct-write",
+        "sandbox-child-write",
+        "sandbox-workspace-write",
+    },
+    "codex": {
+        "deny-blocks-the-tool",
+        "rewrite-reaches-the-tool",
+        "session-start-context",
+        "mcp-matcher-fires",
+        "timeout-behaviour",
+        "hook-is-loaded",
+        "trust-is-recordable",
+        "tampering-is-detected",
+    },
+}
 
 
 def _store():
     store = tempfile.mkdtemp(prefix="ihar-conf-store-")
     shutil.copytree(os.path.join(ROOT, "hooks"), os.path.join(store, "hooks"))
     return store
+
+
+def _fake_claude(store):
+    binary = os.path.join(store, "claude")
+    with open(binary, "w", encoding="utf-8") as handle:
+        handle.write(r'''#!/usr/bin/env python3
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print("2.1.274 (Claude Code)")
+    raise SystemExit(0)
+
+home = os.environ["CLAUDE_CONFIG_DIR"]
+with open(os.path.join(home, "settings.json"), encoding="utf-8") as stream:
+    settings = json.load(stream)
+
+
+def run_hooks(event, tool="", tool_input=None):
+    payload = {"hook_event_name": event, "tool_name": tool,
+               "tool_input": tool_input or {}, "session_id": "fake-session"}
+    decisions = []
+    updated = None
+    contexts = []
+    for group in settings["hooks"].get(event, []):
+        matcher = group.get("matcher")
+        if matcher is not None and re.fullmatch(matcher, tool) is None:
+            continue
+        for hook in group["hooks"]:
+            timeout = None if os.environ.get("IHAR_FAKE_IGNORE_TIMEOUT") else hook["timeout"]
+            try:
+                result = subprocess.run(
+                    hook["command"], input=json.dumps(payload), text=True,
+                    capture_output=True, env=os.environ, timeout=timeout,
+                    shell=True, executable="/bin/bash",
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            body = json.loads(result.stdout) if result.stdout.strip() else {}
+            output = body.get("hookSpecificOutput", {})
+            if output.get("permissionDecision"):
+                decisions.append(output["permissionDecision"])
+            if output.get("updatedInput"):
+                updated = output["updatedInput"]
+            if output.get("additionalContext"):
+                contexts.append(output["additionalContext"])
+    return decisions, updated, contexts
+
+
+_, _, contexts = run_hooks("SessionStart")
+prompt = sys.argv[-1]
+if "MCP server's prove tool" in prompt:
+    tool = "mcp__ihar-conformance__prove"
+    decisions, _, _ = run_hooks("PreToolUse", tool, {})
+    if "deny" not in decisions:
+        path = sys.argv[sys.argv.index("--mcp-config") + 1]
+        with open(path, encoding="utf-8") as stream:
+            config = json.load(stream)["mcpServers"]["ihar-conformance"]
+        server = subprocess.Popen(
+            [config["command"], *config["args"]], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, text=True,
+        )
+        for request in (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "prove", "arguments": {}}},
+        ):
+            server.stdin.write(json.dumps(request) + "\n")
+            server.stdin.flush()
+            json.loads(server.stdout.readline())
+        server.stdin.close()
+        server.wait(timeout=5)
+elif "SessionStart hook supplied" in prompt:
+    target = prompt.rsplit(" to ", 1)[1].removesuffix(".")
+    token = next(value for value in contexts if value.startswith("IHAR-CONFORMANCE-"))
+    command = f"printf '%s' {shlex.quote(token)} > {target}"
+    decisions, updated, _ = run_hooks("PreToolUse", "Bash", {"command": command})
+    if "deny" not in decisions:
+        subprocess.run((updated or {"command": command})["command"], shell=True, check=True)
+else:
+    command = prompt.split("tool: ", 1)[1]
+    decisions, updated, _ = run_hooks("PreToolUse", "Bash", {"command": command})
+    if "deny" not in decisions:
+        subprocess.run((updated or {"command": command})["command"], shell=True, check=True)
+print("{}")
+''')
+    os.chmod(binary, 0o755)
+    return binary
 
 
 def test_the_record_validates_as_a_contract():
@@ -38,7 +158,10 @@ def test_the_record_validates_as_a_contract():
         "schema": 1, "vendor": "codex", "version": "0.154.0",
         "binary_sha256": "a" * 64, "manifest_digest": "b" * 64,
         "created_at": "2026-09-18T10:00:00Z",
-        "cases": {"deny-blocks-the-tool": {"status": "passed", "detail": "x"}},
+        "cases": {
+            name: {"status": "passed", "detail": "x"}
+            for name in EXPECTED_REQUIRED_CASES["codex"]
+        },
     }
     jsonio.check("conformance", record)
 
@@ -54,47 +177,363 @@ def test_the_record_validates_as_a_contract():
         raise AssertionError(f"a broken record validated: {broken}")
 
 
-def test_vendor_independent_cases_pass():
-    """The two cases that exercise the script contract rather than the vendor API
-    run for either vendor, so Claude is covered even without a trust listing."""
+def test_records_require_every_vendor_live_case_without_skips():
+    """A partial or skipped live matrix must never unlock an enforced profile."""
+    base = {
+        "schema": 1,
+        "version": "pinned-vendor",
+        "binary_sha256": "a" * 64,
+        "manifest_digest": "b" * 64,
+        "created_at": "2026-09-18T10:00:00Z",
+    }
+    assert conformance.REQUIRED_CASES == EXPECTED_REQUIRED_CASES
+    for vendor, required in EXPECTED_REQUIRED_CASES.items():
+        complete = {
+            **base,
+            "vendor": vendor,
+            "cases": {
+                name: {"status": "passed", "detail": "live vendor evidence"}
+                for name in required
+            },
+        }
+        jsonio.check("conformance", complete)
+
+        missing = {**complete, "cases": dict(complete["cases"])}
+        missing["cases"].pop(next(iter(required)))
+        skipped = {**complete, "cases": dict(complete["cases"])}
+        skipped["cases"][next(iter(required))] = {
+            "status": "skipped",
+            "detail": "not evidence",
+        }
+        for broken in (missing, skipped):
+            try:
+                jsonio.check("conformance", broken)
+            except jsonio.SchemaError:
+                continue
+            raise AssertionError(f"incomplete {vendor} live evidence validated: {broken}")
+
+
+def test_fake_native_vendor_executes_every_mandatory_live_hook_protocol():
     store = _store()
+    binary = _fake_claude(store)
     home = tempfile.mkdtemp(prefix="ihar-conf-home-")
     workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
     try:
-        conformance._stage(store, MANIFEST, "claude", home)
-        for name in ("deny-blocks-the-tool", "rewrite-is-emitted"):
-            status, detail = conformance.CASES[name]("claude", "/bin/false", home, workdir)
-            assert status == "passed", f"{name}: {status} {detail}"
+        conformance._stage(store, MANIFEST, "claude", home, auth_store=store)
+        results = {
+            name: conformance._run_live_case("claude", binary, home, workdir, name)
+            for name in (
+                "deny-blocks-the-tool",
+                "rewrite-reaches-the-tool",
+                "session-start-context",
+                "mcp-matcher-fires",
+                "timeout-behaviour",
+            )
+        }
     finally:
         for directory in (store, home, workdir):
             shutil.rmtree(directory, ignore_errors=True)
+    assert all(status == "passed" for status, _ in results.values()), results
 
 
-def test_a_broken_hook_fails_the_suite():
-    """The suite has to be able to fail. A hook replaced by something that allows
-    everything must not pass the deny case."""
+def test_deny_needs_an_explicit_probe_decision_not_only_an_absent_sentinel():
     store = _store()
+    binary = _fake_claude(store)
     home = tempfile.mkdtemp(prefix="ihar-conf-home-")
     workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
+    real_turn = conformance._vendor_turn
+
+    def incomplete_turn(_vendor, _binary, selected_home, selected_workdir, _prompt, **_kwargs):
+        block, _ = conformance._hook_block(selected_home, "claude")
+        command = next(
+            hook["command"] for group in block["PreToolUse"]
+            for hook in group["hooks"] if "conformance-probe.py" in hook["command"]
+        )
+        marker = shlex.split(command)[4]
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write("invoked\n")
+        return conformance.subprocess.CompletedProcess([_binary], 0, "{}", "")
+
+    import shlex
+    conformance._vendor_turn = incomplete_turn
     try:
-        conformance._stage(store, MANIFEST, "claude", home)
-        script = os.path.join(home, "hooks", "security-pretool.py")
-        with open(script, "w", encoding="utf-8") as handle:
-            handle.write("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
-        status, _ = conformance.CASES["deny-blocks-the-tool"]("claude", "/bin/false", home, workdir)
-        assert status == "failed", "a hook that allows everything passed the deny case"
+        conformance._stage(store, MANIFEST, "claude", home, auth_store=store)
+        status, detail = conformance._run_live_case(
+            "claude", binary, home, workdir, "deny-blocks-the-tool"
+        )
     finally:
+        conformance._vendor_turn = real_turn
         for directory in (store, home, workdir):
             shutil.rmtree(directory, ignore_errors=True)
+    assert status == "failed", detail
+    assert "deny decision" in detail
+
+
+def test_timeout_rejects_a_vendor_that_ignores_the_configured_limit():
+    store = _store()
+    binary = _fake_claude(store)
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
+    os.environ["IHAR_FAKE_IGNORE_TIMEOUT"] = "1"
+    try:
+        conformance._stage(store, MANIFEST, "claude", home, auth_store=store)
+        status, detail = conformance._run_live_case(
+            "claude", binary, home, workdir, "timeout-behaviour"
+        )
+    finally:
+        os.environ.pop("IHAR_FAKE_IGNORE_TIMEOUT", None)
+        for directory in (store, home, workdir):
+            shutil.rmtree(directory, ignore_errors=True)
+    assert status == "failed", detail
+    assert "timeout" in detail.lower()
+
+
+def test_resealing_codex_replaces_only_the_generated_trust_region():
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    config = os.path.join(home, "config.toml")
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write('model = "x"\n')
+        handle.write("# ihar:hook-trust:start\nold trust bytes\n# ihar:hook-trust:end\n")
+        handle.write("[mcp_servers.ihar-conformance]\ncommand = \"python3\"\n")
+
+    real_seal = hooks_trust.seal_quiet
+
+    def fake_seal(_binary, selected_home, _workdir):
+        with open(os.path.join(selected_home, "config.toml"), encoding="utf-8") as handle:
+            content = handle.read()
+        assert "old trust bytes" not in content
+        assert "[mcp_servers.ihar-conformance]" in content
+        return 0, "sealed"
+
+    hooks_trust.seal_quiet = fake_seal
+    try:
+        ready, detail = conformance._prepare_codex_hooks("codex", home, "/repo")
+    finally:
+        hooks_trust.seal_quiet = real_seal
+        shutil.rmtree(home, ignore_errors=True)
+    assert ready, detail
+
+
+def test_vendor_turn_uses_supported_native_cli_and_exact_claude_tool_allowlist():
+    seen = []
+    real_run = conformance.subprocess.run
+
+    def fake_run(argv, **kwargs):
+        seen.append((argv, kwargs))
+        return conformance.subprocess.CompletedProcess(argv, 0, "", "")
+
+    conformance.subprocess.run = fake_run
+    try:
+        conformance._vendor_turn(
+            "claude", "/pinned/claude", "/runtime", "/work", "prompt",
+            allowed_tool="Bash",
+        )
+        conformance._vendor_turn(
+            "codex", "/pinned/codex", "/runtime", "/work", "prompt",
+            allowed_tool="Bash",
+        )
+    finally:
+        conformance.subprocess.run = real_run
+
+    claude_argv, claude_kwargs = seen[0]
+    codex_argv, codex_kwargs = seen[1]
+    assert claude_argv[:2] == ["/pinned/claude", "-p"], claude_argv
+    assert claude_argv[claude_argv.index("--allowedTools") + 1] == "Bash", claude_argv
+    assert claude_kwargs["env"]["CLAUDE_CONFIG_DIR"] == "/runtime"
+    assert codex_argv[:2] == ["/pinned/codex", "exec"], codex_argv
+    assert codex_kwargs["env"]["CODEX_HOME"] == "/runtime"
+
+
+def test_staged_vendor_home_links_the_stable_shared_login():
+    stage = _store()
+    active = tempfile.mkdtemp(prefix="ihar-conf-active-store-")
+    try:
+        for vendor, name in (("claude", ".credentials.json"), ("codex", "auth.json")):
+            source_dir = os.path.join(active, "auth", vendor)
+            os.makedirs(source_dir, exist_ok=True)
+            source = os.path.join(source_dir, name)
+            with open(source, "w", encoding="utf-8") as handle:
+                handle.write("login evidence\n")
+            home = tempfile.mkdtemp(prefix=f"ihar-conf-{vendor}-")
+            try:
+                conformance._stage(stage, MANIFEST, vendor, home, auth_store=active)
+                target = os.path.join(home, name)
+                assert os.path.islink(target), f"{vendor} login was copied or omitted"
+                assert os.path.realpath(target) == os.path.realpath(source)
+                assert not os.path.exists(os.path.join(stage, "auth", vendor, name))
+            finally:
+                shutil.rmtree(home, ignore_errors=True)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(active, ignore_errors=True)
+
+
+def test_run_rejects_a_binary_that_does_not_match_the_release_pin():
+    store = _store()
+    binary = os.path.join(store, "codex")
+    with open(binary, "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\nprintf 'codex-cli 9.9.9\\n'\n")
+    os.chmod(binary, 0o755)
+    try:
+        try:
+            conformance.run(
+                "codex", binary, store, MANIFEST,
+                auth_store=store, lockfile_path=LOCKFILE,
+            )
+        except RuntimeError as error:
+            assert "pinned" in str(error)
+        else:
+            raise AssertionError("an unpinned vendor binary produced conformance evidence")
+    finally:
+        shutil.rmtree(store, ignore_errors=True)
+
+
+def test_claude_run_probes_native_sandbox_writes():
+    store = _store()
+    active_store = tempfile.mkdtemp(prefix="ihar-conf-active-store-")
+    binary = os.path.join(store, "claude")
+    with open(binary, "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\nexit 0\n")
+    os.chmod(binary, 0o755)
+
+    real_run = conformance.subprocess.run
+    seen = {"direct": set(), "child": set(), "workspace": set()}
+    attempted = {"direct": set(), "child": set()}
+    mode = ["protected"]
+    probe_paths = []
+    unsandboxed_targets = []
+
+    def probe_path(invocation, prefix):
+        match = re.search(re.escape(prefix) + r"[0-9a-f]+", invocation)
+        return match.group(0) if match else None
+
+    def fake_protected_write(target):
+        if mode[0] == "unsandboxed":
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write("ihar-conformance\n")
+            unsandboxed_targets.append(target)
+            return 0
+        raise PermissionError(target)
+
+    def fake_vendor(argv, **kwargs):
+        if argv[0] != binary:
+            return real_run(argv, **kwargs)
+        if argv[1:] == ["--version"]:
+            return conformance.subprocess.CompletedProcess(argv, 0, "claude 2.1.274\n", "")
+        if "-p" not in argv:
+            return conformance.subprocess.CompletedProcess(argv, 2, "", "not non-interactive")
+        if mode[0] == "unavailable":
+            return conformance.subprocess.CompletedProcess(argv, 3, "", "sandbox unavailable")
+
+        settings_path = os.path.join(kwargs["env"]["CLAUDE_CONFIG_DIR"], "settings.json")
+        with open(settings_path, "r", encoding="utf-8") as handle:
+            roots = json.load(handle)["sandbox"]["filesystem"]["denyWrite"]
+        invocation = " ".join(argv)
+
+        for kind in ("direct", "child"):
+            for root in roots:
+                target = probe_path(
+                    invocation, os.path.join(root, f".ihar-conformance-{kind}-write-")
+                )
+                if target:
+                    before = probe_path(
+                        invocation,
+                        os.path.join(kwargs["cwd"], f".ihar-conformance-{kind}-before-"),
+                    )
+                    after = probe_path(
+                        invocation,
+                        os.path.join(kwargs["cwd"], f".ihar-conformance-{kind}-after-"),
+                    )
+                    if not before or not after:
+                        return conformance.subprocess.CompletedProcess(
+                            argv, 2, "", "probe has no before/after markers"
+                        )
+                    seen[kind].add(root)
+                    probe_paths.extend((before, target, after))
+                    with open(before, "w", encoding="utf-8") as handle:
+                        handle.write("ihar-conformance\n")
+                    attempted[kind].add(root)
+                    try:
+                        status = fake_protected_write(target)
+                    except PermissionError:
+                        status = 1
+                    with open(after, "w", encoding="utf-8") as handle:
+                        handle.write(f"{status}\n")
+                    return conformance.subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        target = probe_path(
+            invocation, os.path.join(kwargs["cwd"], ".ihar-conformance-workspace-write-")
+        )
+        if target:
+            seen["workspace"].add(target)
+            probe_paths.append(target)
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write("ihar-conformance\n")
+            return conformance.subprocess.CompletedProcess(argv, 0, "{}", "")
+        return conformance.subprocess.CompletedProcess(argv, 2, "", "unknown probe")
+
+    conformance.subprocess.run = fake_vendor
+    try:
+        record = conformance.run(
+            "claude", binary, store, MANIFEST,
+            auth_store=active_store,
+            lockfile_path=LOCKFILE,
+            protected_store=active_store,
+        )
+        protected_paths = tuple(probe_paths)
+        protected_seen = {kind: set(paths) for kind, paths in seen.items()}
+        protected_attempted = {kind: set(paths) for kind, paths in attempted.items()}
+        mode[0] = "unavailable"
+        unavailable_record = conformance.run(
+            "claude", binary, store, MANIFEST,
+            auth_store=active_store, lockfile_path=LOCKFILE,
+        )
+        mode[0] = "unsandboxed"
+        unsandboxed_record = conformance.run(
+            "claude", binary, store, MANIFEST,
+            auth_store=active_store, lockfile_path=LOCKFILE,
+        )
+    finally:
+        conformance.subprocess.run = real_run
+        shutil.rmtree(store, ignore_errors=True)
+        shutil.rmtree(active_store, ignore_errors=True)
+
+    assert record["cases"]["sandbox-direct-write"]["status"] == "passed", record["cases"]
+    assert record["cases"]["sandbox-child-write"]["status"] == "passed", record["cases"]
+    assert record["cases"]["sandbox-workspace-write"]["status"] == "passed", record["cases"]
+    assert len(protected_seen["direct"]) == 3, protected_seen
+    assert len(protected_seen["child"]) == 3, protected_seen
+    assert len(protected_seen["workspace"]) == 1, protected_seen
+    assert protected_attempted["direct"] == protected_seen["direct"], protected_attempted
+    assert protected_attempted["child"] == protected_seen["child"], protected_attempted
+    assert active_store in protected_seen["direct"], protected_seen
+    assert active_store in protected_seen["child"], protected_seen
+    assert store not in protected_seen["direct"], protected_seen
+    assert store not in protected_seen["child"], protected_seen
+    assert len(protected_paths) == len(set(protected_paths)), protected_paths
+    assert not any(os.path.exists(path) for path in protected_paths), protected_paths
+    assert unavailable_record["cases"]["sandbox-direct-write"]["status"] == "failed"
+    assert unsandboxed_record["cases"]["sandbox-direct-write"]["status"] == "failed"
+    assert unsandboxed_targets, "the fake did not exercise an unsandboxed write"
+    assert not any(os.path.exists(path) for path in unsandboxed_targets), unsandboxed_targets
 
 
 def test_the_full_run_against_the_pinned_codex():
     if not os.access(CODEX, os.X_OK):
         print("SKIP: no Codex binary")
         return
+    with open(os.path.join(ROOT, ".ihar-lockfile.json"), encoding="utf-8") as handle:
+        pinned = json.load(handle)["codex"]["version"].removeprefix("rust-v")
+    installed = conformance.vendor_version("codex", CODEX)
+    if installed != f"codex-cli {pinned}":
+        print(f"SKIP: Codex {installed!r} is not pinned codex-cli {pinned}")
+        return
     store = _store()
     try:
-        record = conformance.run("codex", CODEX, store, MANIFEST)
+        record = conformance.run(
+            "codex", CODEX, store, MANIFEST,
+            auth_store=store, lockfile_path=LOCKFILE,
+        )
         jsonio.check("conformance", record)
         failed = {name: case for name, case in record["cases"].items()
                   if case["status"] == "failed"}

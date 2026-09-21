@@ -27,10 +27,22 @@ ihar_lockfile_get() {
   esac
 }
 
-# ihar_store_verify — lockfile drift, hook integrity, binary pins.
+# ihar_store_verify [vendor binary verify-receipt] — lockfile drift, hook integrity,
+# native-binary receipt, and conformance. Exit 3 for an enforced receipt failure;
+# standard warns and returns zero so the vendor may still start. Dry-run passes
+# `false` because it executes neither the native binary nor an adapter that delegates
+# to it; a real ACP launch verifies the native executable selected for that vendor.
 ihar_store_verify() {
+  local vendor="${1:-${IHAR_VENDOR:-}}" binary="${2:-}" verify_receipt="${3:-true}"
   local strict=true
   if [[ "${IHAR_PROFILE:-standard}" == "standard" ]]; then strict=false; fi
+
+  if [[ -z "$binary" && -n "$vendor" ]]; then
+    case "$vendor" in
+      claude) binary="$IHAR_CLAUDE_BIN" ;;
+      codex)  binary="$IHAR_CODEX_BIN" ;;
+    esac
+  fi
 
   if [[ ! -f "$IHAR_LOCKFILE" ]]; then
     # Nothing is pinned yet, so nothing can be verified. Under an enforced profile
@@ -38,6 +50,9 @@ ihar_store_verify() {
     if [[ "$strict" == true ]]; then
       ihar_die 3 "profile '$IHAR_PROFILE' requires pinned components but $IHAR_LOCKFILE is absent
 run 'ihar install' first"
+    fi
+    if [[ "$verify_receipt" == true ]]; then
+      ihar_store_verify_binaries false "$vendor" "$binary"
     fi
     return 0
   fi
@@ -50,7 +65,9 @@ run 'ihar install' first"
   fi
 
   ihar_store_verify_hooks "$strict"
-  ihar_store_verify_binaries "$strict"
+  if [[ "$verify_receipt" == true ]]; then
+    ihar_store_verify_binaries "$strict" "$vendor" "$binary"
+  fi
   ihar_store_verify_conformance "$strict"
 }
 
@@ -106,28 +123,42 @@ run 'ihar install'" ;;
   done
 }
 
-# ihar_store_verify_binaries <strict>
+# ihar_receipt_binary_status <vendor> <binary> — exactly one public receipt state:
+# `verified`, `mismatched`, or `missing receipt`. Malformed and unreadable evidence
+# is missing evidence, never a fourth state callers could accidentally tolerate.
+ihar_receipt_binary_status() {
+  local vendor="$1" binary="$2" raw status=0
+  [[ -f "$IHAR_STORE/install-receipt.json" && -r "$IHAR_STORE/install-receipt.json" ]] \
+    || { printf 'missing receipt\n'; return 0; }
+  raw="$(ihar_python ihar.check_result receipt "$IHAR_STORE/install-receipt.json" \
+    "$IHAR_LOCKFILE" "$vendor" "$binary" 2>/dev/null)" || status=$?
+  if (( status != 0 )); then
+    printf 'missing receipt\n'
+    return 0
+  fi
+  case "$raw" in
+    valid) printf 'verified\n' ;;
+    stale|not-installed) printf 'mismatched\n' ;;
+    missing|invalid|*) printf 'missing receipt\n' ;;
+  esac
+}
+
+# ihar_store_verify_binaries <strict> [vendor binary]
 ihar_store_verify_binaries() {
-  local strict="$1" pinned actual
-
-  pinned="$(ihar_lockfile_get claude.binarySha256)"
-  if [[ -n "$pinned" && -f "$IHAR_CLAUDE_BIN" ]]; then
-    actual="$(sha256sum "$IHAR_CLAUDE_BIN" | cut -c1-64)"
-    if [[ "$actual" != "$pinned" ]]; then
-      if [[ "$strict" == true ]]; then
-        ihar_die 3 "the claude binary differs from the lockfile; profile '$IHAR_PROFILE' requires a pinned binary"
-      fi
-      ihar_warn "the claude binary differs from the lockfile"
-    fi
+  local strict="$1" vendor="${2:-${IHAR_VENDOR:-}}" binary="${3:-}" receipt_status
+  [[ -n "$vendor" ]] || return 0
+  if [[ -z "$binary" ]]; then
+    case "$vendor" in
+      claude) binary="$IHAR_CLAUDE_BIN" ;;
+      codex)  binary="$IHAR_CODEX_BIN" ;;
+    esac
   fi
-
-  pinned="$(ihar_lockfile_get codex.sha256)"
-  if [[ -n "$pinned" && -f "$IHAR_CODEX_BIN" ]]; then
-    # The Codex pin is the release archive's digest, not the extracted binary's, so
-    # it is verified at install. Nothing to compare here yet; recorded so the next
-    # slice that owns install does not mistake the silence for a missing check.
-    :
+  receipt_status="$(ihar_receipt_binary_status "$vendor" "$binary")"
+  [[ "$receipt_status" == verified ]] && return 0
+  if [[ "$strict" == true ]]; then
+    ihar_die 3 "the $vendor executable is $receipt_status in $IHAR_STORE/install-receipt.json; profile '$IHAR_PROFILE' requires verified install receipt evidence"
   fi
+  ihar_warn "the $vendor executable is $receipt_status in the install receipt; continuing under standard"
 }
 
 # ihar_store_verify_acp <vendor> — version and installed-byte pin for ACP exec.

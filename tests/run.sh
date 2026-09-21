@@ -11,6 +11,39 @@ cd "$ROOT" || exit 1
 failed=0
 total=0
 
+inventory="${IHAR_TEST_INVENTORY:-$ROOT/manifests/tests.json}"
+inventory_paths="$(PYTHONPATH="$ROOT/lib/python" python3 - "$inventory" <<'PY'
+import sys
+from ihar import jsonio
+
+try:
+    document = jsonio.read("test-inventory", sys.argv[1])
+except (OSError, jsonio.SchemaError) as error:
+    print(f"test inventory invalid: {error}", file=sys.stderr)
+    raise SystemExit(3)
+print("\n".join(document["paths"]))
+PY
+)" || exit 3
+
+shopt -s nullglob
+discovered=(tests/test_*.sh tests/test_*.py)
+shopt -u nullglob
+
+for file in $inventory_paths; do
+  [[ -f "$file" ]] || { echo "test inventory missing path: $file" >&2; exit 3; }
+  found=false
+  for candidate in "${discovered[@]}"; do
+    [[ "$candidate" == "$file" ]] && { found=true; break; }
+  done
+  [[ "$found" == true ]] \
+    || { echo "test inventory path is not discovered by tests/run.sh: $file" >&2; exit 3; }
+done
+
+for file in "${discovered[@]}"; do
+  grep -qxF "$file" <<<"$inventory_paths" \
+    || { echo "discovered test is absent from closed inventory: $file" >&2; exit 3; }
+done
+
 for file in tests/test_*.sh; do
   [[ -e "$file" ]] || continue
   total=$((total + 1))

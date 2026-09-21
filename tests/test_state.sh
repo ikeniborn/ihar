@@ -8,6 +8,7 @@ ihar_sandbox
 source "$ROOT/lib/core/logging.sh"
 source "$ROOT/lib/core/init.sh"
 source "$ROOT/lib/core/lock.sh"
+source "$ROOT/lib/store/assets.sh"
 source "$ROOT/lib/state/state.sh"
 source "$ROOT/lib/state/links.sh"
 source "$ROOT/lib/state/runtime.sh"
@@ -20,6 +21,13 @@ assert_eq "legacy migration is explicit, never hidden in launch" "1" \
 IHAR_ROOT="$ROOT"; export IHAR_ROOT
 PROJECT="$IHAR_TEST_TMP/My Project"
 mkdir -p "$PROJECT"
+ihar_asset_install "$IHAR_STORE" >/dev/null
+mkdir -p "$IHAR_STORE/auth/claude" "$IHAR_STORE/auth/codex" \
+  "$IHAR_STORE/plugins/claude" "$IHAR_STORE/plugins/codex"
+printf 'claude auth\n' > "$IHAR_STORE/auth/claude/.credentials.json"
+printf 'codex auth\n' > "$IHAR_STORE/auth/codex/auth.json"
+printf 'claude plugin\n' > "$IHAR_STORE/plugins/claude/sentinel"
+printf 'codex plugin\n' > "$IHAR_STORE/plugins/codex/sentinel"
 
 # --- home id ---------------------------------------------------------------------
 
@@ -112,6 +120,171 @@ h4="$(ihar_config_hash protected secrets explicit vendor true aaa bbb 2.1.274)"
 assert_exit "a different masking level yields a different hash" 1 test "$h1" = "$h4"
 h5="$(ihar_config_hash protected standard explicit vendor true aaa bbb 2.1.999)"
 assert_exit "a different vendor version yields a different hash" 1 test "$h1" = "$h5"
+
+ASSET_HASH_ROOT="$IHAR_TEST_TMP/asset-hash-root"
+ASSET_HASH_STORE="$IHAR_TEST_TMP/asset-hash-store"
+ASSET_HASH_STATE="$IHAR_TEST_TMP/asset-hash-state"
+mkdir -p "$ASSET_HASH_ROOT/manifests" "$ASSET_HASH_STORE" \
+  "$ASSET_HASH_STATE/r" "$ASSET_HASH_STATE/st/claude"
+ln -s "$ROOT/lib" "$ASSET_HASH_ROOT/lib"
+cp "$ROOT/manifests/state.json" "$ASSET_HASH_ROOT/manifests/state.json"
+printf '%s\n' '{"schema":1,"entries":[]}' \
+  > "$ASSET_HASH_ROOT/manifests/mutable-links.json"
+cat > "$ASSET_HASH_ROOT/manifests/assets.json" <<'JSON'
+{"schema":1,"entries":[{"vendor":"common","source":"optional/tools","target":"tools","kind":"directory","required":false,"runtime":true}]}
+JSON
+asset_hash_missing="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+asset_runtime_missing="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_missing")"
+assert_exit "an absent optional store source is absent from its generation" 1 \
+  test -e "$asset_runtime_missing/tools"
+
+# Wrong-kind and symlinked optional sources are distinct store topologies, but
+# neither is eligible for linking into a runtime.
+mkdir -p "$ASSET_HASH_STORE/optional"
+printf 'wrong kind\n' > "$ASSET_HASH_STORE/optional/tools"
+asset_hash_wrong_kind="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_exit "an optional wrong-kind store source has a distinct generation" 1 \
+  test "$asset_hash_missing" = "$asset_hash_wrong_kind"
+asset_runtime_wrong_kind="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_wrong_kind")"
+assert_exit "an optional wrong-kind store source is not linked" 1 \
+  test -e "$asset_runtime_wrong_kind/tools"
+
+rm -rf "$ASSET_HASH_STORE/optional"
+mkdir -p "$ASSET_HASH_STORE/outside-optional/tools"
+ln -s "$ASSET_HASH_STORE/outside-optional" "$ASSET_HASH_STORE/optional"
+asset_hash_symlink="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_exit "a symlinked optional store parent has a distinct generation" 1 \
+  test "$asset_hash_wrong_kind" = "$asset_hash_symlink"
+asset_runtime_symlink="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_symlink")"
+assert_exit "an optional source behind a symlinked parent is not linked" 1 \
+  test -e "$asset_runtime_symlink/tools"
+rm "$ASSET_HASH_STORE/optional"
+
+# A repository source appearing before install does not change the actual topology
+# the runtime linker sees. Publishing it into the store does, and must choose a new
+# generation rather than silently reuse the link-less one.
+mkdir -p "$ASSET_HASH_ROOT/optional/tools"
+asset_hash_before_install="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_eq "repository presence alone does not change runtime asset identity" \
+  "$asset_hash_missing" "$asset_hash_before_install"
+IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_asset_install "$ASSET_HASH_STORE" >/dev/null
+asset_hash_present="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_exit "an optional store asset becoming available selects a new generation" 1 \
+  test "$asset_hash_missing" = "$asset_hash_present"
+assert_exit "an optional correct-kind store source differs from wrong kind" 1 \
+  test "$asset_hash_wrong_kind" = "$asset_hash_present"
+assert_exit "an optional correct-kind source differs from symlinked topology" 1 \
+  test "$asset_hash_symlink" = "$asset_hash_present"
+asset_runtime_present="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_present")"
+assert_exit "the optional asset generation is distinct" 1 \
+  test "$asset_runtime_missing" = "$asset_runtime_present"
+assert_eq "the optional asset generation links the installed source" \
+  "$ASSET_HASH_STORE/optional/tools" "$(readlink "$asset_runtime_present/tools")"
+
+python3 - "$ASSET_HASH_ROOT/manifests/assets.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+document = json.load(open(path, encoding="utf-8"))
+document["entries"].append({
+    "vendor": "claude", "source": "required/new.txt", "target": "new.txt",
+    "kind": "file", "required": True, "runtime": True,
+})
+json.dump(document, open(path, "w", encoding="utf-8"))
+PY
+mkdir -p "$ASSET_HASH_ROOT/required"
+printf 'required\n' > "$ASSET_HASH_ROOT/required/new.txt"
+asset_hash_required_absent="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+required_absent_runtime="$IHAR_TEST_TMP/required-absent-runtime"
+mkdir -p "$required_absent_runtime"
+printf 'runtime stays\n' > "$required_absent_runtime/sentinel"
+required_absent_status=0
+(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_link_runtime claude "$required_absent_runtime" "$ASSET_HASH_STATE") \
+  >/dev/null 2>&1 || required_absent_status=$?
+assert_eq "an absent required store source fails closed" "3" "$required_absent_status"
+assert_exit "required absence mutates no earlier optional target" 1 \
+  test -e "$required_absent_runtime/tools"
+assert_eq "required absence preserves existing runtime bytes" "runtime stays" \
+  "$(cat "$required_absent_runtime/sentinel")"
+
+mkdir -p "$ASSET_HASH_STORE/required/new.txt"
+asset_hash_required_wrong="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_exit "a required wrong-kind store source has a distinct generation" 1 \
+  test "$asset_hash_required_absent" = "$asset_hash_required_wrong"
+required_wrong_runtime="$IHAR_TEST_TMP/required-wrong-runtime"
+mkdir -p "$required_wrong_runtime"
+printf 'runtime stays\n' > "$required_wrong_runtime/sentinel"
+required_wrong_status=0
+(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_link_runtime claude "$required_wrong_runtime" "$ASSET_HASH_STATE") \
+  >/dev/null 2>&1 || required_wrong_status=$?
+assert_eq "a wrong-kind required store source fails closed" "3" "$required_wrong_status"
+assert_exit "required wrong kind mutates no earlier optional target" 1 \
+  test -e "$required_wrong_runtime/tools"
+assert_eq "required wrong kind preserves existing runtime bytes" "runtime stays" \
+  "$(cat "$required_wrong_runtime/sentinel")"
+required_wrong_materialise_status=0
+(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" \
+  ihar_runtime_materialise claude "$asset_hash_required_wrong") \
+  >/dev/null 2>&1 || required_wrong_materialise_status=$?
+assert_eq "required wrong kind aborts runtime materialisation" \
+  "3" "$required_wrong_materialise_status"
+assert_exit "required wrong kind creates no runtime generation" 1 \
+  test -e "$ASSET_HASH_STATE/r/$asset_hash_required_wrong"
+assert_eq "required wrong kind creates no runtime staging tree" "0" \
+  "$(find "$ASSET_HASH_STATE/r" -maxdepth 1 -type d -name '.staging-*' | wc -l)"
+
+# Invalid required assets must be rejected before a legacy materialized owner is
+# migrated into canonical state or rewritten as a link.
+required_owner="$ASSET_HASH_STATE/r/legacy-owner/claude"
+mkdir -p "$required_owner"
+printf 'legacy history\n' > "$required_owner/.claude.json"
+required_owner_before="$(sha256sum "$required_owner/.claude.json" | cut -d' ' -f1)"
+required_owner_status=0
+(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" \
+  ihar_runtime_materialise claude "$asset_hash_required_wrong") \
+  >/dev/null 2>&1 || required_owner_status=$?
+assert_eq "required wrong kind rejects before state migration" "3" "$required_owner_status"
+assert_exit "required asset rejection preserves materialized owner kind" 0 \
+  test -f "$required_owner/.claude.json"
+assert_eq "required asset rejection preserves materialized owner bytes" \
+  "$required_owner_before" "$(sha256sum "$required_owner/.claude.json" | cut -d' ' -f1)"
+assert_exit "required asset rejection publishes no canonical history" 1 \
+  test -e "$ASSET_HASH_STATE/st/claude/.claude.json"
+assert_eq "required asset rejection creates no recovery state" "0" \
+  "$(find "$ASSET_HASH_STATE/recovery" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+rm -rf "$required_owner"
+
+rm -rf "$ASSET_HASH_STORE/required/new.txt"
+IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_asset_install "$ASSET_HASH_STORE" >/dev/null
+asset_hash_required_added="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  ihar_config_hash asset identity optional source a b c d)"
+assert_exit "a required runtime asset addition selects a new generation" 1 \
+  test "$asset_hash_present" = "$asset_hash_required_added"
+assert_exit "a required correct-kind store source differs from wrong kind" 1 \
+  test "$asset_hash_required_wrong" = "$asset_hash_required_added"
+assert_exit "a required correct-kind store source differs from absence" 1 \
+  test "$asset_hash_required_absent" = "$asset_hash_required_added"
+asset_runtime_required="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_required_added")"
+assert_eq "the required asset generation links the installed source" \
+  "$ASSET_HASH_STORE/required/new.txt" "$(readlink "$asset_runtime_required/new.txt")"
+
 assert_exit "a wrong input count is a usage error" 2 \
   bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/state/runtime.sh'
            ihar_config_hash one two"
@@ -177,13 +350,391 @@ assert_exit "and leaves vendor-written state writable" 0 test -w "$sealed/logs_2
 
 # --- links -------------------------------------------------------------------------
 
-mkdir -p "$IHAR_STORE/skills" "$IHAR_STORE/hooks"
-rt2="$(ihar_runtime_materialise claude "$(ihar_config_hash a b c d e f g h)" "$RENDER")"
+rt2_hash="$(ihar_config_hash a b c d e f g h)"
+rt2="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER")"
 assert_exit "a present store entry is linked" 0 test -L "$rt2/skills"
 assert_exit "an absent store entry is skipped" 1 test -e "$rt2/router.json"
+assert_eq "Claude auth links to the global store" \
+  "$IHAR_STORE/auth/claude/.credentials.json" "$(readlink "$rt2/.credentials.json")"
+assert_eq "Claude plugins link to the global store" \
+  "$IHAR_STORE/plugins/claude" "$(readlink "$rt2/plugins")"
 assert_exit "vendor state is linked out of the runtime home" 0 test -L "$rt2/projects"
 assert_eq "vendor state resolves into st/" "$STATE/st/claude/projects" \
   "$(readlink "$rt2/projects")"
+
+rm "$rt2/projects"
+rmdir "$STATE/st/claude/projects"
+ln -s "$STATE/st/claude/projects" "$rt2/projects"
+ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null
+assert_exit "runtime reuse creates the source for a correct dangling directory link" 0 \
+  test -d "$STATE/st/claude/projects"
+assert_eq "runtime reuse keeps the correct directory link" \
+  "$STATE/st/claude/projects" "$(readlink "$rt2/projects")"
+mkdir -p "$STATE/st/claude/projects"
+
+# Reusing an already-published runtime verifies rendered files first, then verifies
+# every manifest-derived state link. Missing links are created; unsafe entries are
+# preserved and rejected, so canonical state is never populated from a runtime fork.
+printf 'canonical directory\n' > "$STATE/st/claude/projects/canonical"
+rm "$rt2/projects"
+ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null
+assert_eq "runtime reuse restores a missing state directory link" \
+  "$STATE/st/claude/projects" "$(readlink "$rt2/projects")"
+
+printf 'canonical file\n' > "$STATE/st/claude/history.jsonl"
+WRONG_STATE_TARGET="$IHAR_TEST_TMP/wrong-state-target"
+printf 'wrong target stays intact\n' > "$WRONG_STATE_TARGET"
+ln -sfn "$WRONG_STATE_TARGET" "$rt2/history.jsonl"
+wrong_state_status=0
+wrong_state_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || wrong_state_status=$?
+assert_eq "runtime reuse rejects a wrong state symlink" "3" "$wrong_state_status"
+assert_contains "wrong state link diagnostics give an explicit recovery step" \
+  "$wrong_state_out" "remove or recover the wrong link"
+assert_eq "runtime reuse preserves the wrong state symlink target" \
+  "$WRONG_STATE_TARGET" "$(readlink "$rt2/history.jsonl")"
+assert_eq "rejecting a wrong state link preserves its referent" "wrong target stays intact" \
+  "$(cat "$WRONG_STATE_TARGET")"
+rm -f "$rt2/history.jsonl"
+ln -s "$STATE/st/claude/history.jsonl" "$rt2/history.jsonl"
+
+printf 'canonical dotfile\n' > "$STATE/st/claude/.claude.json"
+rm "$rt2/.claude.json"
+printf 'materialised runtime file\n' > "$rt2/.claude.json"
+materialised_file_before="$(sha256sum "$rt2/.claude.json" | cut -d' ' -f1)"
+materialised_file_status=0
+materialised_file_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || materialised_file_status=$?
+assert_eq "runtime reuse rejects a materialised state file" "3" "$materialised_file_status"
+assert_contains "materialised state diagnostics give an explicit recovery step" \
+  "$materialised_file_out" "move it to a recovery location"
+assert_exit "a rejected materialised state file remains a regular file" 0 \
+  test -f "$rt2/.claude.json"
+assert_exit "a rejected materialised state file is not replaced by a link" 1 \
+  test -L "$rt2/.claude.json"
+assert_eq "a rejected materialised state file stays byte-identical" \
+  "$materialised_file_before" "$(sha256sum "$rt2/.claude.json" 2>/dev/null | cut -d' ' -f1)"
+assert_eq "materialised-file rejection preserves canonical state" "canonical dotfile" \
+  "$(cat "$STATE/st/claude/.claude.json")"
+rm -f "$rt2/.claude.json"
+ln -s "$STATE/st/claude/.claude.json" "$rt2/.claude.json"
+
+printf 'canonical session\n' > "$STATE/st/claude/sessions/canonical"
+rm "$rt2/sessions"
+mkdir "$rt2/sessions"
+printf 'forked runtime state\n' > "$rt2/sessions/forked"
+materialised_dir_status=0
+materialised_dir_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || materialised_dir_status=$?
+assert_eq "runtime reuse rejects a materialised state directory" "3" "$materialised_dir_status"
+assert_contains "materialised directory diagnostics identify the preserved entry" \
+  "$materialised_dir_out" "$rt2/sessions"
+assert_exit "a rejected materialised state directory remains a directory" 0 \
+  test -d "$rt2/sessions"
+assert_exit "a rejected materialised state directory is not replaced by a link" 1 \
+  test -L "$rt2/sessions"
+assert_eq "a rejected materialised state directory stays byte-identical" \
+  "forked runtime state" "$(cat "$rt2/sessions/forked")"
+assert_eq "materialised-directory rejection preserves canonical content" "canonical session" \
+  "$(cat "$STATE/st/claude/sessions/canonical")"
+assert_exit "rejected runtime-fork content never reaches canonical state" 1 \
+  test -e "$STATE/st/claude/sessions/forked"
+rm -rf "$rt2/sessions"
+ln -s "$STATE/st/claude/sessions" "$rt2/sessions"
+
+# Runtime reuse verifies every manifest-derived store link before it reconciles
+# persistent state. Hooks are required security assets: absence, a wrong target, or
+# a materialised copy must abort without repairing either asset or state paths.
+rm "$rt2/hooks" "$rt2/projects"
+missing_hook_status=0
+missing_hook_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || missing_hook_status=$?
+assert_eq "runtime reuse rejects a missing required hooks link" "3" "$missing_hook_status"
+assert_contains "missing required hooks are diagnosed" "$missing_hook_out" \
+  "required runtime asset link is missing"
+assert_exit "a rejected missing hooks link is not repaired" 1 test -e "$rt2/hooks"
+assert_exit "asset rejection happens before state link restoration" 1 test -L "$rt2/projects"
+ln -s "$IHAR_STORE/hooks" "$rt2/hooks"
+ln -s "$STATE/st/claude/projects" "$rt2/projects"
+
+# Mutable auth and plugin links preserve one machine-global owner across runtime
+# reuse and profile changes. Missing links are repaired, but existing runtime data
+# is never replaced because it may be the only copy from an older layout.
+rm "$rt2/.credentials.json"
+ihar_runtime_materialise claude "$rt2_hash" "$RENDER" >/dev/null
+assert_eq "runtime reuse restores a missing mutable auth link" \
+  "$IHAR_STORE/auth/claude/.credentials.json" "$(readlink "$rt2/.credentials.json")"
+
+rm "$rt2/.credentials.json"
+printf 'runtime-only auth\n' > "$rt2/.credentials.json"
+mutable_auth_status=0
+mutable_auth_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || mutable_auth_status=$?
+assert_eq "runtime reuse rejects materialised mutable auth" "3" "$mutable_auth_status"
+assert_contains "materialised mutable auth gives a recovery instruction" \
+  "$mutable_auth_out" "move it to a recovery location"
+assert_eq "materialised mutable auth is preserved" "runtime-only auth" \
+  "$(cat "$rt2/.credentials.json")"
+assert_eq "canonical mutable auth is preserved" "claude auth" \
+  "$(cat "$IHAR_STORE/auth/claude/.credentials.json")"
+rm "$rt2/.credentials.json"
+ln -s "$IHAR_STORE/auth/claude/.credentials.json" "$rt2/.credentials.json"
+
+profile_runtime="$(ihar_runtime_materialise claude \
+  "$(ihar_config_hash mutable links cross profile a b c d)" "$RENDER")"
+assert_eq "another profile shares the same mutable auth owner" \
+  "$IHAR_STORE/auth/claude/.credentials.json" \
+  "$(readlink "$profile_runtime/.credentials.json")"
+assert_eq "another profile shares the same plugin owner" \
+  "$IHAR_STORE/plugins/claude" "$(readlink "$profile_runtime/plugins")"
+assert_eq "auth written through one profile reaches the other" "profile update" \
+  "$(printf 'profile update\n' > "$rt2/.credentials.json"; cat "$profile_runtime/.credentials.json")"
+
+codex_mutable_runtime="$(ihar_runtime_materialise codex \
+  "$(ihar_config_hash mutable links codex inventory a b c d)" "$RENDER")"
+assert_eq "Codex auth links to the global store" "$IHAR_STORE/auth/codex/auth.json" \
+  "$(readlink "$codex_mutable_runtime/auth.json")"
+assert_eq "Codex plugins link to the global store" "$IHAR_STORE/plugins/codex" \
+  "$(readlink "$codex_mutable_runtime/plugins")"
+
+INVALID_MUTABLE_ROOT="$IHAR_TEST_TMP/invalid-mutable-root"
+INVALID_MUTABLE_RUNTIME="$IHAR_TEST_TMP/invalid-mutable-runtime"
+mkdir -p "$INVALID_MUTABLE_ROOT/manifests" "$INVALID_MUTABLE_RUNTIME"
+ln -s "$ROOT/lib" "$INVALID_MUTABLE_ROOT/lib"
+cp "$ROOT/manifests/assets.json" "$INVALID_MUTABLE_ROOT/manifests/assets.json"
+cp "$ROOT/manifests/state.json" "$INVALID_MUTABLE_ROOT/manifests/state.json"
+printf 'not valid JSON\n' > "$INVALID_MUTABLE_ROOT/manifests/mutable-links.json"
+printf 'runtime auth stays\n' > "$INVALID_MUTABLE_RUNTIME/auth.json"
+invalid_mutable_status=0
+invalid_mutable_out="$(IHAR_ROOT="$INVALID_MUTABLE_ROOT" \
+  ihar_link_runtime codex "$INVALID_MUTABLE_RUNTIME" "$STATE" 2>&1)" \
+  || invalid_mutable_status=$?
+assert_eq "an invalid mutable inventory aborts linking" "3" "$invalid_mutable_status"
+assert_contains "an invalid mutable inventory is diagnosed" "$invalid_mutable_out" \
+  "cannot read mutable-link inventory"
+assert_eq "an invalid mutable inventory preserves runtime auth" "runtime auth stays" \
+  "$(cat "$INVALID_MUTABLE_RUNTIME/auth.json")"
+
+runtime_mutable_tree_fingerprint() { # <root>
+  local root="$1"
+  {
+    find "$root" -mindepth 1 -printf '%P\t%y\t%m\t%l\n' | sort
+    find "$root" -type f -print0 | sort -z | xargs -0 -r sha256sum
+  } | sha256sum | cut -d' ' -f1
+}
+
+write_noncanonical_runtime_manifest() { # <path> <case>
+  local path="$1" case_name="$2"
+  case "$case_name" in
+    auth-dot)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/.","target":".credentials.json","kind":"file"}]}' > "$path"
+      ;;
+    duplicate-plugin-target)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/one","target":"plugins","kind":"file"},{"vendor":"claude","source":"auth/claude/two","target":"plugins/.","kind":"file"}]}' > "$path"
+      ;;
+    repeated-separator)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth//claude/.credentials.json","target":".credentials.json","kind":"file"}]}' > "$path"
+      ;;
+    trailing-separator)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/.credentials.json","target":"plugins/","kind":"file"}]}' > "$path"
+      ;;
+  esac
+}
+
+assert_runtime_rejects_noncanonical_mutable_path() { # <case>
+  local case_name="$1" case_root store runtime state store_before runtime_before status=0
+  case_root="$IHAR_TEST_TMP/runtime-mutable-path-$case_name"
+  store="$case_root/store"
+  runtime="$case_root/runtime"
+  state="$case_root/state"
+  mkdir -p "$case_root/root/manifests" "$store" "$runtime" "$state"
+  ln -s "$ROOT/lib" "$case_root/root/lib"
+  cp "$ROOT/manifests/assets.json" "$case_root/root/manifests/assets.json"
+  cp "$ROOT/manifests/state.json" "$case_root/root/manifests/state.json"
+  write_noncanonical_runtime_manifest \
+    "$case_root/root/manifests/mutable-links.json" "$case_name"
+  ihar_asset_install "$store" >/dev/null
+  printf 'store stays\n' > "$store/sentinel"
+  printf 'runtime stays\n' > "$runtime/sentinel"
+
+  store_before="$(runtime_mutable_tree_fingerprint "$store")"
+  runtime_before="$(runtime_mutable_tree_fingerprint "$runtime")"
+  (IHAR_ROOT="$case_root/root" IHAR_STORE="$store" \
+    ihar_link_runtime claude "$runtime" "$state") >/dev/null 2>&1 || status=$?
+  assert_eq "$case_name mutable path aborts runtime linking" "3" "$status"
+  assert_eq "$case_name mutable path leaves the store unchanged" \
+    "$store_before" "$(runtime_mutable_tree_fingerprint "$store")"
+  assert_eq "$case_name mutable path leaves the runtime unchanged" \
+    "$runtime_before" "$(runtime_mutable_tree_fingerprint "$runtime")"
+}
+
+for case_name in auth-dot duplicate-plugin-target repeated-separator trailing-separator; do
+  assert_runtime_rejects_noncanonical_mutable_path "$case_name"
+done
+
+assert_runtime_rejects_invalid_mutable_source() { # <topology>
+  local topology="$1" case_root store outside runtime state outside_before status=0
+  case_root="$IHAR_TEST_TMP/runtime-mutable-$topology"
+  store="$case_root/store"
+  outside="$case_root/outside"
+  runtime="$case_root/runtime"
+  state="$case_root/state"
+  mkdir -p "$store" "$outside" "$runtime" "$state"
+  ihar_asset_install "$store" >/dev/null
+  printf 'outside stays\n' > "$outside/sentinel"
+
+  case "$topology" in
+    auth-parent-symlink)
+      ln -s "$outside" "$store/auth"
+      ;;
+    auth-leaf-symlink)
+      mkdir -p "$store/auth/claude"
+      ln -s "$outside/sentinel" "$store/auth/claude/.credentials.json"
+      ;;
+    credentials-directory)
+      mkdir -p "$store/auth/claude/.credentials.json"
+      ;;
+    plugin-file)
+      mkdir -p "$store/plugins"
+      printf 'plugin file stays\n' > "$store/plugins/claude"
+      ;;
+  esac
+
+  outside_before="$(runtime_mutable_tree_fingerprint "$outside")"
+  (IHAR_STORE="$store" ihar_link_runtime claude "$runtime" "$state") \
+    >/dev/null 2>&1 || status=$?
+  assert_eq "$topology mutable source aborts runtime linking" "3" "$status"
+  assert_eq "$topology failure creates no runtime link" "0" \
+    "$(find "$runtime" -mindepth 1 | wc -l)"
+  assert_eq "$topology runtime failure leaves outside unchanged" \
+    "$outside_before" "$(runtime_mutable_tree_fingerprint "$outside")"
+}
+
+for topology in auth-parent-symlink auth-leaf-symlink credentials-directory plugin-file; do
+  assert_runtime_rejects_invalid_mutable_source "$topology"
+done
+
+EXPECTED_RUNTIME_ASSETS="$(cat <<'ASSETS'
+claude	hooks	hooks	directory	true
+claude	skills	skills	directory	true
+claude	manifests/config/claude/CLAUDE.md	CLAUDE.md	file	true
+claude	manifests/config/claude/commands	commands	directory	false
+claude	manifests/config/claude/agents	agents	directory	false
+claude	manifests/config/claude/scripts	scripts	directory	false
+codex	hooks	hooks	directory	true
+codex	skills	skills	directory	true
+codex	manifests/config/codex/AGENTS.md	AGENTS.md	file	true
+codex	manifests/config/codex/rules	rules	directory	false
+codex	manifests/config/codex/agents	agents	directory	false
+codex	manifests/config/codex/profiles	profiles	directory	false
+ASSETS
+)"
+
+# The mutation matrix is a reviewed expectation, not output from the production
+# inventory query. Direct JSON comparison makes a manifest addition fail until its
+# reuse-tampering cases are added here.
+manifest_runtime_assets="$(python3 - "$ROOT/manifests/assets.json" <<'PY'
+import json, sys
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+for entry in document["entries"]:
+    if not entry["runtime"]:
+        continue
+    vendors = ("claude", "codex") if entry["vendor"] == "common" else (entry["vendor"],)
+    for vendor in vendors:
+        print("\t".join((vendor, entry["source"], entry["target"], entry["kind"],
+                         str(entry["required"]).lower())))
+PY
+)"
+assert_eq "the independent reuse matrix covers every runtime asset" \
+  "$(sort <<< "$EXPECTED_RUNTIME_ASSETS")" "$(sort <<< "$manifest_runtime_assets")"
+
+asset_codex_hash="$(ihar_config_hash asset reuse codex matrix a b c d)"
+asset_codex_runtime="$(ihar_runtime_materialise codex "$asset_codex_hash" "$RENDER")"
+WRONG_STORE_TARGET="$IHAR_TEST_TMP/wrong-store-target"
+mkdir -p "$WRONG_STORE_TARGET"
+printf 'store target stays intact\n' > "$WRONG_STORE_TARGET/sentinel"
+
+while IFS=$'\t' read -r asset_vendor asset_source asset_target asset_kind asset_required; do
+  [[ -n "$asset_vendor" ]] || continue
+  if [[ "$asset_vendor" == claude ]]; then
+    asset_runtime="$rt2"
+    asset_hash="$rt2_hash"
+  else
+    asset_runtime="$asset_codex_runtime"
+    asset_hash="$asset_codex_hash"
+  fi
+  asset_source_path="$IHAR_STORE/$asset_source"
+  asset_target_path="$asset_runtime/$asset_target"
+
+  if [[ "$asset_required" == false ]]; then
+    case "$asset_kind" in
+      directory) mkdir -p "$asset_source_path" ;;
+      file) mkdir -p "$(dirname "$asset_source_path")"; : > "$asset_source_path" ;;
+    esac
+    assert_exit "$asset_vendor optional $asset_target may be absent on reuse" 0 \
+      ihar_runtime_materialise "$asset_vendor" "$asset_hash" "$RENDER"
+  fi
+
+  rm -rf -- "$asset_target_path"
+  ln -s "$WRONG_STORE_TARGET" "$asset_target_path"
+  wrong_asset_status=0
+  wrong_asset_out="$(ihar_runtime_materialise "$asset_vendor" "$asset_hash" "$RENDER" 2>&1)" \
+    || wrong_asset_status=$?
+  assert_eq "$asset_vendor $asset_target wrong runtime asset link is rejected" \
+    "3" "$wrong_asset_status"
+  assert_contains "$asset_vendor $asset_target wrong-link diagnostic identifies target" \
+    "$wrong_asset_out" "$asset_target_path"
+  assert_eq "$asset_vendor $asset_target wrong link is preserved" \
+    "$WRONG_STORE_TARGET" "$(readlink "$asset_target_path")"
+  assert_eq "$asset_vendor $asset_target wrong-link referent is preserved" \
+    "store target stays intact" "$(cat "$WRONG_STORE_TARGET/sentinel")"
+
+  rm "$asset_target_path"
+  materialised_asset_text="materialised $asset_vendor $asset_target stays intact"
+  if [[ "$asset_kind" == directory ]]; then
+    mkdir "$asset_target_path"
+    materialised_asset_sentinel="$asset_target_path/sentinel"
+  else
+    materialised_asset_sentinel="$asset_target_path"
+  fi
+  printf '%s\n' "$materialised_asset_text" > "$materialised_asset_sentinel"
+  materialised_asset_status=0
+  materialised_asset_out="$(ihar_runtime_materialise "$asset_vendor" "$asset_hash" "$RENDER" 2>&1)" \
+    || materialised_asset_status=$?
+  assert_eq "$asset_vendor $asset_target materialised runtime asset is rejected" \
+    "3" "$materialised_asset_status"
+  assert_contains "$asset_vendor $asset_target materialised diagnostic identifies target" \
+    "$materialised_asset_out" "$asset_target_path"
+  assert_exit "$asset_vendor $asset_target materialised entry is not replaced" \
+    1 test -L "$asset_target_path"
+  assert_eq "$asset_vendor $asset_target materialised bytes are preserved" \
+    "$materialised_asset_text" "$(cat "$materialised_asset_sentinel")"
+
+  rm -rf -- "$asset_target_path"
+  ln -s "$asset_source_path" "$asset_target_path"
+done <<< "$EXPECTED_RUNTIME_ASSETS"
+
+mv "$IHAR_STORE/hooks" "$IHAR_STORE/hooks.saved"
+missing_hook_source_status=0
+missing_hook_source_out="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER" 2>&1)" \
+  || missing_hook_source_status=$?
+assert_eq "runtime reuse rejects a missing required hooks source" \
+  "3" "$missing_hook_source_status"
+assert_contains "missing required hooks source is diagnosed" \
+  "$missing_hook_source_out" "required runtime asset is missing from the store"
+assert_eq "a dangling required hooks link is preserved" \
+  "$IHAR_STORE/hooks" "$(readlink "$rt2/hooks")"
+mv "$IHAR_STORE/hooks.saved" "$IHAR_STORE/hooks"
+
+while IFS=$'\t' read -r asset_vendor asset_source asset_target asset_kind asset_required; do
+  [[ "$asset_required" == false ]] || continue
+  if [[ "$asset_vendor" == claude ]]; then
+    asset_runtime="$rt2"
+  else
+    asset_runtime="$asset_codex_runtime"
+  fi
+  rm -rf -- "$asset_runtime/$asset_target" "$IHAR_STORE/$asset_source"
+done <<< "$EXPECTED_RUNTIME_ASSETS"
 
 # A materialised copy where a link belongs means the entry stopped following the
 # store; the repair replaces it.
@@ -194,6 +745,180 @@ assert_exit "a materialised copy is replaced by a link" 0 test -L "$rt2/skills"
 ln -sfn /nowhere "$rt2/hooks"
 ihar_link_runtime claude "$rt2" "$STATE" 2>/dev/null
 assert_eq "a wrong link is repointed" "$IHAR_STORE/hooks" "$(readlink "$rt2/hooks")"
+
+# Runtime links are a projection of the installed tracked-asset inventory: every
+# runtime entry must be present, while a store pathname absent from that inventory
+# is never linked merely because it happens to exist.
+mkdir -p "$IHAR_STORE/undeclared"
+printf 'not portable\n' > "$IHAR_STORE/undeclared/data"
+rt_assets="$(ihar_runtime_materialise codex "$(ihar_config_hash asset inventory runtime links a b c d)" "$RENDER")"
+while IFS=$'\t' read -r asset_vendor asset_source asset_target asset_kind asset_required; do
+  [[ "$asset_vendor" == codex ]] || continue
+  [[ -e "$IHAR_STORE/$asset_source" ]] || continue
+  assert_exit "runtime asset $asset_target is linked" 0 test -L "$rt_assets/$asset_target"
+done <<< "$EXPECTED_RUNTIME_ASSETS"
+assert_exit "an undeclared store entry is never linked" 1 test -e "$rt_assets/undeclared"
+
+# The complete asset inventory is read and validated before the linker touches a
+# runtime target. A malformed manifest must therefore preserve an existing target
+# byte-for-byte instead of silently falling through to state linking.
+INVALID_ASSET_ROOT="$IHAR_TEST_TMP/invalid-asset-root"
+INVALID_ASSET_RUNTIME="$IHAR_TEST_TMP/invalid-asset-runtime"
+INVALID_ASSET_STATE="$IHAR_TEST_TMP/invalid-asset-state"
+mkdir -p "$INVALID_ASSET_ROOT/manifests" "$INVALID_ASSET_RUNTIME/hooks" "$INVALID_ASSET_STATE"
+ln -s "$ROOT/lib" "$INVALID_ASSET_ROOT/lib"
+printf 'not valid JSON\n' > "$INVALID_ASSET_ROOT/manifests/assets.json"
+printf '{"schema":1,"entries":[]}\n' > "$INVALID_ASSET_ROOT/manifests/state.json"
+printf 'runtime target must remain\n' > "$INVALID_ASSET_RUNTIME/hooks/sentinel"
+invalid_asset_fingerprint="$(find "$INVALID_ASSET_RUNTIME" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+invalid_asset_status=0
+invalid_asset_out="$(IHAR_ROOT="$INVALID_ASSET_ROOT" ihar_link_runtime claude "$INVALID_ASSET_RUNTIME" "$INVALID_ASSET_STATE" 2>&1)" \
+  || invalid_asset_status=$?
+assert_eq "an invalid asset inventory aborts linking" "3" "$invalid_asset_status"
+assert_contains "an invalid asset inventory is diagnosed" "$invalid_asset_out" \
+  "cannot read tracked asset inventory"
+assert_eq "an invalid asset inventory leaves runtime targets unchanged" \
+  "$invalid_asset_fingerprint" \
+  "$(find "$INVALID_ASSET_RUNTIME" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+
+# Both runtime linking and migration consume one validated inventory. This fixture
+# is intentionally outside the repository so adding an entry proves neither path
+# depends on a second hard-coded Bash list.
+MANIFEST_PARENT="$IHAR_TEST_TMP/manifest-parent"
+MANIFEST_ROOT="$MANIFEST_PARENT/ihar"
+MANIFEST_PROJECT="$IHAR_TEST_TMP/manifest-project"
+MANIFEST_HASH="$(printf '%s' "$MANIFEST_PROJECT" | sha256sum | cut -c1-12)"
+MANIFEST_LEGACY="$MANIFEST_PARENT/icodex/.codex-homes/fixture-$MANIFEST_HASH"
+MANIFEST_LINK_STATE="$IHAR_TEST_TMP/manifest-link-state"
+MANIFEST_MIGRATE_STATE="$IHAR_TEST_TMP/manifest-migrate-state"
+MANIFEST_RUNTIME="$IHAR_TEST_TMP/manifest-runtime"
+mkdir -p "$MANIFEST_ROOT/manifests" "$MANIFEST_LEGACY/data" \
+  "$MANIFEST_LINK_STATE/st/codex" "$MANIFEST_MIGRATE_STATE/st/codex" \
+  "$MANIFEST_LINK_STATE/r" "$MANIFEST_RUNTIME" "$MANIFEST_PROJECT"
+ln -s "$ROOT/lib" "$MANIFEST_ROOT/lib"
+cat > "$MANIFEST_ROOT/manifests/state.json" <<'JSON'
+{
+  "schema": 1,
+  "entries": [
+    {"vendor":"codex","path":"data","kind":"directory"},
+    {"vendor":"codex","path":"future.jsonl","kind":"file"},
+    {"vendor":"codex","path":"state.sqlite","kind":"sqlite-family"}
+  ]
+}
+JSON
+printf '{"schema":1,"entries":[]}\n' > "$MANIFEST_ROOT/manifests/assets.json"
+printf '{"schema":1,"entries":[]}\n' > "$MANIFEST_ROOT/manifests/mutable-links.json"
+printf 'db\n' > "$MANIFEST_LEGACY/state.sqlite"
+printf 'wal\n' > "$MANIFEST_LEGACY/state.sqlite-wal"
+printf 'shm\n' > "$MANIFEST_LEGACY/state.sqlite-shm"
+printf 'nested\n' > "$MANIFEST_LEGACY/data/record"
+
+SAVED_IHAR_ROOT="$IHAR_ROOT"
+IHAR_ROOT="$MANIFEST_ROOT"
+state_inventory() { ihar_state_inventory "$1"; }
+migration_inventory() { ihar_migration_inventory "$1"; }
+assert_exit "link inventory query succeeds" 0 ihar_state_inventory codex
+assert_exit "migration inventory query succeeds" 0 ihar_migration_inventory codex
+assert_eq "linker and migration read the same entries" \
+  "$(state_inventory codex)" "$(migration_inventory codex)"
+ihar_link_runtime codex "$MANIFEST_RUNTIME" "$MANIFEST_LINK_STATE" 2>/dev/null
+assert_exit "a declared directory is linked" 0 test -L "$MANIFEST_RUNTIME/data"
+assert_exit "a declared directory source is created" 0 \
+  test -d "$MANIFEST_LINK_STATE/st/codex/data"
+assert_exit "a declared absent file gets a dangling link" 0 test -L "$MANIFEST_RUNTIME/future.jsonl"
+assert_exit "a SQLite base is linked" 0 test -L "$MANIFEST_RUNTIME/state.sqlite"
+assert_exit "a SQLite WAL is linked" 0 test -L "$MANIFEST_RUNTIME/state.sqlite-wal"
+assert_exit "a SQLite SHM is linked" 0 test -L "$MANIFEST_RUNTIME/state.sqlite-shm"
+
+SAVED_IHAR_STATE="$IHAR_STATE"
+SAVED_IHAR_RUNTIME="${IHAR_RUNTIME:-}"
+IHAR_STATE="$MANIFEST_LINK_STATE"
+manifest_runtime_hash="$(ihar_config_hash manifest reuse state links a b c d)"
+ihar_runtime_materialise codex "$manifest_runtime_hash" "$RENDER" >/dev/null
+MANIFEST_REUSE_RUNTIME="$IHAR_RUNTIME"
+rm "$MANIFEST_REUSE_RUNTIME/state.sqlite-wal"
+ihar_runtime_materialise codex "$manifest_runtime_hash" "$RENDER" >/dev/null
+assert_eq "runtime reuse restores a missing SQLite WAL link" \
+  "$MANIFEST_LINK_STATE/st/codex/state.sqlite-wal" \
+  "$(readlink "$MANIFEST_REUSE_RUNTIME/state.sqlite-wal")"
+
+ihar_migrate_vendor codex "$MANIFEST_MIGRATE_STATE" "$MANIFEST_PROJECT" >/dev/null
+assert_exit "migration copies a manifest directory" 0 \
+  test -f "$MANIFEST_MIGRATE_STATE/st/codex/data/record"
+assert_exit "migration copies a SQLite base" 0 \
+  test -f "$MANIFEST_MIGRATE_STATE/st/codex/state.sqlite"
+assert_exit "migration keeps the SQLite WAL" 0 \
+  test -f "$MANIFEST_MIGRATE_STATE/st/codex/state.sqlite-wal"
+assert_exit "migration keeps the SQLite SHM" 0 \
+  test -f "$MANIFEST_MIGRATE_STATE/st/codex/state.sqlite-shm"
+
+python3 - "$MANIFEST_ROOT/manifests/state.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+manifest = json.load(open(path, encoding="utf-8"))
+manifest["entries"].append({"vendor": "codex", "path": "added.jsonl", "kind": "file"})
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle)
+PY
+printf 'added\n' > "$MANIFEST_LEGACY/added.jsonl"
+manifest_runtime_hash_added="$(ihar_config_hash manifest reuse state links a b c d)"
+assert_exit "a state-manifest change selects a new runtime generation" 1 \
+  test "$manifest_runtime_hash" = "$manifest_runtime_hash_added"
+MANIFEST_LINK_STATE_ADDED="$IHAR_TEST_TMP/manifest-link-state-added"
+MANIFEST_MIGRATE_STATE_ADDED="$IHAR_TEST_TMP/manifest-migrate-state-added"
+MANIFEST_RUNTIME_ADDED="$IHAR_TEST_TMP/manifest-runtime-added"
+mkdir -p "$MANIFEST_LINK_STATE_ADDED/st/codex" \
+  "$MANIFEST_MIGRATE_STATE_ADDED/st/codex" "$MANIFEST_RUNTIME_ADDED"
+assert_eq "manifest additions reach linker and migration without Bash array edits" \
+  "$(state_inventory codex)" "$(migration_inventory codex)"
+ihar_runtime_materialise codex "$manifest_runtime_hash_added" "$RENDER" >/dev/null
+MANIFEST_REUSE_RUNTIME_ADDED="$IHAR_RUNTIME"
+assert_exit "an incompatible state inventory does not reuse the old runtime" 1 \
+  test "$MANIFEST_REUSE_RUNTIME" = "$MANIFEST_REUSE_RUNTIME_ADDED"
+assert_eq "the new runtime generation links the added entry" \
+  "$MANIFEST_LINK_STATE/st/codex/added.jsonl" \
+  "$(readlink "$MANIFEST_REUSE_RUNTIME_ADDED/added.jsonl")"
+ihar_link_runtime codex "$MANIFEST_RUNTIME_ADDED" "$MANIFEST_LINK_STATE_ADDED" 2>/dev/null
+assert_exit "the added file is linked" 0 test -L "$MANIFEST_RUNTIME_ADDED/added.jsonl"
+ihar_migrate_vendor codex "$MANIFEST_MIGRATE_STATE_ADDED" "$MANIFEST_PROJECT" >/dev/null
+assert_exit "the added file is migrated" 0 \
+  test -f "$MANIFEST_MIGRATE_STATE_ADDED/st/codex/added.jsonl"
+
+# A pre-manifest runtime may own vendor state as real files/directories. Creating a
+# generation keyed by the current manifest migrates exactly one old owner, keeps a
+# private recovery copy, and links both old and new runtimes to canonical st/.
+UPGRADE_STATE="$IHAR_TEST_TMP/runtime-upgrade-state"
+UPGRADE_OLD="$UPGRADE_STATE/r/11111111/codex"
+mkdir -p "$UPGRADE_STATE/st/codex" "$UPGRADE_OLD/data"
+printf 'old runtime record\n' > "$UPGRADE_OLD/data/record"
+printf 'old runtime db\n' > "$UPGRADE_OLD/state.sqlite"
+printf 'old runtime wal\n' > "$UPGRADE_OLD/state.sqlite-wal"
+printf 'old runtime shm\n' > "$UPGRADE_OLD/state.sqlite-shm"
+IHAR_STATE="$UPGRADE_STATE"
+upgrade_hash="$(ihar_config_hash runtime upgrade manifest identity a b c d)"
+ihar_runtime_materialise codex "$upgrade_hash" "$RENDER" >/dev/null
+UPGRADE_NEW="$IHAR_RUNTIME"
+assert_eq "runtime upgrade publishes materialized directory state" "old runtime record" \
+  "$(cat "$UPGRADE_STATE/st/codex/data/record")"
+assert_eq "runtime upgrade publishes the SQLite WAL" "old runtime wal" \
+  "$(cat "$UPGRADE_STATE/st/codex/state.sqlite-wal")"
+assert_eq "runtime upgrade replaces the old directory with a canonical link" \
+  "$UPGRADE_STATE/st/codex/data" "$(readlink "$UPGRADE_OLD/data")"
+assert_eq "the new runtime links the migrated directory" \
+  "$UPGRADE_STATE/st/codex/data" "$(readlink "$UPGRADE_NEW/data")"
+upgrade_recovery="$(find "$UPGRADE_STATE/recovery/runtime-state/codex" \
+  -mindepth 1 -maxdepth 1 -type d -name '11111111-*' -print -quit)"
+assert_eq "runtime upgrade preserves the original recovery bytes" "old runtime record" \
+  "$(cat "$upgrade_recovery/data/record")"
+recovery_count_before="$(find "$UPGRADE_STATE/recovery/runtime-state/codex" \
+  -mindepth 1 -maxdepth 1 -type d | wc -l)"
+ihar_runtime_materialise codex "$upgrade_hash" "$RENDER" >/dev/null
+assert_eq "runtime upgrade is idempotent" "$recovery_count_before" \
+  "$(find "$UPGRADE_STATE/recovery/runtime-state/codex" \
+    -mindepth 1 -maxdepth 1 -type d | wc -l)"
+IHAR_STATE="$SAVED_IHAR_STATE"
+IHAR_RUNTIME="$SAVED_IHAR_RUNTIME"
+IHAR_ROOT="$SAVED_IHAR_ROOT"
 
 # --- migration from a legacy home ----------------------------------------------------
 
@@ -209,6 +934,7 @@ ln -s /etc/passwd "$LEGACY/.credentials.json"
 IHAR_ROOT="$IHAR_TEST_TMP/parent/ihar"
 mkdir -p "$IHAR_ROOT"
 ln -sfn "$ROOT/lib" "$IHAR_ROOT/lib"
+ln -sfn "$ROOT/manifests" "$IHAR_ROOT/manifests"
 FRESH="$IHAR_TEST_TMP/fresh-state"
 mkdir -p "$FRESH/st/claude"
 ihar_migrate_vendor claude "$FRESH" "$PROJECT" >/dev/null
@@ -372,8 +1098,12 @@ ln -s /etc/passwd "$CLI_CLAUDE/projects/nested-link"
 mkfifo "$CLI_CLAUDE/projects/nested-fifo"
 printf 'codex-history\n' > "$CLI_CODEX/state_5.sqlite"
 printf 'codex-wal\n' > "$CLI_CODEX/state_5.sqlite-wal"
-printf 'thread-history\n' > "$CLI_CODEX/thread_history_1.sqlite"
-printf 'thread-wal\n' > "$CLI_CODEX/thread_history_1.sqlite-wal"
+printf 'codex-shm\n' > "$CLI_CODEX/state_5.sqlite-shm"
+for family in goals_1.sqlite memories_1.sqlite logs_2.sqlite; do
+  printf '%s\n' "$family" > "$CLI_CODEX/$family"
+  printf '%s wal\n' "$family" > "$CLI_CODEX/$family-wal"
+  printf '%s shm\n' "$family" > "$CLI_CODEX/$family-shm"
+done
 printf '{"schema":1,"project_root":"%s","created":"2026-01-01T00:00:00Z"}\n' \
   "$CLI_PROJECT" > "$CLI_CLAUDE/home.json"
 
@@ -402,8 +1132,16 @@ assert_exit "homes migrate copies Codex state" 0 \
   test -f "$CLI_STATE/st/codex/state_5.sqlite"
 assert_exit "homes migrate copies the Codex WAL with its database" 0 \
   test -f "$CLI_STATE/st/codex/state_5.sqlite-wal"
-assert_exit "homes migrate copies the thread-history WAL with its database" 0 \
-  test -f "$CLI_STATE/st/codex/thread_history_1.sqlite-wal"
+assert_exit "homes migrate copies the Codex SHM with its database" 0 \
+  test -f "$CLI_STATE/st/codex/state_5.sqlite-shm"
+for family in goals_1.sqlite memories_1.sqlite logs_2.sqlite; do
+  assert_exit "homes migrate copies $family" 0 \
+    test -f "$CLI_STATE/st/codex/$family"
+  assert_exit "homes migrate copies $family WAL" 0 \
+    test -f "$CLI_STATE/st/codex/$family-wal"
+  assert_exit "homes migrate copies $family SHM" 0 \
+    test -f "$CLI_STATE/st/codex/$family-shm"
+done
 assert_exit "homes migrate skips nested legacy symlinks" 1 \
   test -e "$CLI_STATE/st/claude/projects/nested-link"
 assert_exit "homes migrate skips nested special files" 1 \
@@ -468,6 +1206,228 @@ assert_contains "a removed project is marked orphan" "$(ihar_state_list)" "orpha
 IHAR_ASSUME_YES=1 ihar_state_clean_orphans >/dev/null
 assert_exit "the orphan state is removed" 1 test -d "$gone_state"
 assert_exit "the live state is kept" 0 test -d "$STATE"
+
+# Operator cleanup is runtime-only. No-id resolves current state; an id selects only
+# that exact marked state. Orphans and all persistent st/ content survive.
+CURRENT_STATE="$STATE"
+NAMED_PROJECT="$IHAR_TEST_TMP/named-project"
+mkdir -p "$NAMED_PROJECT"
+NAMED_STATE="$(ihar_state_setup "$NAMED_PROJECT")"
+NAMED_ID="$(basename "$NAMED_STATE")"
+ORPHAN_STATE="$IHAR_STATE_ROOT/orphan-kept"
+CURRENT_OLD=aaaaaaaa
+NAMED_OLD=bbbbbbbb
+ACTIVE_OLD=cccccccc
+RECENT_RUNTIME=dddddddd
+REUSE_RUNTIME=eeeeeeee
+mkdir -p "$CURRENT_STATE/r/$CURRENT_OLD/claude" "$CURRENT_STATE/st/claude" \
+  "$NAMED_STATE/r/$NAMED_OLD/codex" "$NAMED_STATE/st/codex" \
+  "$CURRENT_STATE/r/$ACTIVE_OLD/claude" "$CURRENT_STATE/r/$RECENT_RUNTIME/codex" \
+  "$CURRENT_STATE/r/$REUSE_RUNTIME/claude" "$ORPHAN_STATE/r/ffffffff/claude"
+# The reused fixture represents a published runtime, so it carries the required
+# manifest-derived links that reuse now verifies.
+ihar_link_runtime claude "$CURRENT_STATE/r/$REUSE_RUNTIME/claude" "$CURRENT_STATE" \
+  >/dev/null 2>&1
+touch -d '60 days ago' "$CURRENT_STATE/r/$RECENT_RUNTIME"
+python3 - "$CURRENT_STATE/home.json" "$NAMED_STATE/home.json" <<'PY'
+import json, sys
+old = "2020-01-01T00:00:00Z"
+recent = "2099-01-01T00:00:00Z"
+for path, records in (
+    (sys.argv[1], {"aaaaaaaa": old, "cccccccc": old, "dddddddd": recent, "eeeeeeee": old}),
+    (sys.argv[2], {"bbbbbbbb": old}),
+):
+    marker = json.load(open(path, encoding="utf-8"))
+    for runtime_hash, used in records.items():
+        marker["runtimes"][runtime_hash] = {"profile": "standard", "created": old, "last_used": used}
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(marker, handle)
+PY
+printf 'current\n' > "$CURRENT_STATE/st/claude/sentinel"
+printf 'named\n' > "$NAMED_STATE/st/codex/sentinel"
+
+IHAR_STATE="$CURRENT_STATE"
+reuse_before="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtimes"]["eeeeeeee"]["last_used"])' "$CURRENT_STATE/home.json")"
+ihar_runtime_materialise claude "$REUSE_RUNTIME" "" writable >/dev/null
+reuse_after="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtimes"]["eeeeeeee"]["last_used"])' "$CURRENT_STATE/home.json")"
+assert_exit "runtime reuse refreshes authoritative last_used" 1 test "$reuse_before" = "$reuse_after"
+
+IHAR_RUNTIME="$CURRENT_STATE/r/$ACTIVE_OLD/claude" sleep 30 &
+active_runtime_pid=$!
+assert_exit "clean current runtimes" 0 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean"
+kill "$active_runtime_pid" 2>/dev/null || true
+wait "$active_runtime_pid" 2>/dev/null || true
+assert_exit "clean exact state runtimes" 0 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$NAMED_ID'"
+assert_exit "unknown state id is usage" 2 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean missing"
+assert_exit "current persistent state survives" 0 test -f "$CURRENT_STATE/st/claude/sentinel"
+assert_exit "named persistent state survives" 0 test -f "$NAMED_STATE/st/codex/sentinel"
+assert_exit "orphan state survives" 0 test -d "$ORPHAN_STATE"
+assert_exit "current expired runtime is removed by marker age" 1 test -d "$CURRENT_STATE/r/$CURRENT_OLD"
+assert_exit "named expired runtime is removed by marker age" 1 test -d "$NAMED_STATE/r/$NAMED_OLD"
+assert_exit "active expired runtime survives" 0 test -d "$CURRENT_STATE/r/$ACTIVE_OLD"
+assert_exit "recent marker runtime survives old directory mtime" 0 test -d "$CURRENT_STATE/r/$RECENT_RUNTIME"
+assert_eq "deleted runtime is removed from marker" "False" \
+  "$(python3 -c 'import json,sys; print("aaaaaaaa" in json.load(open(sys.argv[1]))["runtimes"])' "$CURRENT_STATE/home.json")"
+
+record_expired_runtime() { # <marker> <hashes...>
+  python3 - "$@" <<'PY'
+import json, sys
+path, *hashes = sys.argv[1:]
+old = "2020-01-01T00:00:00Z"
+marker = json.load(open(path, encoding="utf-8"))
+for runtime_hash in hashes:
+    marker["runtimes"][runtime_hash] = {
+        "profile": "standard", "created": old, "last_used": old,
+    }
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(marker, handle)
+PY
+}
+
+# Cleanup must upgrade an expired pre-manifest owner before removing its runtime.
+# History and every SQLite family member are independent loss-sensitive bytes.
+CLEAN_UPGRADE_PROJECT="$IHAR_TEST_TMP/clean-upgrade-project"
+mkdir -p "$CLEAN_UPGRADE_PROJECT"
+CLEAN_UPGRADE_STATE="$(ihar_state_setup "$CLEAN_UPGRADE_PROJECT")"
+CLEAN_UPGRADE_ID="$(basename "$CLEAN_UPGRADE_STATE")"
+CLEAN_UPGRADE_HASH=12121212
+CLEAN_UPGRADE_RUNTIME="$CLEAN_UPGRADE_STATE/r/$CLEAN_UPGRADE_HASH/codex"
+mkdir -p "$CLEAN_UPGRADE_RUNTIME"
+printf 'expired history\n' > "$CLEAN_UPGRADE_RUNTIME/history.jsonl"
+printf 'expired sqlite\n' > "$CLEAN_UPGRADE_RUNTIME/state_5.sqlite"
+printf 'expired wal\n' > "$CLEAN_UPGRADE_RUNTIME/state_5.sqlite-wal"
+printf 'expired shm\n' > "$CLEAN_UPGRADE_RUNTIME/state_5.sqlite-shm"
+record_expired_runtime "$CLEAN_UPGRADE_STATE/home.json" "$CLEAN_UPGRADE_HASH"
+assert_exit "cleanup upgrades expired materialized state before deletion" 0 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$CLEAN_UPGRADE_ID'"
+assert_exit "upgraded expired runtime is removed" 1 test -d "$CLEAN_UPGRADE_STATE/r/$CLEAN_UPGRADE_HASH"
+assert_eq "cleanup preserves expired history canonically" "expired history" \
+  "$(cat "$CLEAN_UPGRADE_STATE/st/codex/history.jsonl")"
+assert_eq "cleanup preserves expired SQLite canonically" "expired sqlite" \
+  "$(cat "$CLEAN_UPGRADE_STATE/st/codex/state_5.sqlite")"
+assert_eq "cleanup preserves expired SQLite WAL canonically" "expired wal" \
+  "$(cat "$CLEAN_UPGRADE_STATE/st/codex/state_5.sqlite-wal")"
+assert_eq "cleanup preserves expired SQLite SHM canonically" "expired shm" \
+  "$(cat "$CLEAN_UPGRADE_STATE/st/codex/state_5.sqlite-shm")"
+
+# Two possible materialized owners cannot be merged or guessed. Cleanup fails closed
+# and leaves both candidates available for operator recovery.
+CLEAN_AMBIG_PROJECT="$IHAR_TEST_TMP/clean-ambiguous-project"
+mkdir -p "$CLEAN_AMBIG_PROJECT"
+CLEAN_AMBIG_STATE="$(ihar_state_setup "$CLEAN_AMBIG_PROJECT")"
+CLEAN_AMBIG_ID="$(basename "$CLEAN_AMBIG_STATE")"
+mkdir -p "$CLEAN_AMBIG_STATE/r/13131313/codex" \
+  "$CLEAN_AMBIG_STATE/r/14141414/codex/sessions"
+printf 'first owner\n' > "$CLEAN_AMBIG_STATE/r/13131313/codex/history.jsonl"
+printf 'second owner\n' > "$CLEAN_AMBIG_STATE/r/14141414/codex/sessions/session.jsonl"
+record_expired_runtime "$CLEAN_AMBIG_STATE/home.json" 13131313 14141414
+assert_exit "cleanup fails closed on ambiguous materialized owners" 3 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$CLEAN_AMBIG_ID'"
+assert_eq "ambiguous history owner survives cleanup" "first owner" \
+  "$(cat "$CLEAN_AMBIG_STATE/r/13131313/codex/history.jsonl")"
+assert_eq "ambiguous session owner survives cleanup" "second owner" \
+  "$(cat "$CLEAN_AMBIG_STATE/r/14141414/codex/sessions/session.jsonl")"
+
+# An opaque active vendor candidate makes quiescence unknowable. The transactional
+# upgrade refuses it, so cleanup must preserve the only history copy.
+CLEAN_OPAQUE_PROJECT="$IHAR_TEST_TMP/clean-opaque-project"
+mkdir -p "$CLEAN_OPAQUE_PROJECT"
+CLEAN_OPAQUE_STATE="$(ihar_state_setup "$CLEAN_OPAQUE_PROJECT")"
+CLEAN_OPAQUE_ID="$(basename "$CLEAN_OPAQUE_STATE")"
+CLEAN_OPAQUE_HASH=15151515
+mkdir -p "$CLEAN_OPAQUE_STATE/r/$CLEAN_OPAQUE_HASH/codex"
+printf 'opaque owner\n' > "$CLEAN_OPAQUE_STATE/r/$CLEAN_OPAQUE_HASH/codex/history.jsonl"
+record_expired_runtime "$CLEAN_OPAQUE_STATE/home.json" "$CLEAN_OPAQUE_HASH"
+opaque_ready="$IHAR_TEST_TMP/clean-opaque-ready"
+bash -c 'exec -a codex python3 -c '\''import ctypes,pathlib,sys,time; assert ctypes.CDLL(None).prctl(4,0,0,0,0) == 0; pathlib.Path(sys.argv[1]).touch(); time.sleep(30)'\'' "$1"' _ \
+  "$opaque_ready" &
+opaque_pid=$!
+while [[ ! -e "$opaque_ready" ]]; do :; done
+assert_exit "cleanup fails closed on an opaque active vendor candidate" 3 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$CLEAN_OPAQUE_ID'"
+kill "$opaque_pid" 2>/dev/null || true
+wait "$opaque_pid" 2>/dev/null || true
+assert_eq "opaque active materialized history survives cleanup" "opaque owner" \
+  "$(cat "$CLEAN_OPAQUE_STATE/r/$CLEAN_OPAQUE_HASH/codex/history.jsonl")"
+assert_exit "opaque cleanup failure publishes no canonical state" 1 \
+  test -e "$CLEAN_OPAQUE_STATE/st/codex/history.jsonl"
+
+# Link-only runtimes still contain configuration bytes and can be selected by a
+# live vendor. Unreadable process evidence is uncertainty, not permission to delete.
+CLEAN_LINK_ONLY_PROJECT="$IHAR_TEST_TMP/clean-link-only-project"
+mkdir -p "$CLEAN_LINK_ONLY_PROJECT"
+CLEAN_LINK_ONLY_STATE="$(ihar_state_setup "$CLEAN_LINK_ONLY_PROJECT")"
+CLEAN_LINK_ONLY_ID="$(basename "$CLEAN_LINK_ONLY_STATE")"
+CLEAN_LINK_ONLY_HASH=16161616
+CLEAN_LINK_ONLY_RUNTIME="$CLEAN_LINK_ONLY_STATE/r/$CLEAN_LINK_ONLY_HASH/codex"
+mkdir -p "$CLEAN_LINK_ONLY_RUNTIME"
+printf 'runtime config stays\n' > "$CLEAN_LINK_ONLY_RUNTIME/config.toml"
+ihar_link_runtime codex "$CLEAN_LINK_ONLY_RUNTIME" "$CLEAN_LINK_ONLY_STATE" >/dev/null 2>&1
+record_expired_runtime "$CLEAN_LINK_ONLY_STATE/home.json" "$CLEAN_LINK_ONLY_HASH"
+link_only_ready="$IHAR_TEST_TMP/clean-link-only-ready"
+bash -c 'cd "$1" && exec -a codex python3 -c '\''import ctypes,pathlib,sys,time; assert ctypes.CDLL(None).prctl(4,0,0,0,0) == 0; pathlib.Path(sys.argv[1]).touch(); time.sleep(30)'\'' "$2"' _ \
+  "$CLEAN_LINK_ONLY_RUNTIME" "$link_only_ready" &
+link_only_pid=$!
+while [[ ! -e "$link_only_ready" ]]; do :; done
+assert_exit "cleanup fails closed on an opaque active link-only runtime" 3 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$CLEAN_LINK_ONLY_ID'"
+kill "$link_only_pid" 2>/dev/null || true
+wait "$link_only_pid" 2>/dev/null || true
+assert_eq "opaque active link-only runtime bytes survive cleanup" "runtime config stays" \
+  "$(cat "$CLEAN_LINK_ONLY_RUNTIME/config.toml")"
+
+LOCKED_PROJECT="$IHAR_TEST_TMP/locked-clean-project"
+mkdir -p "$LOCKED_PROJECT"
+LOCKED_STATE="$(ihar_state_setup "$LOCKED_PROJECT")"
+LOCKED_ID="$(basename "$LOCKED_STATE")"
+lock_ready="$IHAR_TEST_TMP/clean-lock-ready"
+bash -c 'exec {fd}>"$1/.ihar.lock"; flock -x "$fd"; : > "$2"; sleep 30' _ \
+  "$LOCKED_STATE" "$lock_ready" &
+clean_lock_pid=$!
+while [[ ! -e "$lock_ready" ]]; do :; done
+assert_exit "runtime cleanup requires the state lock" 3 \
+  bash -c "cd '$PROJECT'; IHAR_CLEAN_LOCK_TIMEOUT=1 IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$LOCKED_ID'"
+kill "$clean_lock_pid" 2>/dev/null || true
+wait "$clean_lock_pid" 2>/dev/null || true
+
+COLLISION_PROJECT="$IHAR_TEST_TMP/collision-project"
+mkdir -p "$COLLISION_PROJECT"
+COLLISION_ID="$(ihar_home_id "$COLLISION_PROJECT")"
+COLLISION_STATE="$IHAR_STATE_ROOT/$COLLISION_ID"
+mkdir -p "$COLLISION_STATE/r/11111111/claude"
+python3 - "$COLLISION_STATE/home.json" <<'PY'
+import json, sys
+json.dump({"schema":3,"project_root":"/different/project","created":"2020-01-01T00:00:00Z","vendors":[],"runtimes":{"11111111":{"profile":"standard","created":"2020-01-01T00:00:00Z","last_used":"2020-01-01T00:00:00Z"}},"migrated_from":{}}, open(sys.argv[1], "w", encoding="utf-8"))
+PY
+assert_exit "current cleanup rejects a colliding project marker" 2 \
+  bash -c "cd '$COLLISION_PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean"
+assert_exit "collision rejection preserves its runtime" 0 test -d "$COLLISION_STATE/r/11111111"
+
+MOVED_PROJECT="$IHAR_TEST_TMP/moved-marker-project"
+mkdir -p "$MOVED_PROJECT"
+MOVED_ID=44444444
+MOVED_STATE="$IHAR_STATE_ROOT/$MOVED_ID"
+mkdir -p "$MOVED_STATE/r/55555555/claude"
+python3 - "$MOVED_STATE/home.json" "$MOVED_PROJECT" <<'PY'
+import json, sys
+old = "2020-01-01T00:00:00Z"
+json.dump({"schema":3,"project_root":sys.argv[2],"created":old,"vendors":["claude"],"runtimes":{"55555555":{"profile":"standard","created":old,"last_used":old}},"migrated_from":{}}, open(sys.argv[1], "w", encoding="utf-8"))
+PY
+assert_exit "named cleanup rejects a valid marker moved under the wrong id" 2 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$MOVED_ID'"
+assert_exit "moved marker rejection preserves its runtime" 0 \
+  test -d "$MOVED_STATE/r/55555555"
+
+MALFORMED_ID=22222222
+MALFORMED_STATE="$IHAR_STATE_ROOT/$MALFORMED_ID"
+mkdir -p "$MALFORMED_STATE/r/33333333/claude"
+printf 'broken\n' > "$MALFORMED_STATE/home.json"
+assert_exit "named cleanup rejects a malformed marker" 2 \
+  bash -c "cd '$PROJECT'; IHAR_ROOT='$ROOT' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' IHAR_STORE='$IHAR_STORE' '$ROOT/ihar.sh' homes clean '$MALFORMED_ID'"
+assert_exit "malformed marker rejection preserves its runtime" 0 test -d "$MALFORMED_STATE/r/33333333"
 
 # A state without a readable marker is unattributable, not unwanted.
 NOMARKER="$IHAR_STATE_ROOT/no-marker-000000000000"

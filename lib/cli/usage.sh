@@ -10,7 +10,8 @@ usage: ihar [global flags] <command> [command flags] [-- agent args]
 
 commands
   claude | codex        launch the agent in this project
-  check                 print the effective profile and what is enforced
+  check [--diff] [--conformance]
+                        print status, compare desired renders, or refresh evidence
   install               install every pinned component under this user, no sudo
   update                re-install what the lockfile now pins, then re-prove the hooks
   homes list | clean | migrate
@@ -43,6 +44,7 @@ launch flags
 install flags
   --acp                 install lockfile-pinned experimental ACP adapters
   --microvm             import pinned Firecracker assets from IHAR_MICROVM_SOURCE_DIR
+  --migrate-store       copy eligible legacy store content before installation
 
 everything after -- goes to the agent verbatim:
   ihar codex -- mcp list

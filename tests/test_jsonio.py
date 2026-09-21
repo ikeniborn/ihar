@@ -13,7 +13,16 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "python"))
 
-from ihar import jsonio  # noqa: E402
+from ihar import install_receipt, jsonio  # noqa: E402
+from ihar.conformance import REQUIRED_CASES  # noqa: E402
+
+HOOK_DETAIL_EMPTY = {
+    "trusted_hash": None,
+    "trustStatus": None,
+    "enabled": None,
+    "source": None,
+    "currentHash": None,
+}
 
 PROFILE = {
     "schema": 1,
@@ -29,6 +38,80 @@ PROFILE = {
     "acp": "allow",
     "env_passthrough": [],
     "handoff": {"system_prompt": False},
+}
+
+LOCKFILE = {
+    "schema": 1,
+    "node": {"version": "22.23.1"},
+    "claude": {"version": "2.1.274"},
+}
+
+RECEIPT = {
+    "schema": 1,
+    "release_lock_sha256": "a" * 64,
+    "installed_at": "2026-09-20T00:00:00Z",
+    "components": {
+        "claude": {"version": "2.1.274", "binary_sha256": "b" * 64},
+    },
+}
+
+STATE_MANIFEST = {
+    "schema": 1,
+    "entries": [
+        {"vendor": "codex", "path": "state_5.sqlite", "kind": "sqlite-family"},
+    ],
+}
+
+MUTABLE_LINK_MANIFEST = {
+    "schema": 1,
+    "entries": [
+        {
+            "vendor": "codex",
+            "source": "auth/codex/auth.json",
+            "target": "auth.json",
+            "kind": "file",
+        },
+    ],
+}
+
+CHECK_RESULT = {
+    "schema": 1,
+    "profile": {"name": "protected", "guarantee": "masked model egress"},
+    "masking": {"level": "standard", "floor": "standard", "engine": "regex", "dropped_env": ["TOKEN"]},
+    "gateway": {
+        "mode": "explicit",
+        "instances": [{
+            "key": "abcdef012345",
+            "mode": "explicit",
+            "port": 1234,
+            "pid": 4321,
+            "consumers": 2,
+            "healthy": True,
+            "metrics": {
+                "state": "available",
+                "masked": 3,
+                "refused": 1,
+                "relayed": 0,
+                "uptime_seconds": 15,
+            },
+        }],
+    },
+    "network": {
+        "state": "not enforced",
+        "scope": "none",
+        "default": "allow",
+        "configured": False,
+        "available": False,
+        "active": False,
+        "verified": False,
+    },
+    "vendors": {
+        "claude": {"receipt": "verified", "hooks": [{"id": "security-pretool", "trust": "configured", **HOOK_DETAIL_EMPTY}], "conformance": "proven", "capabilities": ["fork", "remote-control"]},
+        "codex": {"receipt": "missing receipt", "hooks": [{"id": "security-pretool", "trust": "trusted", "trusted_hash": "sha256:" + "a" * 64, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": "sha256:" + "a" * 64}], "conformance": "unproven", "capabilities": ["archive", "fork"]},
+    },
+    "assets": [{"requirement": "optional", "presence": "missing", "source": "commands", "target": "commands"}],
+    "mcp": {"strict": True, "notes": {"claude": ["missing TOKEN"], "codex": []}},
+    "known_gaps": ["claude-agent-acp #144"],
 }
 
 
@@ -63,6 +146,28 @@ def test_types_are_checked_and_bool_is_not_an_integer():
 
 def test_unknown_key_is_an_error_not_a_warning():
     rejects("profile", {**PROFILE, "surprise": 1}, "unknown key")
+
+
+def test_state_manifest_rejects_overlapping_paths():
+    """One runtime pathname must have one manifest owner; otherwise migration
+    cannot preserve and publish both entries independently."""
+    overlapping = {
+        "schema": 1,
+        "entries": [
+            {"vendor": "codex", "path": "sessions", "kind": "directory"},
+            {"vendor": "codex", "path": "sessions/archive", "kind": "directory"},
+        ],
+    }
+    rejects("state-manifest", overlapping, "overlapping paths")
+
+    sqlite_alias = {
+        "schema": 1,
+        "entries": [
+            {"vendor": "codex", "path": "state.sqlite", "kind": "sqlite-family"},
+            {"vendor": "codex", "path": "state.sqlite-wal", "kind": "file"},
+        ],
+    }
+    rejects("state-manifest", sqlite_alias, "expanded path")
 
 
 def test_missing_key_is_reported_by_name():
@@ -106,7 +211,7 @@ def test_free_form_maps_validate_keys_and_values():
         "schema": 1, "vendor": "codex", "version": "0.154.0",
         "binary_sha256": "a" * 64, "manifest_digest": "b" * 64,
         "created_at": "2026-09-18T10:00:00Z",
-        "cases": {"deny": {"status": "passed"}},
+        "cases": {name: {"status": "passed"} for name in REQUIRED_CASES["codex"]},
     }
     jsonio.check("conformance", record)
     rejects("conformance", {**record, "cases": {"deny": {"status": "maybe"}}}, "cases.deny.status")
@@ -185,6 +290,344 @@ def test_integrity_pins_are_length_checked():
     record["binary_sha256"] = "a" * 64
     jsonio.check("daemon-record", record)
     rejects("daemon-record", {**record, "config_hash": "abc"}, "config_hash")
+
+
+def test_release_lockfile_rejects_machine_local_evidence():
+    jsonio.check("lockfile", LOCKFILE)
+    rejects("lockfile", {**LOCKFILE, "installedAt": "2026-09-20T00:00:00Z"}, "installedAt")
+    rejects(
+        "lockfile",
+        {**LOCKFILE, "claude": {"version": "2.1.274", "binarySha256": "b" * 64}},
+        "binarySha256",
+    )
+
+
+def test_install_receipt_has_a_closed_component_shape():
+    jsonio.check("install-receipt", RECEIPT)
+    rejects("install-receipt", {key: value for key, value in RECEIPT.items() if key != "installed_at"})
+    rejects("install-receipt", {**RECEIPT, "extra": True}, "unknown key")
+    rejects(
+        "install-receipt",
+        {**RECEIPT, "components": {"gemini": RECEIPT["components"]["claude"]}},
+        "gemini",
+    )
+    rejects(
+        "install-receipt",
+        {**RECEIPT, "components": {"claude": {**RECEIPT["components"]["claude"], "extra": 1}}},
+        "unknown key",
+    )
+
+
+def test_install_receipt_requires_complete_sha256_digests():
+    rejects("install-receipt", {**RECEIPT, "release_lock_sha256": "ab"}, "release_lock_sha256")
+    rejects(
+        "install-receipt",
+        {**RECEIPT, "components": {"claude": {"version": "2.1.274", "binary_sha256": "cd"}}},
+        "binary_sha256",
+    )
+
+
+def test_invalid_install_receipt_preserves_previous_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "install-receipt.json")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("previous\n")
+        try:
+            install_receipt.write_receipt(target, {**RECEIPT, "release_lock_sha256": "short"})
+        except jsonio.SchemaError:
+            pass
+        else:
+            raise AssertionError("write_receipt accepted invalid evidence")
+        assert open(target, encoding="utf-8").read() == "previous\n"
+        assert not [name for name in os.listdir(tmp) if name.startswith(".install-receipt-")]
+
+
+def test_state_manifest_accepts_only_safe_relative_paths_and_supported_kinds():
+    jsonio.check("state-manifest", STATE_MANIFEST)
+    for path in ("", "/absolute", "../escape", "nested/../escape", "nested//empty", "trailing/"):
+        rejects("state-manifest", {
+            **STATE_MANIFEST,
+            "entries": [{"vendor": "codex", "path": path, "kind": "file"}],
+        }, "path")
+    rejects("state-manifest", {
+        **STATE_MANIFEST,
+        "entries": [{"vendor": "codex", "path": "state", "kind": "socket"}],
+    }, "kind")
+
+
+def test_state_manifest_rejects_duplicate_vendor_path_keys():
+    entry = STATE_MANIFEST["entries"][0]
+    duplicate = {**entry, "kind": "file"}
+    rejects("state-manifest", {**STATE_MANIFEST, "entries": [entry, duplicate]}, "duplicate")
+
+
+def test_mutable_link_manifest_accepts_only_safe_store_and_runtime_paths():
+    jsonio.check("mutable-link-manifest", MUTABLE_LINK_MANIFEST)
+    for field, path in (("source", "../auth"), ("target", "/absolute")):
+        entry = {**MUTABLE_LINK_MANIFEST["entries"][0], field: path}
+        rejects(
+            "mutable-link-manifest",
+            {**MUTABLE_LINK_MANIFEST, "entries": [entry]},
+            field,
+        )
+    entry = {**MUTABLE_LINK_MANIFEST["entries"][0], "source": "st/codex/auth.json"}
+    rejects(
+        "mutable-link-manifest",
+        {**MUTABLE_LINK_MANIFEST, "entries": [entry]},
+        "auth or plugins",
+    )
+
+    entry = MUTABLE_LINK_MANIFEST["entries"][0]
+    for field, path in (
+        ("source", "auth/codex/."),
+        ("source", "auth//codex/auth.json"),
+        ("source", "auth/codex/auth.json/"),
+        ("target", "."),
+        ("target", "./auth.json"),
+        ("target", "auth//auth.json"),
+        ("target", "auth.json/"),
+    ):
+        rejects(
+            "mutable-link-manifest",
+            {**MUTABLE_LINK_MANIFEST, "entries": [{**entry, field: path}]},
+            field,
+        )
+
+
+def test_mutable_link_manifest_rejects_duplicate_sources_and_runtime_targets():
+    entry = MUTABLE_LINK_MANIFEST["entries"][0]
+    rejects(
+        "mutable-link-manifest",
+        {**MUTABLE_LINK_MANIFEST, "entries": [entry, {**entry, "target": "other.json"}]},
+        "duplicate source",
+    )
+    rejects(
+        "mutable-link-manifest",
+        {**MUTABLE_LINK_MANIFEST, "entries": [entry, {**entry, "source": "auth/codex/other.json"}]},
+        "duplicate target",
+    )
+
+    source_alias = {**entry, "source": "auth/codex/./auth.json", "target": "other.json"}
+    rejects(
+        "mutable-link-manifest",
+        {**MUTABLE_LINK_MANIFEST, "entries": [entry, source_alias]},
+        "duplicate source",
+    )
+    target_alias = {**entry, "source": "auth/codex/other.json", "target": "auth.json/."}
+    rejects(
+        "mutable-link-manifest",
+        {**MUTABLE_LINK_MANIFEST, "entries": [entry, target_alias]},
+        "duplicate target",
+    )
+
+
+def test_check_result_is_closed_and_covers_both_vendors():
+    jsonio.check("check-result", CHECK_RESULT)
+    rejects("check-result", {**CHECK_RESULT, "extra": True}, "unknown key")
+    missing_codex = {**CHECK_RESULT, "vendors": {"claude": CHECK_RESULT["vendors"]["claude"]}}
+    rejects("check-result", missing_codex, "codex")
+
+
+def test_check_result_gateway_metrics_availability_is_consistent():
+    unavailable = {
+        **CHECK_RESULT["gateway"]["instances"][0],
+        "healthy": False,
+        "metrics": {
+            "state": "unavailable",
+            "masked": None,
+            "refused": None,
+            "relayed": None,
+            "uptime_seconds": None,
+        },
+    }
+    jsonio.check("check-result", {
+        **CHECK_RESULT,
+        "gateway": {**CHECK_RESULT["gateway"], "instances": [unavailable]},
+    })
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "gateway": {**CHECK_RESULT["gateway"], "instances": [{
+            **unavailable,
+            "metrics": {**unavailable["metrics"], "refused": 0},
+        }]},
+    }, "unavailable metrics")
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "gateway": {**CHECK_RESULT["gateway"], "instances": [{
+            **CHECK_RESULT["gateway"]["instances"][0],
+            "metrics": {**CHECK_RESULT["gateway"]["instances"][0]["metrics"], "refused": True},
+        }]},
+    }, "refused")
+
+
+def test_check_result_network_state_matches_its_scope():
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "network": {**CHECK_RESULT["network"], "available": "false"},
+    }, "expected boolean")
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "network": {
+            **CHECK_RESULT["network"],
+            "configured": True,
+            "scope": "none",
+            "default": "deny",
+        },
+    }, "configured network boundary")
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "network": {
+            "state": "enforced",
+            "scope": "guest-boundary",
+            "default": "deny",
+            "configured": True,
+            "available": True,
+            "active": True,
+            "verified": False,
+        },
+    }, "observed network evidence")
+    rejects("check-result", {
+        **CHECK_RESULT,
+        "network": {
+            "state": "not enforced",
+            "scope": "guest-boundary",
+            "default": "deny",
+            "configured": True,
+            "available": True,
+            "active": True,
+            "verified": True,
+        },
+    }, "observed network evidence")
+    enforced = {
+        "state": "enforced",
+        "scope": "guest-boundary",
+        "default": "deny",
+        "configured": True,
+        "available": True,
+        "active": True,
+        "verified": True,
+    }
+    jsonio.check("check-result", {**CHECK_RESULT, "network": enforced})
+
+
+def test_network_status_requires_observed_live_evidence_before_enforced():
+    from ihar import check_result
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "isolated.json"), "w", encoding="utf-8") as handle:
+            json.dump({
+                "schema": 1,
+                "name": "isolated",
+                "default": "deny",
+                "allow": [{"kind": "gateway", "reason": "test gateway"}],
+            }, handle)
+        names = (
+            "IHAR_PROFILE_SANDBOX",
+            "IHAR_PROFILE_NETPOLICY",
+            "_IHAR_CHECK_NETPOLICY_DIR",
+            "_IHAR_CHECK_NETWORK_EVIDENCE",
+        )
+        previous = {name: os.environ.get(name) for name in names}
+        try:
+            os.environ.update({
+                "IHAR_PROFILE_SANDBOX": "microvm",
+                "IHAR_PROFILE_NETPOLICY": "isolated",
+                "_IHAR_CHECK_NETPOLICY_DIR": tmp,
+                "_IHAR_CHECK_NETWORK_EVIDENCE": json.dumps({
+                    "configured": True,
+                    "available": True,
+                    "active": True,
+                    "verified": True,
+                }),
+            })
+            assert check_result._network_status()["state"] == "enforced"
+            os.environ["_IHAR_CHECK_NETWORK_EVIDENCE"] = json.dumps({
+                "configured": True,
+                "available": True,
+                "active": True,
+                "verified": False,
+            })
+            assert check_result._network_status()["state"] == "not enforced"
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
+def test_check_result_text_and_json_render_the_same_facts():
+    from ihar import check_result
+
+    rendered = check_result.render_text(CHECK_RESULT)
+    encoded = check_result.render_json(CHECK_RESULT)
+    jsonio.check("check-result", json.loads(encoded))
+    for value in (
+        "protected", "masked model egress", "standard", "explicit", "verified", "missing receipt",
+        "abcdef012345", "1234", "4321", "available", "masked", "refused", "relayed",
+        "not enforced", "none", "allow",
+        "commands", "security-pretool", "trusted", "trusted_hash", "trustStatus", "enabled",
+        "source", "user", "currentHash", "sha256:" + "a" * 64,
+        "missing TOKEN", "claude-agent-acp #144",
+    ):
+        assert value in rendered, value
+        assert value in encoded, value
+    for name in ("configured", "available", "active", "verified"):
+        assert f"{name} false" in rendered, name
+        assert f'"{name}": false' in encoded, name
+    assert (
+        "instance abcdef012345 mode explicit port 1234 pid 4321 "
+        "consumers 2 healthy true"
+    ) in rendered
+    assert (
+        "metrics available masked 3 refused 1 relayed 0 uptime_seconds 15"
+    ) in rendered
+
+
+def test_codex_hook_facts_are_evaluated_per_hook_from_vendor_and_trust_records():
+    from ihar import check_result
+
+    manifest = {
+        "schema": 1,
+        "entries": [
+            {"id": "hook-one", "event": "PreToolUse", "vendors": ["codex"], "profiles": ["*"], "tools": ["any"], "script": "one.py", "args": [], "timeout": 5, "rewrites_input": False, "required_in": []},
+            {"id": "hook-two", "event": "PostToolUse", "vendors": ["codex"], "profiles": ["*"], "tools": ["any"], "script": "two.py", "args": [], "timeout": 5, "rewrites_input": False, "required_in": []},
+        ],
+    }
+    one_hash = "sha256:" + "1" * 64
+    two_hash = "sha256:" + "2" * 64
+    with tempfile.TemporaryDirectory() as runtime:
+        hooks_path = os.path.join(runtime, "hooks.json")
+        with open(hooks_path, "w", encoding="utf-8") as handle:
+            json.dump({"hooks": {
+                "PreToolUse": [{"hooks": [{"command": 'python3 -I "$CODEX_HOME/hooks/one.py" --vendor codex'}]}],
+                "PostToolUse": [{"hooks": [{"command": 'python3 -I "$CODEX_HOME/hooks/two.py" --vendor codex'}]}],
+            }}, handle)
+        one_key = f"{hooks_path}:PreToolUse:0:0"
+        two_key = f"{hooks_path}:PostToolUse:0:0"
+        observed = [
+            {"key": one_key, "sourcePath": hooks_path, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": one_hash},
+            {"key": two_key, "sourcePath": hooks_path, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": two_hash},
+        ]
+
+        def write_trust(records):
+            with open(os.path.join(runtime, "config.toml"), "w", encoding="utf-8") as handle:
+                for key, value in records.items():
+                    handle.write(f'[hooks.state."{key}"]\ntrusted_hash = "{value}"\n')
+
+        write_trust({one_key: one_hash, two_key: two_hash})
+        facts = check_result.codex_hook_facts(manifest, "standard", runtime, observed)
+        assert {fact["id"]: fact["trust"] for fact in facts} == {"hook-one": "trusted", "hook-two": "trusted"}
+        assert next(fact for fact in facts if fact["id"] == "hook-one")["currentHash"] == one_hash
+
+        write_trust({one_key: one_hash, two_key: "sha256:" + "3" * 64})
+        facts = check_result.codex_hook_facts(manifest, "standard", runtime, observed)
+        assert {fact["id"]: fact["trust"] for fact in facts} == {"hook-one": "trusted", "hook-two": "untrusted"}
+
+        write_trust({one_key: one_hash})
+        facts = check_result.codex_hook_facts(manifest, "standard", runtime, observed)
+        assert {fact["id"]: fact["trust"] for fact in facts} == {"hook-one": "trusted", "hook-two": "untrusted"}
+        assert next(fact for fact in facts if fact["id"] == "hook-two")["trusted_hash"] is None
 
 
 if __name__ == "__main__":

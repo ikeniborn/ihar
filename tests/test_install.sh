@@ -19,12 +19,124 @@ source "$ROOT/lib/core/logging.sh"
 source "$ROOT/lib/core/init.sh"
 source "$ROOT/lib/core/lock.sh"
 source "$ROOT/lib/store/lockfile.sh"
+source "$ROOT/lib/store/assets.sh"
+source "$ROOT/lib/store/migrate.sh"
 source "$ROOT/lib/store/install.sh"
 
 export IHAR_CLAUDE_BIN="$IHAR_NVM/npm-global/bin/claude"
 export IHAR_CODEX_BIN="$IHAR_STORE/bin/codex"
 export IHAR_CLAUDE_ACP_BIN="$IHAR_STORE/acp/bin/claude-agent-acp"
 export IHAR_CODEX_ACP_BIN="$IHAR_STORE/acp/bin/codex-acp"
+
+# --- copy-only legacy store migration -----------------------------------------------
+
+LEGACY_STORE="$IHAR_TEST_TMP/legacy-store"
+mkdir -p "$LEGACY_STORE/hooks" "$LEGACY_STORE/skills" "$LEGACY_STORE/config" "$LEGACY_STORE/state"
+printf 'old hook\n' > "$LEGACY_STORE/hooks/old"
+printf 'old skill\n' > "$LEGACY_STORE/skills/old"
+printf 'do not copy\n' > "$LEGACY_STORE/config/settings.json"
+printf 'do not copy\n' > "$LEGACY_STORE/state/session.jsonl"
+printf '{"schema":1,"release_lock_sha256":"%064d","installed_at":"2026-09-20T00:00:00Z","components":{}}\n' 0 > "$LEGACY_STORE/install-receipt.json"
+legacy_before="$(find "$LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+
+lock_ready="$IHAR_TEST_TMP/store-lock-ready"
+bash -c 'exec {fd}>"$1.ihar-lifecycle.lock"; flock -s "$fd"; : > "$2"; sleep 30' _ \
+  "$LEGACY_STORE" "$lock_ready" &
+legacy_lock_pid=$!
+while [[ ! -e "$lock_ready" ]]; do :; done
+assert_exit "store migration refuses a held lifecycle lock" 3 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; IHAR_LEGACY_STORE='$LEGACY_STORE' IHAR_ROOT='$ROOT' IHAR_STORE='$IHAR_STORE/migrated' IHAR_STORE_MIGRATION_LOCK_TIMEOUT=1 ihar_store_migrate"
+kill "$legacy_lock_pid" 2>/dev/null || true
+wait "$legacy_lock_pid" 2>/dev/null || true
+assert_exit "lock refusal copies nothing" 1 test -e "$IHAR_STORE/migrated/hooks/old"
+
+mkdir -p "$IHAR_STORE/migrated"
+assert_exit "stable store migration succeeds" 0 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; IHAR_LEGACY_STORE='$LEGACY_STORE' IHAR_ROOT='$ROOT' IHAR_STORE='$IHAR_STORE/migrated' ihar_store_migrate"
+assert_exit "eligible hooks are copied" 0 test -f "$IHAR_STORE/migrated/hooks/old"
+assert_exit "eligible skills are copied" 0 test -f "$IHAR_STORE/migrated/skills/old"
+assert_exit "old receipt is copied" 0 test -f "$IHAR_STORE/migrated/install-receipt.json"
+assert_exit "legacy configuration is excluded" 1 test -e "$IHAR_STORE/migrated/config/settings.json"
+assert_exit "legacy state is excluded" 1 test -e "$IHAR_STORE/migrated/state/session.jsonl"
+assert_eq "legacy source stays byte-identical" "$legacy_before" \
+  "$(find "$LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+
+RACE_STORE="$IHAR_TEST_TMP/legacy-store-race"
+RACE_TARGET="$IHAR_STORE/migrated-race"
+RACE_BIN="$IHAR_TEST_TMP/store-race-bin"
+mkdir -p "$RACE_STORE/hooks" "$RACE_BIN"
+printf 'before\n' > "$RACE_STORE/hooks/old"
+cat > "$RACE_BIN/rsync" <<'EOF'
+#!/usr/bin/env bash
+/usr/bin/rsync "$@" || exit
+if [[ ! -e "$IHAR_TEST_RACE_DONE" ]]; then
+  : > "$IHAR_TEST_RACE_DONE"
+  printf 'during copy\n' >> "$IHAR_TEST_RACE_SOURCE/hooks/old"
+fi
+EOF
+chmod +x "$RACE_BIN/rsync"
+assert_exit "a changing legacy store discards its stage" 3 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; PATH='$RACE_BIN':\"\$PATH\" IHAR_TEST_RACE_SOURCE='$RACE_STORE' IHAR_TEST_RACE_DONE='$IHAR_TEST_TMP/store-race-done' IHAR_LEGACY_STORE='$RACE_STORE' IHAR_ROOT='$ROOT' IHAR_STORE='$RACE_TARGET' ihar_store_migrate"
+assert_exit "an unstable store publishes no eligible entry" 1 test -e "$RACE_TARGET/hooks/old"
+
+FINGERPRINT_STORE="$IHAR_TEST_TMP/legacy-fingerprint"
+mkdir -p "$FINGERPRINT_STORE/hooks"
+ln -s first "$FINGERPRINT_STORE/hooks/link"
+fingerprint_before="$(_ihar_store_full_fingerprint "$FINGERPRINT_STORE" hooks)"
+ln -sfn second "$FINGERPRINT_STORE/hooks/link"
+fingerprint_after="$(_ihar_store_full_fingerprint "$FINGERPRINT_STORE" hooks)"
+assert_exit "full migration fingerprint includes symlink targets" 1 \
+  test "$fingerprint_before" = "$fingerprint_after"
+
+# Every source must be staged and validated before one activation. If the second
+# source changes, bytes from the first source must not become active.
+MULTI_A="$IHAR_TEST_TMP/legacy-multi-a"
+MULTI_B="$IHAR_TEST_TMP/legacy-multi-b"
+MULTI_TARGET="$IHAR_STORE/migrated-multi"
+MULTI_BIN="$IHAR_TEST_TMP/store-multi-bin"
+mkdir -p "$MULTI_A/hooks" "$MULTI_B/skills" "$MULTI_TARGET/hooks" "$MULTI_BIN"
+printf 'new hook\n' > "$MULTI_A/hooks/entry"
+printf 'new skill\n' > "$MULTI_B/skills/entry"
+printf 'active hook\n' > "$MULTI_TARGET/hooks/entry"
+cat > "$MULTI_BIN/rsync" <<'EOF'
+#!/usr/bin/env bash
+/usr/bin/rsync "$@" || exit
+if [[ "$*" == *"$IHAR_TEST_MUTATE_SOURCE"* && ! -e "$IHAR_TEST_MUTATE_DONE" ]]; then
+  : > "$IHAR_TEST_MUTATE_DONE"
+  printf 'changed\n' >> "$IHAR_TEST_MUTATE_SOURCE/skills/entry"
+fi
+EOF
+chmod +x "$MULTI_BIN/rsync"
+assert_exit "all store sources validate before one activation" 3 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; PATH='$MULTI_BIN':\"\$PATH\" IHAR_TEST_MUTATE_SOURCE='$MULTI_B' IHAR_TEST_MUTATE_DONE='$IHAR_TEST_TMP/multi-done' IHAR_LEGACY_STORE='$MULTI_A:$MULTI_B' IHAR_ROOT='$ROOT' IHAR_STORE='$MULTI_TARGET' ihar_store_migrate"
+assert_eq "a late source failure leaves the active store untouched" "active hook" \
+  "$(cat "$MULTI_TARGET/hooks/entry")"
+assert_exit "a late source failure publishes no second-source bytes" 1 \
+  test -e "$MULTI_TARGET/skills/entry"
+
+# Activation failure rolls every published path back. A failed restore keeps the
+# recovery backup and reports its location instead of destroying recoverable data.
+ROLL_SOURCE="$IHAR_TEST_TMP/legacy-roll"
+ROLL_TARGET="$IHAR_STORE/migrated-roll"
+mkdir -p "$ROLL_SOURCE/hooks" "$ROLL_SOURCE/skills" "$ROLL_TARGET/hooks" "$ROLL_TARGET/skills"
+printf 'new hook\n' > "$ROLL_SOURCE/hooks/entry"
+printf 'new skill\n' > "$ROLL_SOURCE/skills/entry"
+printf 'old hook\n' > "$ROLL_TARGET/hooks/entry"
+printf 'old skill\n' > "$ROLL_TARGET/skills/entry"
+assert_exit "store publication failure rolls back every activated path" 1 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; ihar_store_migration_move() { if [[ \"\$1\" == */.ihar-store-migrate-stage-*/skills && \"\$2\" == '$ROLL_TARGET/skills' ]]; then return 1; fi; command mv -- \"\$@\"; }; IHAR_LEGACY_STORE='$ROLL_SOURCE' IHAR_ROOT='$ROOT' IHAR_STORE='$ROLL_TARGET' ihar_store_migrate"
+assert_eq "publication rollback restores old hooks" "old hook" "$(cat "$ROLL_TARGET/hooks/entry")"
+assert_eq "publication rollback restores old skills" "old skill" "$(cat "$ROLL_TARGET/skills/entry")"
+
+incomplete_status=0
+incomplete_out="$(bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/migrate.sh'; ihar_store_migration_move() { if [[ \"\$1\" == */.ihar-store-migrate-stage-*/skills && \"\$2\" == '$ROLL_TARGET/skills' ]]; then return 1; fi; if [[ \"\$1\" == */.ihar-store-migrate-backup-*/hooks && \"\$2\" == '$ROLL_TARGET/hooks' ]]; then return 1; fi; command mv -- \"\$@\"; }; IHAR_LEGACY_STORE='$ROLL_SOURCE' IHAR_ROOT='$ROOT' IHAR_STORE='$ROLL_TARGET' ihar_store_migrate" 2>&1)" \
+  || incomplete_status=$?
+assert_eq "incomplete store rollback is fail-closed" "3" "$incomplete_status"
+assert_contains "incomplete rollback reports retained recovery backup" \
+  "$incomplete_out" "recovery backup retained at"
+recovery_store_backup="$(sed -n 's/.*recovery backup retained at //p' <<<"$incomplete_out" | tail -1)"
+assert_exit "incomplete rollback preserves recoverable old hooks" 0 \
+  test -f "$recovery_store_backup/hooks/entry"
 
 # --- a stub release, and a stub fetcher that serves it --------------------------------
 
@@ -43,25 +155,200 @@ chmod +x "$IHAR_TEST_TMP/fetch"
 export IHAR_DOWNLOAD="$IHAR_TEST_TMP/fetch"
 
 write_lock() {
-  printf '{"schema":1,"installedAt":"2026-09-18T10:00:00Z",%s}\n' "$1" > "$IHAR_LOCKFILE"
+  printf '{"schema":1,%s}\n' "$1" > "$IHAR_LOCKFILE"
 }
 
 # --- the store is built, and the tracked trees are pinned --------------------------------
 
-write_lock '"codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
+cp "$ROOT/.ihar-lockfile.json" "$IHAR_LOCKFILE"
+before_lock="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
 ihar_install_store >/dev/null 2>&1
+ihar_prepare_mutable_store "$IHAR_STORE"
 assert_exit "the store tree is created" 0 test -d "$IHAR_STORE/hooks/_shared"
 assert_exit "manifests are copied in" 0 test -f "$IHAR_STORE/manifests/hooks.json"
 assert_eq "the auth directory is owner-only" "700" "$(stat -c '%a' "$IHAR_STORE/auth")"
+assert_exit "fresh install creates the Claude plugin owner" 0 \
+  test -d "$IHAR_STORE/plugins/claude"
+assert_exit "fresh install creates the Codex plugin owner" 0 \
+  test -d "$IHAR_STORE/plugins/codex"
+assert_exit "fresh install leaves absent Claude credentials for the vendor to create" 1 \
+  test -e "$IHAR_STORE/auth/claude/.credentials.json"
+assert_exit "fresh install leaves absent Codex auth for the vendor to create" 1 \
+  test -e "$IHAR_STORE/auth/codex/auth.json"
+assert_eq "the mutable inventory is explicit" \
+  $'auth/claude/.credentials.json\t.credentials.json\tfile\nauth/codex/auth.json\tauth.json\tfile\nplugins/claude\tplugins\tdirectory\nplugins/codex\tplugins\tdirectory' \
+  "$(ihar_mutable_inventory all | sort)"
+
+printf 'preserve auth\n' > "$IHAR_STORE/auth/claude/.credentials.json"
+printf 'preserve plugin\n' > "$IHAR_STORE/plugins/claude/sentinel"
+ihar_prepare_mutable_store "$IHAR_STORE"
+assert_eq "mutable store preparation preserves existing auth" "preserve auth" \
+  "$(cat "$IHAR_STORE/auth/claude/.credentials.json")"
+assert_eq "mutable store preparation preserves existing plugins" "preserve plugin" \
+  "$(cat "$IHAR_STORE/plugins/claude/sentinel")"
+
+MALFORMED_MUTABLE_ROOT="$IHAR_TEST_TMP/malformed-mutable-root"
+MALFORMED_MUTABLE_STORE="$IHAR_TEST_TMP/malformed-mutable-store"
+mkdir -p "$MALFORMED_MUTABLE_ROOT/manifests" "$MALFORMED_MUTABLE_STORE"
+printf 'not valid JSON\n' > "$MALFORMED_MUTABLE_ROOT/manifests/mutable-links.json"
+printf 'active bytes\n' > "$MALFORMED_MUTABLE_STORE/sentinel"
+malformed_mutable_before="$(sha256sum "$MALFORMED_MUTABLE_STORE/sentinel" | cut -d' ' -f1)"
+assert_exit "a malformed mutable inventory aborts store preparation" 3 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/store/assets.sh'; PYTHONPATH='$ROOT/lib/python' IHAR_ROOT='$MALFORMED_MUTABLE_ROOT' ihar_prepare_mutable_store '$MALFORMED_MUTABLE_STORE'"
+assert_eq "a malformed mutable inventory preserves the active store" \
+  "$malformed_mutable_before" \
+  "$(sha256sum "$MALFORMED_MUTABLE_STORE/sentinel" | cut -d' ' -f1)"
+
+mutable_tree_fingerprint() { # <root>
+  local root="$1"
+  {
+    find "$root" -mindepth 1 -printf '%P\t%y\t%m\t%l\n' | sort
+    find "$root" -type f -print0 | sort -z | xargs -0 -r sha256sum
+  } | sha256sum | cut -d' ' -f1
+}
+
+write_noncanonical_mutable_manifest() { # <path> <case>
+  local path="$1" case_name="$2"
+  case "$case_name" in
+    auth-dot)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/.","target":".credentials.json","kind":"file"}]}' > "$path"
+      ;;
+    duplicate-plugin-target)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/one","target":"plugins","kind":"file"},{"vendor":"claude","source":"auth/claude/two","target":"plugins/.","kind":"file"}]}' > "$path"
+      ;;
+    repeated-separator)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth//claude/.credentials.json","target":".credentials.json","kind":"file"}]}' > "$path"
+      ;;
+    trailing-separator)
+      printf '%s\n' '{"schema":1,"entries":[{"vendor":"claude","source":"auth/claude/.credentials.json","target":"plugins/","kind":"file"}]}' > "$path"
+      ;;
+  esac
+}
+
+assert_noncanonical_mutable_store_preserved() { # <case>
+  local case_name="$1" case_root store store_before inventory_status=0 prepare_status=0
+  case_root="$IHAR_TEST_TMP/install-mutable-path-$case_name"
+  store="$case_root/store"
+  mkdir -p "$case_root/manifests" "$store"
+  write_noncanonical_mutable_manifest \
+    "$case_root/manifests/mutable-links.json" "$case_name"
+  printf 'store stays\n' > "$store/sentinel"
+
+  store_before="$(mutable_tree_fingerprint "$store")"
+  IHAR_ROOT="$case_root" ihar_mutable_inventory all >/dev/null 2>&1 \
+    || inventory_status=$?
+  IHAR_ROOT="$case_root" ihar_prepare_mutable_store "$store" >/dev/null 2>&1 \
+    || prepare_status=$?
+  assert_eq "$case_name mutable path is rejected by the inventory query" \
+    "3" "$inventory_status"
+  assert_eq "$case_name mutable path aborts store preparation" "3" "$prepare_status"
+  assert_eq "$case_name mutable path leaves the store unchanged" \
+    "$store_before" "$(mutable_tree_fingerprint "$store")"
+}
+
+for case_name in auth-dot duplicate-plugin-target repeated-separator trailing-separator; do
+  assert_noncanonical_mutable_store_preserved "$case_name"
+done
+
+assert_invalid_mutable_store_preserved() { # <topology>
+  local topology="$1" case_root store outside store_before outside_before status=0
+  case_root="$IHAR_TEST_TMP/install-mutable-$topology"
+  store="$case_root/store"
+  outside="$case_root/outside"
+  mkdir -p "$store" "$outside"
+  printf 'outside stays\n' > "$outside/sentinel"
+
+  case "$topology" in
+    auth-parent-symlink)
+      ln -s "$outside" "$store/auth"
+      ;;
+    auth-leaf-symlink)
+      mkdir -p "$store/auth/claude"
+      ln -s "$outside/sentinel" "$store/auth/claude/.credentials.json"
+      ;;
+    credentials-directory)
+      mkdir -p "$store/auth/claude/.credentials.json"
+      ;;
+    plugin-file)
+      mkdir -p "$store/plugins"
+      printf 'plugin file stays\n' > "$store/plugins/claude"
+      ;;
+  esac
+
+  store_before="$(mutable_tree_fingerprint "$store")"
+  outside_before="$(mutable_tree_fingerprint "$outside")"
+  ihar_prepare_mutable_store "$store" >/dev/null 2>&1 || status=$?
+  assert_eq "$topology mutable source is rejected before preparation" "3" "$status"
+  assert_eq "$topology rejection leaves the store unchanged" \
+    "$store_before" "$(mutable_tree_fingerprint "$store")"
+  assert_eq "$topology rejection leaves outside unchanged" \
+    "$outside_before" "$(mutable_tree_fingerprint "$outside")"
+}
+
+for topology in auth-parent-symlink auth-leaf-symlink credentials-directory plugin-file; do
+  assert_invalid_mutable_store_preserved "$topology"
+done
 
 pinned="$(python3 -c "
 import json,sys
 print(len(json.load(open(sys.argv[1])).get('hooks', {})))" "$IHAR_LOCKFILE")"
 assert_exit "every hook file is pinned, not a curated list" 0 test "$pinned" -ge 5
+assert_eq "install never rewrites release lock" "$before_lock" \
+  "$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
 
 # The store is copied, never linked: a link would put the agent's writable checkout
 # back on the path a hook is loaded from.
 assert_exit "the store is a copy, not a link into the checkout" 1 test -L "$IHAR_STORE/hooks"
+
+# Conformance executes staged hooks and binaries, but reads mutable authentication
+# from the stable active store that owns it.
+CONFORMANCE_STAGE="$IHAR_TEST_TMP/conformance-stage"
+CONFORMANCE_ACTIVE="$IHAR_TEST_TMP/conformance-active"
+CONFORMANCE_ARGS="$IHAR_TEST_TMP/conformance-args"
+mkdir -p "$CONFORMANCE_STAGE/bin" "$CONFORMANCE_STAGE/nvm/bin" \
+  "$CONFORMANCE_ACTIVE/auth/claude" "$CONFORMANCE_ACTIVE/auth/codex"
+printf '#!/bin/sh\nexit 0\n' > "$CONFORMANCE_STAGE/nvm/bin/claude"
+printf '#!/bin/sh\nexit 0\n' > "$CONFORMANCE_STAGE/bin/codex"
+chmod +x "$CONFORMANCE_STAGE/nvm/bin/claude" "$CONFORMANCE_STAGE/bin/codex"
+(
+  export IHAR_STORE="$CONFORMANCE_STAGE"
+  export IHAR_CLAUDE_BIN="$CONFORMANCE_STAGE/nvm/bin/claude"
+  export IHAR_CODEX_BIN="$CONFORMANCE_STAGE/bin/codex"
+  ihar_python() { printf '%s\n' "$*" >> "$CONFORMANCE_ARGS"; }
+  ihar_install_conformance "$CONFORMANCE_ACTIVE"
+)
+assert_contains "install conformance keeps the staged store as its runtime source" \
+  "$(cat "$CONFORMANCE_ARGS")" \
+  "ihar.conformance.run claude $CONFORMANCE_STAGE/nvm/bin/claude $CONFORMANCE_STAGE"
+assert_contains "install conformance reads auth from the stable active store" \
+  "$(cat "$CONFORMANCE_ARGS")" "--auth-store $CONFORMANCE_ACTIVE"
+assert_contains "install conformance validates the immutable release lock" \
+  "$(cat "$CONFORMANCE_ARGS")" "--lockfile $IHAR_LOCKFILE"
+assert_contains "install conformance protects the stable active store" \
+  "$(cat "$CONFORMANCE_ARGS")" "--protected-store $CONFORMANCE_ACTIVE"
+assert_exit "install conformance does not copy mutable auth into its stage" 1 \
+  test -e "$CONFORMANCE_STAGE/auth"
+
+# Required asset inputs are checked before an install transaction can touch the
+# active store. Optional sources stay visible for check collection without blocking
+# publication.
+ASSET_ROOT="$IHAR_TEST_TMP/assets-root"
+ASSET_STAGE="$IHAR_TEST_TMP/assets-stage"
+mkdir -p "$ASSET_ROOT/manifests" "$ASSET_ROOT/hooks"
+printf '{"schema":1,"entries":[{"vendor":"common","source":"hooks","target":"hooks","kind":"directory","required":true,"runtime":true},{"vendor":"claude","source":"extensions","target":"extensions","kind":"directory","required":false,"runtime":true}]}\n' \
+  > "$ASSET_ROOT/manifests/assets.json"
+printf 'active asset generation\n' > "$IHAR_STORE/asset-generation"
+asset_fingerprint_before="$(sha256sum "$IHAR_STORE/asset-generation" | cut -d' ' -f1)"
+rm -rf "$ASSET_ROOT/hooks"
+assert_exit "a missing required asset aborts before transaction publication" 3 \
+  bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'; source '$ROOT/lib/core/lock.sh'; source '$ROOT/lib/store/assets.sh'; source '$ROOT/lib/store/install.sh'; PYTHONPATH='$ROOT/lib/python' IHAR_ROOT='$ASSET_ROOT' IHAR_STORE='$IHAR_STORE' IHAR_NVM='$IHAR_NVM' ihar_install_transaction install"
+assert_eq "a missing required asset preserves the active store fingerprint" \
+  "$asset_fingerprint_before" "$(sha256sum "$IHAR_STORE/asset-generation" | cut -d' ' -f1)"
+mkdir -p "$ASSET_ROOT/hooks"
+optional_assets="$(IHAR_ROOT="$ASSET_ROOT" ihar_asset_install "$ASSET_STAGE")"
+assert_contains "a missing optional asset emits a stable diagnostic" "$optional_assets" \
+  $'optional\tmissing\textensions\textensions'
+assert_exit "a missing optional asset does not block asset staging" 0 test -d "$ASSET_STAGE/hooks"
 
 # --- the command on PATH -------------------------------------------------------------------
 
@@ -97,6 +384,7 @@ assert_eq "no install step invokes sudo" "0" \
 
 # --- a Codex release is verified before it is trusted -------------------------------------------
 
+write_lock '"codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
 ihar_install_codex >/dev/null 2>&1
 assert_exit "the release is extracted" 0 test -x "$IHAR_STORE/bin/codex"
 assert_eq "and the version is stamped" "rust-v0.154.0" "$(cat "$IHAR_STORE/bin/.codex-version")"
@@ -217,5 +505,367 @@ for key in "${_IHAR_CONFIG_KEYS[@]}"; do
 done
 
 rm -f "$EXAMPLE"
+
+# --- install stages one generation and rolls every failure back ----------------------
+
+write_lock '"node":{"version":"22.23.1"},"claude":{"version":"2.1.274"},
+            "codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
+OLD_RECEIPT='{"schema":1,"release_lock_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","installed_at":"2026-09-19T00:00:00Z","components":{}}'
+COMMAND_LEGACY_STORE="$IHAR_TEST_TMP/legacy-command-store"
+mkdir -p "$COMMAND_LEGACY_STORE/hooks"
+printf 'legacy hook\n' > "$COMMAND_LEGACY_STORE/hooks/security-pretool.py"
+printf 'legacy stage proof\n' > "$COMMAND_LEGACY_STORE/hooks/migration-proof"
+printf '{"schema":1,"release_lock_sha256":"%064d","installed_at":"2026-09-18T00:00:00Z","components":{}}\n' 0 \
+  > "$COMMAND_LEGACY_STORE/install-receipt.json"
+command_legacy_before="$(find "$COMMAND_LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+
+migration_stage_observation() { # <scenario>
+  printf '%s/%s-migration-stage\n' "$IHAR_TEST_TMP" "$1"
+}
+
+assert_migration_stage_observed() { # <scenario>
+  local scenario="$1" observation content=""
+  observation="$(migration_stage_observation "$scenario")"
+  assert_exit "$scenario observes migrated content in install stage" 0 test -f "$observation"
+  [[ ! -f "$observation" ]] || content="$(cat "$observation")"
+  assert_contains "$scenario observes legacy hook bytes before installer overwrite" \
+    "$content" "legacy stage proof"
+  assert_contains "$scenario observes legacy receipt before receipt publication" \
+    "$content" '"release_lock_sha256":"0000000000000000000000000000000000000000000000000000000000000000"'
+}
+
+reset_active_generation() {
+  mkdir -p "$IHAR_STORE/hooks" "$(dirname "$IHAR_CODEX_BIN")" "$(dirname "$IHAR_CLAUDE_BIN")"
+  printf 'old hook\n' > "$IHAR_STORE/hooks/security-pretool.py"
+  printf '#!/bin/sh\necho old claude\n' > "$IHAR_CLAUDE_BIN"
+  printf '#!/bin/sh\necho old codex\n' > "$IHAR_CODEX_BIN"
+  chmod +x "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
+  printf '%s\n' "$OLD_RECEIPT" > "$IHAR_STORE/install-receipt.json"
+}
+
+generation_fingerprint() {
+  {
+    find "$IHAR_STORE/hooks" -type f -print0 | sort -z | xargs -0 sha256sum
+    for path in "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN" \
+                "$IHAR_STORE/install-receipt.json"; do
+      sha256sum "$path" | cut -d' ' -f1
+    done
+  } | sha256sum | cut -d' ' -f1
+}
+
+wait_for_install_barrier() { # <path>
+  local path="$1" attempt
+  for ((attempt=0; attempt<500; attempt++)); do
+    [[ -e "$path" ]] && return 0
+    sleep 0.01
+  done
+  return 1
+}
+
+run_install_scenario() ( # <success|paths|ownership|conformance|receipt|activation|rollback> [install|update]
+  local scenario="$1" operation="${2:-install}" migration_observation
+  export IHAR_ACTIVE_TEST_STORE="$IHAR_STORE"
+  if [[ "$scenario" == migration-* ]]; then
+    export IHAR_FLAG_MIGRATE_STORE=true IHAR_LEGACY_STORE="$COMMAND_LEGACY_STORE"
+    migration_observation="$(migration_stage_observation "$scenario")"
+    rm -f -- "$migration_observation"
+  else
+    export IHAR_FLAG_MIGRATE_STORE=false
+    unset IHAR_LEGACY_STORE
+  fi
+  ihar_install_command() { :; }
+  ihar_install_example_config() { :; }
+  ihar_install_store() {
+    if [[ "$scenario" == migration-* &&
+          -f "$IHAR_STORE/hooks/migration-proof" &&
+          -f "$IHAR_STORE/install-receipt.json" ]]; then
+      {
+        cat "$IHAR_STORE/hooks/migration-proof"
+        cat "$IHAR_STORE/install-receipt.json"
+      } > "$migration_observation"
+    fi
+    mkdir -p "$IHAR_STORE/hooks"
+    printf 'new hook\n' > "$IHAR_STORE/hooks/security-pretool.py"
+  }
+  ihar_install_python() { :; }
+  ihar_install_codex() {
+    mkdir -p "$(dirname "$IHAR_CODEX_BIN")"
+    printf '#!/bin/sh\necho new codex\n' > "$IHAR_CODEX_BIN"
+    chmod +x "$IHAR_CODEX_BIN"
+  }
+  ihar_install_claude() {
+    mkdir -p "$(dirname "$IHAR_CLAUDE_BIN")"
+    printf '#!/bin/sh\necho new claude\n' > "$IHAR_CLAUDE_BIN"
+    chmod +x "$IHAR_CLAUDE_BIN"
+  }
+  ihar_install_conformance() {
+    [[ "$scenario" != *conformance ]] || return 36
+    grep -q 'new hook' "$IHAR_STORE/hooks/security-pretool.py" || return 40
+    grep -q 'new claude' "$IHAR_CLAUDE_BIN" || return 40
+    grep -q 'new codex' "$IHAR_CODEX_BIN" || return 40
+    if [[ "$scenario" == migration-late-mutation ||
+          "$scenario" == migration-late-consumer ]]; then
+      : > "$IHAR_TEST_TMP/$scenario.conformance-entered"
+      wait_for_install_barrier "$IHAR_TEST_TMP/$scenario.conformance-release" || return 43
+    fi
+    if [[ "$scenario" == paths ]]; then
+      [[ "${1:-}" == "$IHAR_ACTIVE_TEST_STORE" ]] || return 41
+      [[ "$IHAR_STORE" == */.ihar-store-stage-* ]] || return 42
+      [[ "$IHAR_CLAUDE_BIN" == */.ihar-nvm-stage-*/npm-global/bin/claude ]] || return 42
+      [[ "$IHAR_CODEX_BIN" == */.ihar-store-stage-*/bin/codex ]] || return 42
+    fi
+    if [[ "$scenario" == ownership ]]; then
+      if [[ -e "$IHAR_STORE/auth/claude/concurrent" ||
+            -e "$IHAR_STORE/plugins/claude/concurrent" ||
+            -e "$IHAR_STORE/vendor-data/concurrent" ]]; then
+        printf 'copied\n' > "$IHAR_TEST_TMP/ownership-stage-observation"
+      else
+        printf 'clean\n' > "$IHAR_TEST_TMP/ownership-stage-observation"
+      fi
+      printf 'concurrent auth\n' > "$IHAR_ACTIVE_TEST_STORE/auth/claude/concurrent"
+      printf 'concurrent plugin\n' > "$IHAR_ACTIVE_TEST_STORE/plugins/claude/concurrent"
+      printf 'concurrent vendor data\n' > "$IHAR_ACTIVE_TEST_STORE/vendor-data/concurrent"
+    fi
+  }
+  ihar_publish_install_receipt() {
+    [[ "$scenario" != *receipt ]] || return 37
+    ihar_python ihar.install_receipt build "$IHAR_LOCKFILE" \
+      "$IHAR_STORE/install-receipt.json" "$IHAR_CLAUDE_BIN" "$IHAR_CODEX_BIN"
+  }
+  ihar_install_move() {
+    if [[ ( "$scenario" == activation || "$scenario" == rollback ||
+            "$scenario" == migration-rollback ) &&
+          "$1" == */.ihar-store-stage-*/install-receipt.json &&
+          "$2" == "$IHAR_ACTIVE_TEST_STORE/install-receipt.json" ]]; then
+      return 39
+    fi
+    if [[ ( "$scenario" == rollback || "$scenario" == migration-rollback ) &&
+          "$1" == */.ihar-install-backup-*/install-receipt.json &&
+          "$2" == "$IHAR_ACTIVE_TEST_STORE/install-receipt.json" ]]; then
+      return 41
+    fi
+    command mv "$@"
+  }
+  if [[ "$operation" == update ]]; then
+    ihar_codex_daemon_stop_all() { :; }
+    ihar_codex_daemon_start_pending() { :; }
+    _ihar_update_all
+  else
+    _ihar_install_all
+  fi
+)
+
+before_lock="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
+for scenario in conformance receipt activation; do
+  reset_active_generation
+  before_generation="$(generation_fingerprint)"
+  case "$scenario" in
+    conformance) expected_status=36 ;;
+    receipt) expected_status=37 ;;
+    activation) expected_status=39 ;;
+  esac
+  assert_exit "$scenario failure aborts install" "$expected_status" \
+    run_install_scenario "$scenario"
+  assert_eq "$scenario failure preserves exact active generation and receipt" \
+    "$before_generation" "$(generation_fingerprint)"
+  assert_exit "$scenario failure leaves Claude executable usable" 0 "$IHAR_CLAUDE_BIN"
+  assert_exit "$scenario failure leaves Codex executable usable" 0 "$IHAR_CODEX_BIN"
+done
+
+reset_active_generation
+rm -f -- "$IHAR_TEST_TMP/migration-late-mutation.conformance-"{entered,release}
+late_mutation_generation="$(generation_fingerprint)"
+run_install_scenario migration-late-mutation \
+  >"$IHAR_TEST_TMP/migration-late-mutation.out" 2>&1 &
+late_mutation_pid=$!
+assert_exit "migrated install reaches paused conformance before late mutation" 0 \
+  wait_for_install_barrier "$IHAR_TEST_TMP/migration-late-mutation.conformance-entered"
+printf 'late mutation\n' >> "$COMMAND_LEGACY_STORE/hooks/security-pretool.py"
+touch "$IHAR_TEST_TMP/migration-late-mutation.conformance-release"
+late_mutation_status=0
+wait "$late_mutation_pid" || late_mutation_status=$?
+assert_eq "late legacy mutation aborts before activation" "3" "$late_mutation_status"
+assert_eq "late legacy mutation preserves prior active generation and receipt" \
+  "$late_mutation_generation" "$(generation_fingerprint)"
+assert_contains "late legacy mutation remains in copy-only source evidence" \
+  "$(cat "$COMMAND_LEGACY_STORE/hooks/security-pretool.py")" "late mutation"
+printf 'legacy hook\n' > "$COMMAND_LEGACY_STORE/hooks/security-pretool.py"
+
+reset_active_generation
+rm -f -- "$IHAR_TEST_TMP/migration-late-consumer.conformance-"{entered,release} \
+  "$IHAR_TEST_TMP/migration-late-consumer.consumer-"{ready,release}
+late_consumer_generation="$(generation_fingerprint)"
+run_install_scenario migration-late-consumer \
+  >"$IHAR_TEST_TMP/migration-late-consumer.out" 2>&1 &
+late_consumer_install_pid=$!
+assert_exit "migrated install reaches paused conformance before late consumer" 0 \
+  wait_for_install_barrier "$IHAR_TEST_TMP/migration-late-consumer.conformance-entered"
+bash -c 'exec 9>>"$1"; : > "$2"; while [[ ! -e "$3" ]]; do sleep 0.01; done' _ \
+  "$COMMAND_LEGACY_STORE/hooks/security-pretool.py" \
+  "$IHAR_TEST_TMP/migration-late-consumer.consumer-ready" \
+  "$IHAR_TEST_TMP/migration-late-consumer.consumer-release" &
+late_consumer_pid=$!
+assert_exit "late legacy consumer opens the staged source before activation" 0 \
+  wait_for_install_barrier "$IHAR_TEST_TMP/migration-late-consumer.consumer-ready"
+touch "$IHAR_TEST_TMP/migration-late-consumer.conformance-release"
+late_consumer_status=0
+wait "$late_consumer_install_pid" || late_consumer_status=$?
+touch "$IHAR_TEST_TMP/migration-late-consumer.consumer-release"
+wait "$late_consumer_pid"
+assert_eq "late legacy consumer aborts before activation" "3" "$late_consumer_status"
+assert_eq "late legacy consumer preserves prior active generation and receipt" \
+  "$late_consumer_generation" "$(generation_fingerprint)"
+assert_eq "late legacy consumer leaves source evidence byte-identical" \
+  "$command_legacy_before" \
+  "$(find "$COMMAND_LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+
+for scenario in migration-conformance migration-receipt; do
+  reset_active_generation
+  before_generation="$(generation_fingerprint)"
+  case "$scenario" in
+    migration-conformance) expected_status=36 ;;
+    migration-receipt) expected_status=37 ;;
+  esac
+  assert_exit "$scenario failure aborts install" "$expected_status" \
+    run_install_scenario "$scenario"
+  assert_eq "$scenario failure preserves prior active generation and receipt" \
+    "$before_generation" "$(generation_fingerprint)"
+  assert_exit "$scenario failure leaves prior Claude executable usable" 0 "$IHAR_CLAUDE_BIN"
+  assert_exit "$scenario failure leaves prior Codex executable usable" 0 "$IHAR_CODEX_BIN"
+  assert_eq "$scenario failure leaves legacy source byte-identical" \
+    "$command_legacy_before" \
+    "$(find "$COMMAND_LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+  assert_migration_stage_observed "$scenario"
+done
+
+reset_active_generation
+assert_exit "conformance loads staged hooks and binaries while protecting active store" 0 \
+  run_install_scenario paths
+
+reset_active_generation
+before_generation="$(generation_fingerprint)"
+assert_exit "receipt failure aborts update" 37 run_install_scenario receipt update
+assert_eq "receipt failure preserves exact active generation across update" \
+  "$before_generation" "$(generation_fingerprint)"
+assert_eq "failed installs never rewrite release lock" "$before_lock" \
+  "$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
+assert_exit "failed installs leak no store stage" 1 \
+  compgen -G "$(dirname "$IHAR_STORE")/.ihar-store-stage-*"
+assert_exit "failed installs leak no NVM stage" 1 \
+  compgen -G "$(dirname "$IHAR_NVM")/.ihar-nvm-stage-*"
+assert_exit "failed installs leak no activation backup" 1 \
+  compgen -G "$(dirname "$IHAR_STORE")/.ihar-install-backup-*"
+
+reset_active_generation
+mkdir -p "$IHAR_STORE/auth/claude" "$IHAR_STORE/plugins/claude" "$IHAR_STORE/vendor-data"
+printf 'initial auth\n' > "$IHAR_STORE/auth/claude/concurrent"
+printf 'initial plugin\n' > "$IHAR_STORE/plugins/claude/concurrent"
+printf 'initial vendor data\n' > "$IHAR_STORE/vendor-data/concurrent"
+printf 'stable lock\n' > "$IHAR_STORE/.ihar-store.lock"
+lock_inode="$(stat -c '%i' "$IHAR_STORE/.ihar-store.lock")"
+assert_exit "transaction stages only installer-owned store paths" 0 \
+  run_install_scenario ownership
+assert_eq "mutable store paths are not copied into the generation stage" "clean" \
+  "$(cat "$IHAR_TEST_TMP/ownership-stage-observation")"
+assert_eq "concurrent auth writes survive activation" "concurrent auth" \
+  "$(cat "$IHAR_STORE/auth/claude/concurrent")"
+assert_eq "concurrent plugin writes survive activation" "concurrent plugin" \
+  "$(cat "$IHAR_STORE/plugins/claude/concurrent")"
+assert_eq "concurrent vendor data writes survive activation" "concurrent vendor data" \
+  "$(cat "$IHAR_STORE/vendor-data/concurrent")"
+assert_eq "stable lock inode survives activation" "$lock_inode" \
+  "$(stat -c '%i' "$IHAR_STORE/.ihar-store.lock")"
+
+reset_active_generation
+rollback_output="$(run_install_scenario rollback 2>&1)"
+rollback_status=$?
+assert_eq "incomplete rollback reports recovery failure" 3 "$rollback_status"
+recovery_backup="$(compgen -G "$(dirname "$IHAR_STORE")/.ihar-install-backup-*" | head -1)"
+assert_exit "incomplete rollback retains recovery backup" 0 test -n "$recovery_backup"
+assert_contains "incomplete rollback reports retained backup path" "$rollback_output" \
+  ".ihar-install-backup-"
+assert_exit "incomplete rollback retains prior receipt for recovery" 0 \
+  test -f "$recovery_backup/install-receipt.json"
+assert_contains "retained recovery receipt has prior bytes" \
+  "$(cat "$recovery_backup/install-receipt.json")" '"release_lock_sha256":"aaaaaaaa'
+assert_contains "rollback continues restoring hooks after one restore failure" \
+  "$(cat "$IHAR_STORE/hooks/security-pretool.py")" "old hook"
+assert_contains "rollback continues restoring Claude after one restore failure" \
+  "$(cat "$IHAR_CLAUDE_BIN")" "old claude"
+assert_contains "rollback continues restoring Codex after one restore failure" \
+  "$(cat "$IHAR_CODEX_BIN")" "old codex"
+rm -rf -- "$recovery_backup"
+
+reset_active_generation
+migration_rollback_output="$(run_install_scenario migration-rollback 2>&1)"
+migration_rollback_status=$?
+assert_eq "migrated install with incomplete rollback is fail-closed" 3 \
+  "$migration_rollback_status"
+migration_recovery_backup="$(compgen -G "$(dirname "$IHAR_STORE")/.ihar-install-backup-*" | head -1)"
+assert_exit "migrated install retains one recovery backup" 0 \
+  test -n "$migration_recovery_backup"
+assert_contains "migrated install reports retained recovery backup" \
+  "$migration_rollback_output" ".ihar-install-backup-"
+assert_contains "migrated install recovery keeps pre-command receipt" \
+  "$(cat "$migration_recovery_backup/install-receipt.json")" \
+  '"release_lock_sha256":"aaaaaaaa'
+assert_contains "migrated install rollback restores pre-command hooks" \
+  "$(cat "$IHAR_STORE/hooks/security-pretool.py")" "old hook"
+assert_eq "incomplete migrated install leaves legacy source byte-identical" \
+  "$command_legacy_before" \
+  "$(find "$COMMAND_LEGACY_STORE" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+assert_migration_stage_observed migration-rollback
+
+reset_active_generation
+rm -rf "$IHAR_STORE/auth" "$IHAR_STORE/plugins"
+run_install_scenario success >/dev/null 2>&1
+assert_exit "successful transaction prepares active mutable owners" 0 \
+  test -d "$IHAR_STORE/auth/claude"
+assert_exit "successful transaction prepares active plugin owners" 0 \
+  test -d "$IHAR_STORE/plugins/codex"
+assert_contains "successful install activates staged hook bytes" \
+  "$(cat "$IHAR_STORE/hooks/security-pretool.py")" "new hook"
+assert_contains "successful install activates staged Claude bytes" \
+  "$(cat "$IHAR_CLAUDE_BIN")" "new claude"
+assert_contains "successful install activates staged Codex bytes" \
+  "$(cat "$IHAR_CODEX_BIN")" "new codex"
+
+expected_lock_sha="$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
+expected_claude_sha="$(sha256sum "$IHAR_CLAUDE_BIN" | cut -d' ' -f1)"
+expected_codex_sha="$(sha256sum "$IHAR_CODEX_BIN" | cut -d' ' -f1)"
+receipt_values="$(python3 - "$IHAR_STORE/install-receipt.json" <<'PY'
+import sys
+from ihar.install_receipt import read_receipt
+
+receipt = read_receipt(sys.argv[1])
+print(receipt["release_lock_sha256"])
+print(receipt["components"]["claude"]["version"])
+print(receipt["components"]["claude"]["binary_sha256"])
+print(receipt["components"]["codex"]["version"])
+print(receipt["components"]["codex"]["binary_sha256"])
+PY
+)"
+assert_eq "receipt records release and executable evidence" \
+  "$expected_lock_sha
+2.1.274
+$expected_claude_sha
+rust-v0.154.0
+$expected_codex_sha" "$receipt_values"
+assert_eq "receipt is owner-only" "600" "$(stat -c '%a' "$IHAR_STORE/install-receipt.json")"
+assert_eq "successful install preserves release lock" "$before_lock" \
+  "$(sha256sum "$IHAR_LOCKFILE" | cut -d' ' -f1)"
+assert_exit "successful publication leaves no temp" 1 compgen -G "$IHAR_STORE/.install-receipt-*"
+
+chmod -x "$IHAR_CODEX_BIN"
+ihar_publish_install_receipt
+receipt_vendors="$(python3 - "$IHAR_STORE/install-receipt.json" <<'PY'
+import json
+import sys
+
+print(" ".join(sorted(json.load(open(sys.argv[1], encoding="utf-8"))["components"])))
+PY
+)"
+assert_eq "receipt hashes only executables that exist" "claude" "$receipt_vendors"
+chmod +x "$IHAR_CODEX_BIN"
 
 finish

@@ -165,12 +165,193 @@ accept "a nested script path inside the hooks directory is accepted" hook-manife
 # --- every JSON contract the LLD specifies has a registered kind ------------------
 
 for kind in profile netpolicy hook-manifest mcp-registry capabilities session \
-            launch-claim handoff daemon-record conformance home-marker lockfile; do
+            launch-claim handoff daemon-record conformance home-marker lockfile \
+            install-receipt state-manifest asset-manifest mutable-link-manifest \
+            test-inventory; do
   assert_exit "contract kind '$kind' is registered" 0 py "
 import sys
 from ihar import jsonio
 sys.exit(0 if sys.argv[1] in jsonio.KINDS else 1)
 " "$kind"
 done
+
+
+assert_exit "the persistent-state manifest validates" 0 \
+  py 'import sys; from ihar import jsonio; jsonio.read("state-manifest", sys.argv[1])' \
+  "$ROOT/manifests/state.json"
+
+# --- tracked assets are one safe, explicit inventory -----------------------------
+
+asset_entry="{'vendor':'common','source':'hooks','target':'hooks','kind':'directory',
+             'required':True,'runtime':False}"
+
+accept "a minimal asset inventory entry is accepted" asset-manifest \
+  "{'schema':1,'entries':[$asset_entry]}"
+reject "an asset source that escapes its root is rejected" asset-manifest \
+  "{'schema':1,'entries':[{**$asset_entry,'source':'../auth'}]}"
+reject "an asset target that escapes its runtime is rejected" asset-manifest \
+  "{'schema':1,'entries':[{**$asset_entry,'target':'../hooks'}]}"
+reject "authentication is not a tracked asset" asset-manifest \
+  "{'schema':1,'entries':[{**$asset_entry,'source':'auth/claude'}]}"
+reject "generated settings are not tracked assets" asset-manifest \
+  "{'schema':1,'entries':[{**$asset_entry,'target':'settings.json'}]}"
+reject "state is not a tracked asset" asset-manifest \
+  "{'schema':1,'entries':[{**$asset_entry,'source':'st/codex'}]}"
+reject "an asset target is unique per vendor" asset-manifest \
+  "{'schema':1,'entries':[$asset_entry, {**$asset_entry,'source':'skills'}]}"
+
+assert_exit "the tracked-asset manifest validates" 0 \
+  py 'import sys; from ihar import jsonio; jsonio.read("asset-manifest", sys.argv[1])' \
+  "$ROOT/manifests/assets.json"
+
+# Runtime generation identity is a semantic projection of the validated asset
+# inventory, not the manifest's byte layout. Optional source presence is part of
+# that projection because it changes which runtime links can be materialised.
+ASSET_IDENTITY_ROOT="$IHAR_TEST_TMP/asset-identity"
+mkdir -p "$ASSET_IDENTITY_ROOT/required"
+printf 'required\n' > "$ASSET_IDENTITY_ROOT/required/instructions.md"
+cat > "$ASSET_IDENTITY_ROOT/first.json" <<'JSON'
+{"schema":1,"entries":[
+  {"vendor":"common","source":"optional/tools","target":"tools","kind":"directory","required":false,"runtime":true},
+  {"vendor":"claude","source":"required/instructions.md","target":"CLAUDE.md","kind":"file","required":true,"runtime":true}
+]}
+JSON
+cat > "$ASSET_IDENTITY_ROOT/reordered.json" <<'JSON'
+{
+  "entries": [
+    {"runtime": true, "required": true, "kind": "file", "target": "CLAUDE.md", "source": "required/instructions.md", "vendor": "claude"},
+    {"runtime": true, "required": false, "kind": "directory", "target": "tools", "source": "optional/tools", "vendor": "common"}
+  ],
+  "schema": 1
+}
+JSON
+assert_exit "asset runtime identity query succeeds" 0 \
+  python3 -m ihar.inventory asset-identity \
+    "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT"
+asset_identity_first="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+asset_identity_reordered="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/reordered.json" all "$ASSET_IDENTITY_ROOT")"
+assert_eq "asset identity ignores JSON and entry ordering" \
+  "$asset_identity_first" "$asset_identity_reordered"
+
+mkdir -p "$ASSET_IDENTITY_ROOT/optional"
+printf 'wrong kind\n' > "$ASSET_IDENTITY_ROOT/optional/tools"
+asset_identity_optional_wrong_kind="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+assert_exit "an optional wrong-kind source differs from absence" 1 \
+  test "$asset_identity_first" = "$asset_identity_optional_wrong_kind"
+
+rm "$ASSET_IDENTITY_ROOT/optional/tools"
+mkdir "$ASSET_IDENTITY_ROOT/optional/tools"
+asset_identity_optional_present="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+assert_exit "an optional correct-kind source differs from absence" 1 \
+  test "$asset_identity_first" = "$asset_identity_optional_present"
+assert_exit "an optional correct-kind source differs from wrong kind" 1 \
+  test "$asset_identity_optional_wrong_kind" = "$asset_identity_optional_present"
+
+python3 - "$ASSET_IDENTITY_ROOT/first.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+document = json.load(open(path, encoding="utf-8"))
+document["entries"].append({
+    "vendor": "codex", "source": "required/new.txt", "target": "new.txt",
+    "kind": "file", "required": True, "runtime": True,
+})
+json.dump(document, open(path, "w", encoding="utf-8"))
+PY
+asset_identity_required_absent="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+assert_exit "a required runtime inventory addition changes asset identity" 1 \
+  test "$asset_identity_optional_present" = "$asset_identity_required_absent"
+mkdir -p "$ASSET_IDENTITY_ROOT/required/new.txt"
+asset_identity_required_wrong_kind="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+assert_exit "a required wrong-kind source differs from absence" 1 \
+  test "$asset_identity_required_absent" = "$asset_identity_required_wrong_kind"
+rm -rf "$ASSET_IDENTITY_ROOT/required/new.txt"
+printf 'required new\n' > "$ASSET_IDENTITY_ROOT/required/new.txt"
+asset_identity_required_present="$(python3 -m ihar.inventory asset-identity \
+  "$ASSET_IDENTITY_ROOT/first.json" all "$ASSET_IDENTITY_ROOT")"
+assert_exit "a required correct-kind source differs from absence" 1 \
+  test "$asset_identity_required_absent" = "$asset_identity_required_present"
+assert_exit "a required correct-kind source differs from wrong kind" 1 \
+  test "$asset_identity_required_wrong_kind" = "$asset_identity_required_present"
+
+# --- mutable auth and plugin links are separate from tracked assets ---------------
+
+mutable_entry="{'vendor':'claude','source':'auth/claude/.credentials.json',
+                 'target':'.credentials.json','kind':'file'}"
+
+accept "a minimal mutable-link entry is accepted" mutable-link-manifest \
+  "{'schema':1,'entries':[$mutable_entry]}"
+reject "a mutable source cannot escape the store" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'source':'../credentials'}]}"
+reject "a mutable runtime target cannot escape its home" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'target':'../credentials'}]}"
+reject "a mutable source cannot use a dot-segment alias" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'source':'auth/claude/.'}]}"
+reject "a mutable target cannot be a dot segment" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'target':'.'}]}"
+reject "a mutable source cannot use repeated separators" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'source':'auth//claude/.credentials.json'}]}"
+reject "a mutable target cannot use a trailing separator" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'target':'plugins/'}]}"
+reject "persistent state is not a mutable auth or plugin link" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'source':'st/claude/history.jsonl'}]}"
+reject "a mutable runtime target is unique per vendor" mutable-link-manifest \
+  "{'schema':1,'entries':[$mutable_entry, {**$mutable_entry,'source':'auth/claude/other'}]}"
+reject "mutable target aliases are duplicate paths" mutable-link-manifest \
+  "{'schema':1,'entries':[{**$mutable_entry,'target':'plugins'},
+    {**$mutable_entry,'source':'auth/claude/other','target':'plugins/.'}]}"
+
+assert_exit "the mutable-link manifest validates" 0 \
+  py 'import sys; from ihar import jsonio; jsonio.read("mutable-link-manifest", sys.argv[1])' \
+  "$ROOT/manifests/mutable-links.json"
+
+assert_exit "the tracked release lockfile validates" 0 \
+  py 'import sys; from ihar import jsonio; jsonio.read("lockfile", sys.argv[1])' \
+  "$ROOT/.ihar-lockfile.json"
+
+# --- executable test inventory is closed and safe ------------------------------------
+
+test_path="{'schema':1,'paths':['tests/test_contracts.sh']}"
+accept "a minimal test inventory is accepted" test-inventory "$test_path"
+reject "duplicate test paths are rejected" test-inventory \
+  "{'schema':1,'paths':['tests/test_contracts.sh','tests/test_contracts.sh']}"
+reject "a test path cannot escape the repository" test-inventory \
+  "{'schema':1,'paths':['../outside/test_bad.sh']}"
+reject "inventory paths must name discovered test files" test-inventory \
+  "{'schema':1,'paths':['tests/helpers.sh']}"
+
+assert_exit "the shipped test inventory validates" 0 \
+  py 'import sys; from ihar import jsonio; jsonio.read("test-inventory", sys.argv[1])' \
+  "$ROOT/manifests/tests.json"
+
+MISSING_INVENTORY="$IHAR_TEST_TMP/missing-tests.json"
+printf '%s\n' '{"schema":1,"paths":["tests/test_missing.sh"]}' > "$MISSING_INVENTORY"
+assert_exit "the runner rejects a missing inventory path before execution" 3 \
+  env IHAR_TEST_INVENTORY="$MISSING_INVENTORY" bash "$ROOT/tests/run.sh"
+
+assert_exit "every shipped hook has exactly one reviewed release pin" 0 \
+  py '
+import pathlib, sys
+from ihar import jsonio
+root = pathlib.Path(sys.argv[1])
+lock = jsonio.read("lockfile", root / ".ihar-lockfile.json")
+hooks = {
+    path.relative_to(root).as_posix()
+    for path in (root / "hooks").rglob("*")
+    if path.is_file() and "__pycache__" not in path.parts
+}
+managed_root = root / "managed-hooks"
+managed = {
+    path.relative_to(root).as_posix()
+    for path in managed_root.rglob("*")
+    if path.is_file()
+} if managed_root.is_dir() else set()
+sys.exit(0 if set(lock["hooks"]) == hooks and set(lock["managedHooks"]) == managed else 1)
+' "$ROOT"
 
 finish

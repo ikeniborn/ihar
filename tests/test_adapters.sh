@@ -8,12 +8,16 @@ ihar_sandbox
 
 PROJECT="$IHAR_TEST_TMP/proj"
 mkdir -p "$PROJECT"
+cp -R "$ROOT/hooks" "$ROOT/manifests" "$ROOT/skills" "$IHAR_STORE/"
 
 ihar() {
   ( cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
       "$ROOT/ihar.sh" "$@" ) 2>&1
 }
-argv() { ihar --dry-run "$@" | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["argv"][1:]))'; }
+argv() {
+  ihar --dry-run "$@" | sed -n '/^{/,$p' \
+    | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["argv"][1:]))'
+}
 
 # --- the passthrough separator differs per vendor ----------------------------------
 #
