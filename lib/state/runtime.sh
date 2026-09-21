@@ -90,6 +90,9 @@ _ihar_runtime_materialise() {
 
   # A manifest change selects a new generation. Before building it, recover state
   # materialized in exactly one older pre-manifest runtime, if present.
+  # Validate required store topology first: an invalid release asset must not cause
+  # persistent-state migration or any other runtime mutation.
+  ihar_validate_runtime_asset_sources "$vendor" || return
   ihar_upgrade_runtime_state "$vendor" "$IHAR_STATE" || return
 
   local staging

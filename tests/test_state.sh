@@ -247,6 +247,28 @@ assert_exit "required wrong kind creates no runtime generation" 1 \
 assert_eq "required wrong kind creates no runtime staging tree" "0" \
   "$(find "$ASSET_HASH_STATE/r" -maxdepth 1 -type d -name '.staging-*' | wc -l)"
 
+# Invalid required assets must be rejected before a legacy materialized owner is
+# migrated into canonical state or rewritten as a link.
+required_owner="$ASSET_HASH_STATE/r/legacy-owner/claude"
+mkdir -p "$required_owner"
+printf 'legacy history\n' > "$required_owner/.claude.json"
+required_owner_before="$(sha256sum "$required_owner/.claude.json" | cut -d' ' -f1)"
+required_owner_status=0
+(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
+  IHAR_STATE="$ASSET_HASH_STATE" \
+  ihar_runtime_materialise claude "$asset_hash_required_wrong") \
+  >/dev/null 2>&1 || required_owner_status=$?
+assert_eq "required wrong kind rejects before state migration" "3" "$required_owner_status"
+assert_exit "required asset rejection preserves materialized owner kind" 0 \
+  test -f "$required_owner/.claude.json"
+assert_eq "required asset rejection preserves materialized owner bytes" \
+  "$required_owner_before" "$(sha256sum "$required_owner/.claude.json" | cut -d' ' -f1)"
+assert_exit "required asset rejection publishes no canonical history" 1 \
+  test -e "$ASSET_HASH_STATE/st/claude/.claude.json"
+assert_eq "required asset rejection creates no recovery state" "0" \
+  "$(find "$ASSET_HASH_STATE/recovery" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+rm -rf "$required_owner"
+
 rm -rf "$ASSET_HASH_STORE/required/new.txt"
 IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
   ihar_asset_install "$ASSET_HASH_STORE" >/dev/null

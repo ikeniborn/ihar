@@ -103,6 +103,24 @@ ihar_verify_runtime_asset_links() {
   done <<< "$inventory"
 }
 
+# ihar_validate_runtime_asset_sources <vendor> — reject invalid required store
+# topology before runtime-state migration or runtime-home mutation.
+ihar_validate_runtime_asset_sources() {
+  local vendor="$1" inventory source target kind required runtime_link topology
+  inventory="$(ihar_asset_topology_inventory "$vendor")" || return 3
+  while IFS=$'\t' read -r source target kind required runtime_link topology; do
+    [[ "$runtime_link" == true && "$required" == true ]] || continue
+    if [[ "$topology" == absent ]]; then
+      ihar_error "required runtime asset is missing from the store: $IHAR_STORE/$source"
+      return 3
+    fi
+    if [[ "$topology" != "$kind" ]]; then
+      ihar_error "required runtime asset has topology $topology, expected $kind: $IHAR_STORE/$source"
+      return 3
+    fi
+  done <<< "$inventory"
+}
+
 # ihar_verify_runtime_state_links <vendor> <runtime-dir> <state-dir> — reconcile
 # state links when reusing a published runtime. This never removes a materialised
 # runtime entry: that entry may contain the only copy of vendor state from an older
@@ -202,6 +220,7 @@ _ihar_link() {
 ihar_link_runtime() {
   local vendor="$1" runtime="$2" state="$3" asset_inventory mutable_inventory source name kind required runtime_link topology suffix inventory
 
+  ihar_validate_runtime_asset_sources "$vendor" || return 3
   asset_inventory="$(ihar_asset_topology_inventory "$vendor")" || return 3
   mutable_inventory="$(ihar_mutable_inventory "$vendor")" || return 3
   ihar_mutable_preflight "$IHAR_STORE" "$vendor" || return 3
