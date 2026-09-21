@@ -1,4 +1,4 @@
-read = ["ihar", "iclaude", "icodex"]
+read = ["ihar", "iclaude", "icodex", "minipc"]
 write = ["ihar"]
 primary = "ihar"
 
