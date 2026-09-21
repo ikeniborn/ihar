@@ -2,7 +2,7 @@
 
 ## Status
 
-Lifecycle completion-pending. `docs/lld/unified-harness.md` is revision 12 and, together with `README.md`, describes the effective contracts reviewed through `e54b6c4` without weakening fail-closed behavior or data-preservation guarantees. Executable commits after the previously verified fingerprint supersede that full-suite result; a new final suite has not yet run on the current executable state.
+Lifecycle completion-pending until result-gate and task-ledger closure. `docs/lld/unified-harness.md` is revision 12 and, together with `README.md`, describes the effective contracts reviewed through `e54b6c4` without weakening fail-closed behavior or data-preservation guarantees. The complete test inventory passed on executable commit `731546b`.
 
 ## Inputs reconciled
 
@@ -32,13 +32,14 @@ Documentation-only checks on the final three-file diff:
 - Positive contract search for actual-store topology identity, pre-state-mutation asset validation, cleanup quiescence, activation-time legacy revalidation, four observed network facts, pre-spawn artifact lineage, and Linux/Darwin atomic swaps — exit 0.
 - Carrier checks for runtime upgrade, cleanup, asset topology, store migration, network evidence, their focused tests, and the 28-entry `manifests/tests.json` — exit 0.
 - Superseded historical evidence: fingerprint `1c2d872c9798bcf1fd2aad808c8e3a9c3b63d6b82bb7195c3b23edc3179e3b63` at verification head `fdb365c240f65cc0cea7d8ed4d74a2746af8da95`; `bash tests/run.sh` then exited 0 with `files=28 failed=0`. The ten executable commits listed above invalidate that fingerprint as current final-suite evidence.
-- No code suite was run for this documentation-only reconciliation. Focused evidence attached to the approved commits does not replace the required new final full-suite run.
+- The first final-suite attempt at executable head `63b7fed` exited 1: `tests/test_concurrency.sh` lacked stubs for newly required runtime asset guards. Its other 27 test files passed. Commit `731546b` updated only the concurrent test worker's stub boundary; `bash tests/test_concurrency.sh` exited 0 with `PASS=33 FAIL=0`, without child-process errors.
+- Final `bash tests/run.sh` on executable head `731546bcd4548eb62f24a16ea19a66c33a0b6266` exited 0 with `files=28 failed=0`. This documentation-only update does not change executable inputs.
 
 ## Scope and blockers
 
 - Changed only `README.md`, `docs/lld/unified-harness.md`, and this report.
 - Preserved the pre-existing user-owned `.iwiki.toml` modification and all code/test files.
-- Lifecycle remains completion-pending until a new final full suite passes on the current executable fingerprint. Durable iwiki/task-ledger reconciliation, lint, and code-graph publication also remain parent-owned follow-up work.
+- Hosted iwiki task page and concept documentation were updated and linted; the code graph was published with `state=ready`, `fresh=true`, `wiki_links_stale=false` before the test-only commit. Lifecycle remains completion-pending until result-gate, final task-ledger evidence, and lint complete.
 
 ## Proposed changelog
 
