@@ -203,7 +203,16 @@ IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" IHAR_TEST_WRITE_PROOF=true 
 assert_eq "symlink proof blocks explicit retry" 3 "$symlink_retry_status"
 assert_exit "symlink proof aborts before live runner" 1 test -e "$EVIDENCE"
 assert_exit "symlink proof remains untouched" 0 test -L "$IHAR_STORE/verification/claude-trap.json"
+assert_exit "failed revocation cannot reuse old Claude proof" 3 enforced_claude_gate
+assert_exit "failed revocation keeps Claude recheck pending" 0 \
+  test -d "$IHAR_STORE/verification/.recheck-claude"
 rm -f -- "$IHAR_STORE/verification/claude-trap.json"
+IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" IHAR_TEST_WRITE_PROOF=true \
+  IHAR_CLAUDE_BIN="$VENDOR_STUB" IHAR_CODEX_BIN="$IHAR_TEST_TMP/no-codex" \
+  ihar check --conformance >/dev/null
+assert_exit "passing retry clears Claude recheck marker" 1 \
+  test -e "$IHAR_STORE/verification/.recheck-claude"
+assert_exit "passing retry restores enforced Claude gate" 0 enforced_claude_gate
 
 # --- the masking floor may be tightened, never loosened ------------------------------
 #

@@ -82,13 +82,20 @@ ihar_store_verify_conformance() {
   [[ "$strict" == true ]] || return 0
   [[ "${IHAR_PROFILE_HOOKS:-best-effort}" == "enforced" ]] || return 0
 
-  local vendor="${IHAR_VENDOR:-}" binary version record
+  local vendor="${IHAR_VENDOR:-}" binary version record verification marker
   [[ -n "$vendor" ]] || return 0
   case "$vendor" in
     claude) binary="$IHAR_CLAUDE_BIN" ;;
     codex)  binary="$IHAR_CODEX_BIN" ;;
   esac
   [[ -x "$binary" ]] || ihar_die 3 "profile '$IHAR_PROFILE' enforces hooks but the $vendor binary is absent"
+
+  verification="$IHAR_STORE/verification"
+  marker="$verification/.recheck-$vendor"
+  [[ -d "$verification" && ! -L "$verification" ]] \
+    || ihar_die 3 "hook enforcement is unproven for $vendor: verification store unavailable"
+  [[ ! -e "$marker" && ! -L "$marker" ]] \
+    || ihar_die 3 "hook enforcement is unproven for $vendor: conformance recheck incomplete"
 
   version="$(ihar_version_slug "$binary")"
   record="$IHAR_STORE/verification/$vendor-$version.json"

@@ -65,6 +65,9 @@ record exists. An install or update of an existing generation is different: fail
 incomplete live conformance aborts activation and keeps the prior generation, receipt and
 proof records.
 
+An explicit recheck revokes the prior managed proof for each checked vendor. If it fails,
+the enforced profile stays closed until that vendor passes a later recheck.
+
 The specialised Firecracker guest comes from a compatible, locally built asset directory.
 Its `firecracker`, `vmlinux` and `rootfs.ext4` files are checked against lockfile
 digests. The three SSH key files are checked for their expected format and pairing;
