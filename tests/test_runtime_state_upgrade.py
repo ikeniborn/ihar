@@ -1118,10 +1118,167 @@ def test_atomic_exchange_uses_one_renameat2_exchange_syscall():
 
     renameat2 = RenameAt2()
     libc = type("LibC", (), {"renameat2": renameat2})()
-    with mock.patch.object(module.ctypes, "CDLL", return_value=libc):
+    with mock.patch.object(module.sys, "platform", "linux"), \
+         mock.patch.object(module.ctypes, "CDLL", return_value=libc):
         module._exchange_directories(10, "staged", 20, "canonical")
 
     assert calls == [(10, b"staged", 20, b"canonical", module._RENAME_EXCHANGE)]
+
+
+def test_macos_atomic_exchange_uses_renameatx_np_swap():
+    module = implementation()
+    calls = []
+
+    class RenameAtxNp:
+        argtypes = None
+        restype = None
+
+        def __call__(self, *args):
+            calls.append(args)
+            return 0
+
+    renameatx_np = RenameAtxNp()
+    libc = type("LibC", (), {"renameatx_np": renameatx_np})()
+    with mock.patch.object(module.sys, "platform", "darwin"), \
+         mock.patch.object(module.ctypes, "CDLL", return_value=libc):
+        module._exchange_directories(10, "staged", 20, "canonical")
+
+    assert calls == [(10, b"staged", 20, b"canonical", module._RENAME_SWAP)]
+
+
+def test_unsupported_platform_exchange_fails_without_mutation():
+    module = implementation()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        staged = root / "staged"
+        canonical = root / "canonical"
+        staged.mkdir()
+        canonical.mkdir()
+        (staged / "value").write_text("staged\n", encoding="utf-8")
+        (canonical / "value").write_text("canonical\n", encoding="utf-8")
+        parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with mock.patch.object(module.sys, "platform", "freebsd14"):
+                try:
+                    module._exchange_directories(parent_fd, "staged", parent_fd, "canonical")
+                except OSError as error:
+                    assert "unavailable" in str(error)
+                else:
+                    raise AssertionError("unsupported platform used an unproved exchange syscall")
+        finally:
+            os.close(parent_fd)
+
+        assert (staged / "value").read_text(encoding="utf-8") == "staged\n"
+        assert (canonical / "value").read_text(encoding="utf-8") == "canonical\n"
+
+
+def test_macos_process_observer_uses_ps_and_lsof_evidence():
+    module = implementation()
+    commands = []
+
+    class Result:
+        def __init__(self, stdout, returncode=0, stderr=""):
+            self.stdout = stdout
+            self.returncode = returncode
+            self.stderr = stderr
+
+    def run_command(arguments):
+        commands.append(arguments)
+        if arguments == ["/bin/ps", "-axo", "pid=,uid=,comm=,command="]:
+            return Result("321 501 /opt/bin/codex codex resume session\n")
+        if arguments == ["/bin/ps", "-Eww", "-p", "321", "-o", "command="]:
+            return Result("codex resume session CODEX_HOME=/state/r/sibling/codex LANG=C\n")
+        if arguments == ["/usr/sbin/lsof", "-n", "-P", "-a", "-p", "321", "-F", "fcn"]:
+            return Result("p321\nccodex\nfcwd\nn/state/r/owner/codex\nf7\nn/state/st/codex/history.jsonl\n")
+        raise AssertionError(f"unexpected process-observation command: {arguments!r}")
+
+    with mock.patch.object(module.os, "getuid", return_value=501), \
+         mock.patch.object(module.os, "getpid", return_value=999), \
+         mock.patch.object(module, "_run_macos_command", side_effect=run_command):
+        observations = module._macos_process_observations()
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation.pid == 321
+    assert observation.executable == "/opt/bin/codex"
+    assert observation.command_line == "codex resume session"
+    assert observation.environment == "codex resume session CODEX_HOME=/state/r/sibling/codex LANG=C"
+    assert observation.cwd == "/state/r/owner/codex"
+    assert observation.open_files == ("/state/st/codex/history.jsonl",)
+    assert observation.uncertainties == ()
+    assert len(commands) == 3
+
+
+def test_macos_quiescence_blocks_direct_runtime_evidence():
+    module = implementation()
+    owner = Path("/state/r/owner/codex")
+    sibling = Path("/state/r/sibling/codex")
+    canonical = Path("/state/st/codex")
+    cases = (
+        ("IHAR_RUNTIME=/state/r/owner/codex", None, (), "IHAR_RUNTIME"),
+        ("CODEX_HOME=/state/r/sibling/codex", None, (), "CODEX_HOME"),
+        ("CLAUDE_CONFIG_DIR=/state/st/codex", None, (), "CLAUDE_CONFIG_DIR"),
+        ("LANG=C", str(owner), (), "cwd consumer"),
+        ("LANG=C", None, (str(canonical / "history.jsonl"),), "open file consumer"),
+    )
+    for environment, cwd, open_files, diagnostic in cases:
+        observation = module.MacOSProcessObservation(
+            pid=321,
+            uid=os.getuid(),
+            executable="/usr/bin/python3",
+            command_line="unrelated-worker",
+            environment=environment,
+            cwd=cwd,
+            open_files=open_files,
+            uncertainties=(),
+        )
+        with mock.patch.object(module.sys, "platform", "darwin"), \
+             mock.patch.object(module, "_macos_process_observations", return_value=[observation]):
+            try:
+                module._require_quiescent([owner, sibling], canonical, owner)
+            except module.UpgradeError as error:
+                assert diagnostic in str(error)
+            else:
+                raise AssertionError(f"macOS runtime evidence {diagnostic!r} was ignored")
+
+
+def test_macos_quiescence_classifies_opaque_consumers_without_blocking_daemons():
+    module = implementation()
+    cases = (
+        ("codex", "codex", "codex", True),
+        ("codex", "codex-acp", "codex-acp", True),
+        ("codex", "ihar", "ihar", True),
+        ("codex", "ihar.sh", "ihar.sh", True),
+        ("codex", "claude", "claude", False),
+        ("claude", "claude", "claude", True),
+        ("claude", "claude-agent-acp", "claude-agent-acp", True),
+        ("claude", "codex", "codex", False),
+        ("codex", "systemd", "systemd --user", False),
+    )
+    for vendor, executable, command_line, should_block in cases:
+        owner = Path(f"/state/r/owner/{vendor}")
+        canonical = Path(f"/state/st/{vendor}")
+        observation = module.MacOSProcessObservation(
+            pid=321,
+            uid=os.getuid(),
+            executable=f"/opt/bin/{executable}",
+            command_line=command_line,
+            environment=None,
+            cwd=None,
+            open_files=(),
+            uncertainties=("environment unavailable", "open files unavailable"),
+        )
+        with mock.patch.object(module.sys, "platform", "darwin"), \
+             mock.patch.object(module, "_macos_process_observations", return_value=[observation]):
+            try:
+                module._require_quiescent([owner], canonical, owner)
+            except module.UpgradeError as error:
+                if not should_block:
+                    raise AssertionError(f"unrelated macOS process {executable!r} blocked") from error
+                assert f"candidate executable {executable!r}" in str(error)
+            else:
+                if should_block:
+                    raise AssertionError(f"opaque macOS candidate {executable!r} was ignored")
 
 
 def test_atomic_exchange_never_exposes_a_missing_canonical_directory():

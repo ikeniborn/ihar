@@ -7,6 +7,7 @@ import hashlib
 import os
 import secrets
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,7 @@ class UpgradeError(RuntimeError):
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 _RENAME_EXCHANGE = 2
+_RENAME_SWAP = 2
 _IHAR_PROCESS_NAMES = frozenset(("ihar", "ihar.sh"))
 _VENDOR_PROCESS_NAMES = {
     "claude": frozenset(("claude", "claude-agent-acp")),
@@ -35,6 +37,18 @@ class RuntimeView:
     generation: str
     descriptor: int
     materialized: list[tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class MacOSProcessObservation:
+    pid: int
+    uid: int
+    executable: str
+    command_line: str
+    environment: str | None
+    cwd: str | None
+    open_files: tuple[str, ...]
+    uncertainties: tuple[str, ...]
 
 
 def _expanded_entries(manifest: Path, vendor: str) -> list[tuple[str, str]]:
@@ -528,7 +542,212 @@ def _process_candidate_evidence(
     return list(dict.fromkeys(evidence))
 
 
-def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) -> None:
+def _run_macos_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            arguments,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise UpgradeError(
+            f"cannot inspect macOS runtime-state consumers with {arguments[0]}: {error}"
+        ) from error
+
+
+def _macos_process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _macos_process_observations() -> list[MacOSProcessObservation]:
+    listing = _run_macos_command(["/bin/ps", "-axo", "pid=,uid=,comm=,command="])
+    if listing.returncode != 0:
+        raise UpgradeError(
+            "cannot inspect macOS runtime-state processes: "
+            + (listing.stderr.strip() or f"ps exited {listing.returncode}")
+        )
+    observations: list[MacOSProcessObservation] = []
+    current_uid = os.getuid()
+    current_pid = os.getpid()
+    for line in listing.stdout.splitlines():
+        fields = line.strip().split(None, 3)
+        if not fields:
+            continue
+        if len(fields) != 4:
+            raise UpgradeError(f"cannot parse macOS process observation: {line!r}")
+        try:
+            pid = int(fields[0])
+            uid = int(fields[1])
+        except ValueError as error:
+            raise UpgradeError(f"cannot parse macOS process identity: {line!r}") from error
+        if uid != current_uid or pid == current_pid:
+            continue
+        executable, command_line = fields[2], fields[3]
+        uncertainties: list[str] = []
+
+        environment_result = _run_macos_command(
+            ["/bin/ps", "-Eww", "-p", str(pid), "-o", "command="]
+        )
+        if environment_result.returncode == 0:
+            environment = environment_result.stdout.strip()
+        elif _macos_process_exists(pid):
+            environment = None
+            uncertainties.append(
+                "environment: "
+                + (environment_result.stderr.strip() or f"ps exited {environment_result.returncode}")
+            )
+        else:
+            continue
+
+        lsof_result = _run_macos_command(
+            ["/usr/sbin/lsof", "-n", "-P", "-a", "-p", str(pid), "-F", "fcn"]
+        )
+        cwd: str | None = None
+        open_files: list[str] = []
+        if lsof_result.returncode == 0:
+            descriptor = ""
+            for record in lsof_result.stdout.splitlines():
+                if not record:
+                    continue
+                if record.startswith("f"):
+                    descriptor = record[1:]
+                    continue
+                if not record.startswith("n"):
+                    continue
+                target = record[1:]
+                if descriptor == "cwd":
+                    cwd = target
+                elif os.path.isabs(target):
+                    open_files.append(target)
+            if cwd is None:
+                uncertainties.append("cwd: lsof returned no cwd record")
+        elif _macos_process_exists(pid):
+            detail = lsof_result.stderr.strip() or f"lsof exited {lsof_result.returncode}"
+            uncertainties.extend((f"cwd: {detail}", f"open files: {detail}"))
+        else:
+            continue
+
+        observations.append(
+            MacOSProcessObservation(
+                pid=pid,
+                uid=uid,
+                executable=executable,
+                command_line=command_line,
+                environment=environment,
+                cwd=cwd,
+                open_files=tuple(open_files),
+                uncertainties=tuple(uncertainties),
+            )
+        )
+    return observations
+
+
+def _selected_macos_runtime(
+    environment: str, runtime_paths: list[Path], canonical: Path, owner: Path
+) -> tuple[str, Path] | None:
+    roots = tuple(dict.fromkeys((*runtime_paths, canonical, owner)))
+    resolved_roots = tuple(Path(os.path.realpath(root)) for root in roots)
+    for selector in ("IHAR_RUNTIME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"):
+        marker = selector + "="
+        offset = 0
+        while True:
+            index = environment.find(marker, offset)
+            if index < 0:
+                break
+            offset = index + len(marker)
+            if index != 0 and not environment[index - 1].isspace():
+                continue
+            value = environment[offset:]
+            for root, resolved_root in zip(roots, resolved_roots):
+                raw = os.fspath(root)
+                if value.startswith(raw) and (
+                    len(value) == len(raw)
+                    or value[len(raw)].isspace()
+                    or value[len(raw)] == os.path.sep
+                ):
+                    return selector, resolved_root
+            token = value.split(None, 1)[0].strip("'\"") if value else ""
+            if os.path.isabs(token):
+                selected = Path(os.path.realpath(token))
+                if any(
+                    selected == root or _path_within(os.fspath(selected), root)
+                    for root in resolved_roots
+                ):
+                    return selector, selected
+    return None
+
+
+def _macos_candidate_evidence(
+    observation: MacOSProcessObservation, vendor: str, protected_roots: tuple[Path, ...]
+) -> list[str]:
+    names = _IHAR_PROCESS_NAMES | _VENDOR_PROCESS_NAMES.get(vendor, frozenset())
+    evidence: list[str] = []
+    executable_name = Path(observation.executable).name
+    if executable_name in names:
+        evidence.append(f"candidate executable {executable_name!r}")
+    for argument in observation.command_line.split():
+        argument_path = argument.strip("'\"").removesuffix(" (deleted)")
+        argument_name = Path(argument_path).name
+        if argument_name in names:
+            evidence.append(f"candidate command line {argument_name!r}")
+        if os.path.isabs(argument_path):
+            resolved = os.path.realpath(argument_path)
+            if any(_path_within(resolved, root) for root in protected_roots):
+                evidence.append(f"candidate command-line root reference {resolved!r}")
+    return list(dict.fromkeys(evidence))
+
+
+def _require_macos_quiescent(
+    runtime_paths: list[Path], canonical: Path, owner: Path
+) -> None:
+    protected_roots = tuple(dict.fromkeys((*runtime_paths, canonical, owner)))
+    vendor = owner.name
+    uncertainties: list[str] = []
+    for observation in _macos_process_observations():
+        candidate_evidence = _macos_candidate_evidence(observation, vendor, protected_roots)
+        if observation.environment is not None:
+            selected = _selected_macos_runtime(
+                observation.environment, runtime_paths, canonical, owner
+            )
+            if selected is not None:
+                selector, active_runtime = selected
+                raise UpgradeError(
+                    f"runtime state is active in process {observation.pid}: "
+                    f"{selector}={active_runtime}"
+                )
+        if observation.cwd is not None and any(
+            _path_within(observation.cwd, root) for root in protected_roots
+        ):
+            raise UpgradeError(
+                f"runtime-state cwd consumer is active in process {observation.pid}: "
+                f"{observation.cwd}"
+            )
+        for target in observation.open_files:
+            if any(_path_within(target, root) for root in protected_roots):
+                raise UpgradeError(
+                    f"runtime-state open file consumer is active in process "
+                    f"{observation.pid}: {target}"
+                )
+        if candidate_evidence and observation.uncertainties:
+            uncertainties.append(
+                f"process {observation.pid} {', '.join(candidate_evidence)}: "
+                + "; ".join(observation.uncertainties)
+            )
+    if uncertainties:
+        raise UpgradeError(
+            "cannot prove that runtime-state consumers are quiescent: " + "; ".join(uncertainties)
+        )
+
+
+def _require_linux_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) -> None:
     proc = Path("/proc")
     if not proc.is_dir():
         raise UpgradeError("cannot prove runtime-state quiescence: /proc is unavailable")
@@ -612,24 +831,55 @@ def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) 
         )
 
 
+def _require_quiescent(runtime_paths: list[Path], canonical: Path, owner: Path) -> None:
+    if sys.platform == "darwin":
+        _require_macos_quiescent(runtime_paths, canonical, owner)
+        return
+    if sys.platform.startswith("linux"):
+        _require_linux_quiescent(runtime_paths, canonical, owner)
+        return
+    raise UpgradeError(
+        f"cannot prove runtime-state quiescence: platform {sys.platform!r} is unsupported"
+    )
+
+
 def _exchange_directories(
     first_parent_fd: int, first_name: str, second_parent_fd: int, second_name: str
 ) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise OSError("atomic directory exchange is unavailable")
-    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    renameat2.restype = ctypes.c_int
-    if renameat2(
+    exchange, flag = _atomic_exchange_function()
+    if exchange(
         first_parent_fd,
         os.fsencode(first_name),
         second_parent_fd,
         os.fsencode(second_name),
-        _RENAME_EXCHANGE,
+        flag,
     ) != 0:
         error_number = ctypes.get_errno()
         raise OSError(error_number, os.strerror(error_number))
+
+
+def _atomic_exchange_function() -> tuple[object, int]:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        exchange = getattr(libc, "renameat2", None)
+        flag = _RENAME_EXCHANGE
+    elif sys.platform == "darwin":
+        exchange = getattr(libc, "renameatx_np", None)
+        flag = _RENAME_SWAP
+    else:
+        exchange = None
+        flag = 0
+    if exchange is None:
+        raise OSError("atomic directory exchange is unavailable")
+    exchange.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    exchange.restype = ctypes.c_int
+    return exchange, flag
 
 
 def _restore_runtime_entries(
@@ -749,6 +999,7 @@ def upgrade(
         canonical_path = state_path / "st" / vendor
         runtime_paths = [view.path for view in views]
         _require_quiescent(runtime_paths, canonical_path, owner.path)
+        _atomic_exchange_function()
         st_fd = _open_directory_at(state_fd, "st", "canonical state root")
         canonical_fd = _open_directory_at(st_fd, vendor, f"canonical {vendor} state")
 
