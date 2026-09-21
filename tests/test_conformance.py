@@ -6,18 +6,22 @@ question the suite exists to ask: does this vendor, at this version, load the ho
 fire it, and honour what it decided?
 """
 
+import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "python"))
 
 from ihar import jsonio                     # noqa: E402
 from ihar.codex import hooks_trust          # noqa: E402
 from ihar.conformance import run as conformance   # noqa: E402
+from ihar.conformance import check as conformance_check  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 MANIFEST = os.path.join(ROOT, "manifests", "hooks.json")
@@ -49,6 +53,211 @@ EXPECTED_REQUIRED_CASES = {
         "tampering-is-detected",
     },
 }
+
+
+def _record(vendor, binary, manifest, failed=()):
+    with open(binary, "rb") as handle:
+        binary_digest = hashlib.sha256(handle.read()).hexdigest()
+    with open(manifest, "rb") as handle:
+        manifest_digest = hashlib.sha256(handle.read()).hexdigest()
+    return {
+        "schema": 1, "vendor": vendor, "version": "pinned-vendor",
+        "binary_sha256": binary_digest, "manifest_digest": manifest_digest,
+        "created_at": "2026-09-18T10:00:00Z",
+        "cases": {
+            name: {"status": "failed" if name in failed else "passed", "detail": "safe"}
+            for name in EXPECTED_REQUIRED_CASES[vendor]
+        },
+    }
+
+
+def test_main_reports_failed_case_without_dynamic_detail():
+    store = tempfile.mkdtemp(prefix="ihar-conf-output-")
+    binary = os.path.join(store, "binary")
+    manifest = os.path.join(store, "manifest")
+    for path in (binary, manifest):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("fixture\n")
+    record = _record("codex", binary, manifest, {"deny-blocks-the-tool"})
+    record["cases"]["deny-blocks-the-tool"]["detail"] = "SECRET-SENTINEL"
+    real_run = conformance.run
+    conformance.run = lambda *_args, **_kwargs: record
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with redirect_stdout(out), redirect_stderr(err):
+            result = conformance.main([
+                "codex", binary, store, manifest,
+                "--auth-store", store, "--lockfile", LOCKFILE,
+            ])
+    finally:
+        conformance.run = real_run
+        shutil.rmtree(store, ignore_errors=True)
+    assert result == 1
+    assert "deny-blocks-the-tool" in out.getvalue()
+    assert "SECRET-SENTINEL" not in out.getvalue() + err.getvalue()
+
+
+def test_main_hides_pre_record_exception_detail():
+    store = tempfile.mkdtemp(prefix="ihar-conf-output-")
+    real_run = conformance.run
+
+    def fail_run(*_args, **_kwargs):
+        raise RuntimeError("SECRET-SENTINEL")
+
+    conformance.run = fail_run
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with redirect_stdout(out), redirect_stderr(err):
+            result = conformance.main([
+                "codex", "binary", store, "manifest",
+                "--auth-store", store, "--lockfile", LOCKFILE,
+            ])
+    finally:
+        conformance.run = real_run
+        shutil.rmtree(store, ignore_errors=True)
+    assert result == 3
+    assert "codex" in err.getvalue()
+    assert "RuntimeError" in err.getvalue()
+    assert "SECRET-SENTINEL" not in out.getvalue() + err.getvalue()
+
+
+def test_main_treats_record_write_error_as_pre_record_failure():
+    store = tempfile.mkdtemp(prefix="ihar-conf-output-")
+    binary = os.path.join(store, "binary")
+    manifest = os.path.join(store, "manifest")
+    for path in (binary, manifest):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("fixture\n")
+    record = _record("codex", binary, manifest, {"deny-blocks-the-tool"})
+    real_run = conformance.run
+    real_write = conformance.jsonio.write
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("SECRET-SENTINEL")
+
+    conformance.run = lambda *_args, **_kwargs: record
+    conformance.jsonio.write = fail_write
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with redirect_stdout(out), redirect_stderr(err):
+            result = conformance.main([
+                "codex", binary, store, manifest,
+                "--auth-store", store, "--lockfile", LOCKFILE,
+            ])
+    finally:
+        conformance.run = real_run
+        conformance.jsonio.write = real_write
+        shutil.rmtree(store, ignore_errors=True)
+    assert result == 3
+    assert "OSError" in err.getvalue()
+    assert "SECRET-SENTINEL" not in out.getvalue() + err.getvalue()
+
+
+def test_main_persists_only_fixed_case_details():
+    store = tempfile.mkdtemp(prefix="ihar-conf-record-")
+    binary = os.path.join(store, "binary")
+    manifest = os.path.join(store, "manifest")
+    for path in (binary, manifest):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("fixture\n")
+    real_cases = conformance.CASES
+    real_live_case = conformance._run_live_case
+    real_stage = conformance._stage
+    real_version = conformance.vendor_version
+    real_validate = conformance._validate_release_pin
+    conformance.CASES = {
+        name: (lambda *_args: ("failed", "SECRET-SENTINEL"))
+        for name in EXPECTED_REQUIRED_CASES["codex"] - conformance.LIVE_CASES
+    }
+    conformance._run_live_case = lambda *_args: ("passed", "SECRET-SENTINEL")
+    conformance._stage = lambda *_args, **_kwargs: None
+    conformance.vendor_version = lambda *_args: "pinned-vendor"
+    conformance._validate_release_pin = lambda *_args: None
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with redirect_stdout(out), redirect_stderr(err):
+            result = conformance.main([
+                "codex", binary, store, manifest,
+                "--auth-store", store, "--lockfile", LOCKFILE, "--json",
+            ])
+        record_path = os.path.join(store, "verification", "codex-pinned-vendor.json")
+        with open(record_path, encoding="utf-8") as handle:
+            saved = handle.read()
+    finally:
+        conformance.CASES = real_cases
+        conformance._run_live_case = real_live_case
+        conformance._stage = real_stage
+        conformance.vendor_version = real_version
+        conformance._validate_release_pin = real_validate
+        shutil.rmtree(store, ignore_errors=True)
+    assert result == 1
+    assert "SECRET-SENTINEL" not in saved
+    assert "SECRET-SENTINEL" not in out.getvalue() + err.getvalue()
+    record = json.loads(saved)
+    assert json.loads(out.getvalue()) == record
+    assert record["cases"]["hook-is-loaded"]["detail"] == "hook-is-loaded: failed"
+
+
+def test_vendor_version_rejects_extra_output_without_echoing_it():
+    store = tempfile.mkdtemp(prefix="ihar-conf-version-")
+    binary = os.path.join(store, "vendor")
+    try:
+        for vendor, output in (
+            ("codex", "codex-cli 0.154.0 SECRET-SENTINEL"),
+            ("claude", "2.1.274 (Claude Code) SECRET-SENTINEL"),
+        ):
+            with open(binary, "w", encoding="utf-8") as handle:
+                handle.write(f"#!/bin/sh\nprintf '%s\\n' '{output}'\n")
+            os.chmod(binary, 0o755)
+            try:
+                conformance.vendor_version(vendor, binary)
+            except RuntimeError as error:
+                assert "SECRET-SENTINEL" not in str(error)
+            else:
+                raise AssertionError(f"{vendor} accepted unbounded version output")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                result = conformance.main([
+                    vendor, binary, store, MANIFEST,
+                    "--auth-store", store, "--lockfile", LOCKFILE,
+                ])
+            assert result == 3
+            assert "SECRET-SENTINEL" not in out.getvalue() + err.getvalue()
+            assert not os.path.exists(os.path.join(store, "verification"))
+    finally:
+        shutil.rmtree(store, ignore_errors=True)
+
+
+def test_failed_record_mode_requires_complete_matching_failed_required_case():
+    store = tempfile.mkdtemp(prefix="ihar-conf-check-")
+    binary = os.path.join(store, "binary")
+    manifest = os.path.join(store, "manifest")
+    record_path = os.path.join(store, "record.json")
+    for path in (binary, manifest):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("fixture\n")
+    try:
+        failed = _record("codex", binary, manifest, {"deny-blocks-the-tool"})
+        passing = _record("codex", binary, manifest)
+        stale = {**failed, "manifest_digest": "0" * 64}
+        malformed = {**failed, "cases": {}}
+        optional_only = {**passing, "cases": {
+            **passing["cases"], "optional": {"status": "failed", "detail": "SECRET-SENTINEL"},
+        }}
+        for record, expected in ((failed, 0), (passing, 1), (stale, 1),
+                                 (malformed, 1), (optional_only, 1)):
+            with open(record_path, "w", encoding="utf-8") as handle:
+                json.dump(record, handle)
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                actual = conformance_check.main([
+                    "--failed-record", record_path, binary, manifest,
+                ])
+            assert actual == expected, (record["cases"], actual)
+            assert record_path not in out.getvalue() + err.getvalue()
+            assert "SECRET-SENTINEL" not in out.getvalue() + err.getvalue()
+    finally:
+        shutil.rmtree(store, ignore_errors=True)
 
 
 def _store():
@@ -419,7 +628,7 @@ def test_claude_run_probes_native_sandbox_writes():
         if argv[0] != binary:
             return real_run(argv, **kwargs)
         if argv[1:] == ["--version"]:
-            return conformance.subprocess.CompletedProcess(argv, 0, "claude 2.1.274\n", "")
+            return conformance.subprocess.CompletedProcess(argv, 0, "2.1.274 (Claude Code)\n", "")
         if "-p" not in argv:
             return conformance.subprocess.CompletedProcess(argv, 2, "", "not non-interactive")
         if mode[0] == "unavailable":

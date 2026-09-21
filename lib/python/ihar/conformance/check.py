@@ -16,6 +16,7 @@ import hashlib
 import sys
 
 from .. import jsonio
+from . import REQUIRED_CASES
 
 
 def _digest(path: str) -> str:
@@ -27,28 +28,40 @@ def _digest(path: str) -> str:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
+    failed_record_mode = len(argv) == 4 and argv[0] == "--failed-record"
+    if failed_record_mode:
+        argv = argv[1:]
+    elif len(argv) != 3:
         print(__doc__, file=sys.stderr)
         return 2
     record_path, binary, manifest = argv
 
     try:
         record = jsonio.read("conformance", record_path)
-    except (jsonio.SchemaError, OSError) as error:
-        print(f"the record is unreadable: {error}")
+    except (jsonio.SchemaError, OSError):
+        print("the record is unreadable")
         return 1
 
-    if record["binary_sha256"] != _digest(binary):
-        print("the record was made against a different binary")
+    try:
+        binary_matches = record["binary_sha256"] == _digest(binary)
+        manifest_matches = record["manifest_digest"] == _digest(manifest)
+    except OSError:
+        print("the binary or hook manifest is unreadable")
         return 1
-    if record["manifest_digest"] != _digest(manifest):
-        print("the record was made against a different hook manifest")
+    if not binary_matches or not manifest_matches:
+        print("the record does not match the binary or hook manifest")
         return 1
 
     failed = sorted(name for name, case in record["cases"].items()
                     if case["status"] == "failed")
+    if failed_record_mode:
+        return 0 if REQUIRED_CASES[record["vendor"]].intersection(failed) else 1
     if failed:
-        print(f"these cases failed: {', '.join(failed)}")
+        required_failed = sorted(REQUIRED_CASES[record["vendor"]].intersection(failed))
+        if required_failed:
+            print(f"these cases failed: {', '.join(required_failed)}")
+        else:
+            print("non-required cases failed")
         return 1
 
     # A record of nothing but skips proves nothing. The schema already refuses an

@@ -652,8 +652,15 @@ def vendor_version(vendor: str, binary: str) -> str:
     try:
         result = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError) as error:
-        raise RuntimeError(f"cannot run {binary}: {error}") from error
-    return (result.stdout or result.stderr).strip().splitlines()[0] if result.stdout or result.stderr else "unknown"
+        raise RuntimeError(f"{vendor} version probe failed: {type(error).__name__}") from error
+    version = (result.stdout or result.stderr).removesuffix("\n")
+    pattern = {
+        "codex": r"codex-cli [0-9]+\.[0-9]+\.[0-9]+",
+        "claude": r"[0-9]+\.[0-9]+\.[0-9]+ \(Claude Code\)",
+    }[vendor]
+    if result.returncode != 0 or re.fullmatch(pattern, version) is None:
+        raise RuntimeError(f"unexpected {vendor} version output")
+    return version
 
 
 def _validate_release_pin(vendor: str, version: str, lockfile_path: str) -> None:
@@ -706,16 +713,16 @@ def run(
             if name in CLAUDE_ONLY_CASES and vendor != "claude":
                 continue
             try:
-                status, detail = case(vendor, binary, home, workdir)
-            except Exception as error:             # noqa: BLE001
-                status, detail = "failed", f"{type(error).__name__}: {error}"
-            record["cases"][name] = {"status": status, "detail": detail}
+                status, _detail = case(vendor, binary, home, workdir)
+            except Exception:                      # noqa: BLE001
+                status = "failed"
+            record["cases"][name] = {"status": status, "detail": f"{name}: {status}"}
         for name in sorted(LIVE_CASES):
             try:
-                status, detail = _run_live_case(vendor, binary, home, workdir, name)
-            except Exception as error:             # noqa: BLE001
-                status, detail = "failed", f"{type(error).__name__}: {error}"
-            record["cases"][name] = {"status": status, "detail": detail}
+                status, _detail = _run_live_case(vendor, binary, home, workdir, name)
+            except Exception:                      # noqa: BLE001
+                status = "failed"
+            record["cases"][name] = {"status": status, "detail": f"{name}: {status}"}
     finally:
         shutil.rmtree(home, ignore_errors=True)
         shutil.rmtree(workdir, ignore_errors=True)
@@ -765,22 +772,22 @@ def main(argv: list[str]) -> int:
             lockfile_path=lockfile_path,
             protected_store=protected_store,
         )
+        target = os.path.join(store, "verification",
+                              f"{vendor}-{version_slug(record['version'])}.json")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        jsonio.write("conformance", target, record, mode=0o644)
     except (RuntimeError, OSError, jsonio.SchemaError) as error:
-        print(f"ihar: conformance could not run: {error}", file=sys.stderr)
+        print(f"ihar: conformance setup failed for {vendor}: {type(error).__name__}",
+              file=sys.stderr)
         return 3
 
-    target = os.path.join(store, "verification",
-                          f"{vendor}-{version_slug(record['version'])}.json")
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    jsonio.write("conformance", target, record, mode=0o644)
-
-    failed = [name for name, case in record["cases"].items() if case["status"] == "failed"]
+    failed = sorted(name for name in REQUIRED_CASES[vendor]
+                    if record["cases"][name]["status"] == "failed")
     if "--json" in options:
         print(json.dumps(record, indent=2, sort_keys=True))
     else:
-        for name, case in sorted(record["cases"].items()):
-            print(f"{case['status']:<8} {name:<24} {case['detail']}")
-        print(f"record: {target}")
+        for name in failed:
+            print(f"failed {name}")
     return 1 if failed else 0
 
 
