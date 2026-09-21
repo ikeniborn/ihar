@@ -40,12 +40,16 @@ cd ihar
 ```
 
 That builds the store, links `ihar` into `~/.local/bin`, creates the Python environment,
-downloads the components the lockfile pins — verifying each against its recorded digest —
-and runs the hook conformance suite the enforced profiles require.
+installs pinned component versions, verifies the Codex archive against its recorded
+digest, and runs the hook conformance suite the enforced profiles require. The
+Node/Claude installation is version-pinned but has no archive digest in the lockfile.
 
 The specialised Firecracker guest comes from a compatible, locally built asset directory.
-Its `firecracker`, `vmlinux`, `rootfs.ext4`, `client_key`, `client_key.pub` and
-`host_key.pub` files are all validated before one pinned version is activated atomically:
+Its `firecracker`, `vmlinux` and `rootfs.ext4` files are checked against lockfile
+digests. The three SSH key files are checked for their expected format and pairing;
+they have no lockfile digests. The version key derives from the three pinned image
+digests. A staged version is published, then its current pointer and command links
+are updated with rollback protection:
 
 ```bash
 IHAR_MICROVM_SOURCE_DIR=/path/to/assets ./ihar.sh install --microvm
