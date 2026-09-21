@@ -12,6 +12,13 @@ review:
 chain:
   intent: docs/superpowers/intents/2026-09-21-install-hook-conformance-diagnostics-intent.md
   spec: docs/superpowers/specs/2026-09-21-install-hook-conformance-diagnostics-design.md
+result_check:
+  verdict: OK
+  source: plan
+  plan_hash: d3cd35b36e9f5bd4
+  last_run: 2026-09-21
+  reviewed: true
+  docs_checked: true
 ---
 
 # Install Hook Conformance Diagnostics Implementation Plan
