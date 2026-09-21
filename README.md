@@ -115,11 +115,12 @@ a floor, and neither the file nor a flag may lower it.
 ihar update
 ```
 
-Install and update are the same operation. Each component compares the version the
-lockfile pins with the one recorded beside it, so bumping the lockfile is what upgrades and
-an unchanged lockfile makes the run a no-op. A vendor upgrade re-runs the conformance suite,
-because the record is keyed by the binary's digest — a new binary has not earned the old
-pass.
+Install and update use the same transaction, and the lockfile remains the immutable source
+of pinned versions. A matching version stamp may skip downloading or reinstalling that
+vendor binary, but every run still validates topology, stages and copies declared assets,
+re-runs conformance, rebuilds the receipt, and activates the staged generation. Bumping a
+pin upgrades the component; an unchanged lockfile does not make the command a no-op. A new
+vendor binary must earn new conformance evidence because the record is keyed by its digest.
 
 ## Requirements
 
