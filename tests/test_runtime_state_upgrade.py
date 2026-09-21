@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -1143,7 +1144,50 @@ def test_macos_atomic_exchange_uses_renameatx_np_swap():
          mock.patch.object(module.ctypes, "CDLL", return_value=libc):
         module._exchange_directories(10, "staged", 20, "canonical")
 
-    assert calls == [(10, b"staged", 20, b"canonical", module._RENAME_SWAP)]
+    assert module._RENAME_SWAP == 2
+    assert renameatx_np.argtypes == [
+        module.ctypes.c_int,
+        module.ctypes.c_char_p,
+        module.ctypes.c_int,
+        module.ctypes.c_char_p,
+        module.ctypes.c_uint,
+    ]
+    assert renameatx_np.restype is module.ctypes.c_int
+    assert calls == [(10, b"staged", 20, b"canonical", 2)]
+
+
+def test_macos_exchange_errno_preserves_runtime_and_canonical_directories():
+    module = implementation()
+
+    class RenameAtxNp:
+        argtypes = None
+        restype = None
+
+        def __call__(self, *_args):
+            return -1
+
+    libc = type("LibC", (), {"renameatx_np": RenameAtxNp()})()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest, state, (runtime,) = fixture(Path(tmp), "99999987")
+        write_materialized(runtime)
+        canonical = state / "st" / "codex"
+        runtime_before = (runtime / "history.jsonl").read_bytes()
+
+        with mock.patch.object(module.sys, "platform", "darwin"), \
+             mock.patch.object(module, "_macos_process_observations", return_value=[]), \
+             mock.patch.object(module.ctypes, "CDLL", return_value=libc), \
+             mock.patch.object(module.ctypes, "get_errno", return_value=errno.ENOTSUP):
+            try:
+                module.upgrade(manifest, state, "codex")
+            except module.UpgradeError as error:
+                assert f"Errno {errno.ENOTSUP}" in str(error)
+            else:
+                raise AssertionError("failed Darwin directory exchange was published")
+
+        assert (runtime / "history.jsonl").read_bytes() == runtime_before
+        assert_materialized(runtime)
+        assert canonical.is_dir() and not any(canonical.iterdir())
+        assert not list((state / "st").glob(".runtime-upgrade-*"))
 
 
 def test_unsupported_platform_exchange_fails_without_mutation():
@@ -1279,6 +1323,40 @@ def test_macos_quiescence_classifies_opaque_consumers_without_blocking_daemons()
             else:
                 if should_block:
                     raise AssertionError(f"opaque macOS candidate {executable!r} was ignored")
+
+
+def test_macos_opaque_command_line_root_forms_fail_closed():
+    module = implementation()
+    owner = Path("/state/r/owner/codex")
+    sibling = Path("/state/r/sibling/codex")
+    canonical = Path("/state/st/codex")
+    cases = (
+        "/state/r/owner/codex/sessions",
+        "--state=/state/r/sibling/codex/history.jsonl",
+        "--socket=unix:///state/st/codex/control.sock",
+        "--state=file:///state/r/owner/codex/history.jsonl",
+    )
+    for command_line in cases:
+        observation = module.MacOSProcessObservation(
+            pid=321,
+            uid=os.getuid(),
+            executable="/usr/bin/python3",
+            command_line=command_line,
+            environment=None,
+            cwd=None,
+            open_files=(),
+            uncertainties=("environment unavailable",),
+        )
+        with mock.patch.object(module.sys, "platform", "darwin"), \
+             mock.patch.object(module, "_macos_process_observations", return_value=[observation]):
+            try:
+                module._require_quiescent([owner, sibling], canonical, owner)
+            except module.UpgradeError as error:
+                assert "candidate command-line root reference" in str(error)
+            else:
+                raise AssertionError(
+                    f"opaque macOS command-line root {command_line!r} was ignored"
+                )
 
 
 def test_atomic_exchange_never_exposes_a_missing_canonical_directory():

@@ -698,8 +698,17 @@ def _macos_candidate_evidence(
         argument_name = Path(argument_path).name
         if argument_name in names:
             evidence.append(f"candidate command line {argument_name!r}")
-        if os.path.isabs(argument_path):
-            resolved = os.path.realpath(argument_path)
+        path_values = [argument_path]
+        if not os.path.isabs(argument_path) and "=" in argument_path:
+            path_values.append(argument_path.split("=", 1)[1])
+        for path_value in path_values:
+            for prefix in ("unix://", "file://"):
+                if path_value.startswith(prefix):
+                    path_value = path_value[len(prefix) :]
+                    break
+            if not os.path.isabs(path_value):
+                continue
+            resolved = os.path.realpath(path_value)
             if any(_path_within(resolved, root) for root in protected_roots):
                 evidence.append(f"candidate command-line root reference {resolved!r}")
     return list(dict.fromkeys(evidence))

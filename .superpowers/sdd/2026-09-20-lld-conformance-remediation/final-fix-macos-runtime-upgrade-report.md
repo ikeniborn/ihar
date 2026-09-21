@@ -36,3 +36,17 @@ for a live syscall/process-observation integration run.
 
 None for the requested implementation. Live macOS integration remains outside
 this bounded Linux-host execution.
+
+## Review round 1
+
+- Mirrored Linux command-line root extraction on Darwin: whole absolute
+  arguments, values after `=`, `unix://`, and `file://` forms now classify a
+  protected-root candidate.
+- Added mutation-sensitive `--state=<sibling-root>/...` coverage plus owner,
+  canonical `unix://`, and owner `file://` cases. Opaque observations fail
+  closed after classification.
+- Hardened Darwin exchange tests with the literal `RENAME_SWAP == 2`, exact
+  `ctypes` argument/result ABI, and an injected `ENOTSUP` result proving
+  `UpgradeError` while runtime and canonical directories remain unchanged.
+- RED: the focused suite exited 1 because the `--state=` candidate was ignored.
+- GREEN: the focused suite exited 0 with `PASS=42 FAIL=0`.
