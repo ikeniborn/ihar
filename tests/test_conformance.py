@@ -228,6 +228,51 @@ def test_vendor_version_rejects_extra_output_without_echoing_it():
         shutil.rmtree(store, ignore_errors=True)
 
 
+def test_main_bounds_invalid_utf8_vendor_version():
+    store = tempfile.mkdtemp(prefix="ihar-conf-version-bytes-")
+    binary = os.path.join(store, "vendor")
+    try:
+        with open(binary, "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/env python3\nimport os\nos.write(1, bytes([255]))\n")
+        os.chmod(binary, 0o755)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            result = conformance.main([
+                "codex", binary, store, MANIFEST,
+                "--auth-store", store, "--lockfile", LOCKFILE,
+            ])
+        assert result == 3
+        assert out.getvalue() == ""
+        assert "codex: RuntimeError" in err.getvalue()
+        assert binary not in err.getvalue()
+        assert not os.path.exists(os.path.join(store, "verification"))
+    finally:
+        shutil.rmtree(store, ignore_errors=True)
+
+
+def test_failed_record_mode_bounds_invalid_utf8_record():
+    store = tempfile.mkdtemp(prefix="ihar-conf-record-bytes-")
+    binary = os.path.join(store, "binary")
+    manifest = os.path.join(store, "manifest")
+    record_path = os.path.join(store, "record.json")
+    try:
+        for path in (binary, manifest):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("fixture\n")
+        with open(record_path, "wb") as handle:
+            handle.write(bytes([255]))
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            result = conformance_check.main([
+                "--failed-record", record_path, binary, manifest,
+            ])
+        assert result == 1
+        assert out.getvalue().strip() == "the record is unreadable"
+        assert record_path not in out.getvalue() + err.getvalue()
+    finally:
+        shutil.rmtree(store, ignore_errors=True)
+
+
 def test_failed_record_mode_requires_complete_matching_failed_required_case():
     store = tempfile.mkdtemp(prefix="ihar-conf-check-")
     binary = os.path.join(store, "binary")

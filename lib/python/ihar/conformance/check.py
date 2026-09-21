@@ -8,6 +8,7 @@ Failure class: fail-closed. Exit 0 only when the record covers exactly this bina
 and this manifest and every case passed.
 
 Usage: python3 -m ihar.conformance.check <record> <binary> <manifest>
+       python3 -m ihar.conformance.check --failed-record <record> <binary> <manifest>
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ def main(argv: list[str]) -> int:
 
     try:
         record = jsonio.read("conformance", record_path)
-    except (jsonio.SchemaError, OSError):
+    except (jsonio.SchemaError, OSError, UnicodeError):
         print("the record is unreadable")
         return 1
 

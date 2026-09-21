@@ -651,7 +651,7 @@ def version_slug(version: str) -> str:
 def vendor_version(vendor: str, binary: str) -> str:
     try:
         result = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError, UnicodeError) as error:
         raise RuntimeError(f"{vendor} version probe failed: {type(error).__name__}") from error
     version = (result.stdout or result.stderr).removesuffix("\n")
     pattern = {
