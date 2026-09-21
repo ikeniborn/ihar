@@ -11,6 +11,7 @@
     "tests/test_gateway_routes.py",
     "tests/test_handoff.sh",
     "tests/test_handoff_build.py",
+    "tests/test_handoff_history.py",
     "tests/test_hook_trust.sh",
     "tests/test_hooks.sh",
     "tests/test_ids.py",

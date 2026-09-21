@@ -96,3 +96,10 @@ adapter_codex_export_context() {
   local session="$1"
   ihar_python ihar.handoff.export codex "$IHAR_STATE/st/codex" "$session"
 }
+
+# stdout: JSON array of every user and assistant message, oldest first. Exit 1 when the
+# rollout cannot be read; the caller degrades the handoff to summary mode.
+adapter_codex_get_session() {
+  local session="$1"
+  ihar_python ihar.handoff.export codex "$IHAR_STATE/st/codex" "$session" --transcript
+}

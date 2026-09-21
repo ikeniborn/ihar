@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 13 (multi-session console designed: broker, tab kinds, status contract, thread projection) |
+| Status | revision 14 (handoff history modes implemented: transcript export, budget, degradation, check reporting) |
 | Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -847,7 +847,7 @@ Revision 2 allowed `ihar claude --mask-level standard` under `standard`, which s
 
 In order, each fail-closed: hook integrity and, for Codex, trust state through `hooks/list` (§6.5); conformance record for the pinned version (§6.6); gateway acquisition (§8.1); sandbox and network policy (§9); runtime home immutability (§4.2); daemon reconciliation (§5.5). `--web` for a vendor outside `remote` is exit 2; `acp` under `refuse` is exit 2; a console tab whose resolved project profile carries `console: refuse` is exit 2 and is reported in the tab rather than in the broker's own exit, because one refused project must not stop a window serving others.
 
-`ihar check` collects one closed schema-1 object and both renderers consume that same validated object. It contains the profile and guarantee, masking floor/effective level/engine/dropped names, per-vendor receipt state, closed per-hook trust facts, conformance state, capabilities, asset diagnostics, MCP notes and known gaps. Per-vendor receipt state comes from the same `ihar_receipt_binary_status` helper used by launch and is exactly `verified`, `mismatched`, or `missing receipt`.
+`ihar check` collects one closed schema-1 object and both renderers consume that same validated object. It contains the profile and guarantee, masking floor/effective level/engine/dropped names, per-vendor receipt state, closed per-hook trust facts, conformance state, capabilities, asset diagnostics, MCP notes, the handoff export count and bytes, and known gaps. Per-vendor receipt state comes from the same `ihar_receipt_binary_status` helper used by launch and is exactly `verified`, `mismatched`, or `missing receipt`.
 
 Gateway and network status are structured rather than prose claims. Each discovered explicit gateway instance carries `{key, mode, port, pid, consumers, healthy, metrics}`. `key` is the 12-hex instance identity; `port` and `pid` are nullable observed integers; `consumers` is the count of live consumer records; `healthy` is the live local protocol-probe result. `metrics` carries `state: available|unavailable` and `masked`, `refused`, `relayed`, `uptime_seconds`. Available metrics require every non-negative integer; unavailable metrics require every counter to be `null`, so check never invents zeroes or claims opaque counters are known. Collection is read-only and fail-soft per instance.
 
@@ -1026,7 +1026,7 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | workflow | `tests/test_workflow_gates.sh` | validated chain transitions, stale-hash rejection and bounded gate evidence |
 | concurrency | `tests/test_concurrency.sh` | real-`flock` acknowledgement precedes every blocked-entry assertion; a marker paused inside publication proves a second profile cannot enter, then distinct homes publish and remain unchanged; parallel `ihar_cmd_install` calls serialize through the production store lock; different masking levels create different gateway instances; after one shared consumer releases, a live protocol probe succeeds for the other |
 
-`manifests/tests.json` is the closed schema-1 inventory of the 28 test files that exist today, including `tests/test_runtime_state_upgrade.py`; the four console and handoff-history files above are named by this plan and join the inventory in the slice that creates them, since the manifest describes what is discovered and not what is intended. Paths are unique, repository-relative `tests/test_*.sh` or `tests/test_*.py` names. Before executing anything, `tests/run.sh` validates the manifest and fails with exit 3 for malformed, duplicate, unsafe, missing, unlisted-discovered, or listed-but-undiscovered paths. It then runs the inventory-equivalent discovered set and is the command each slice's verification names.
+`manifests/tests.json` is the closed schema-1 inventory of the 29 test files that exist today, including `tests/test_runtime_state_upgrade.py` and `tests/test_handoff_history.py`; the three console files above are named by this plan and join the inventory in the slice that creates them, since the manifest describes what is discovered and not what is intended. Paths are unique, repository-relative `tests/test_*.sh` or `tests/test_*.py` names. Before executing anything, `tests/run.sh` validates the manifest and fails with exit 3 for malformed, duplicate, unsafe, missing, unlisted-discovered, or listed-but-undiscovered paths. It then runs the inventory-equivalent discovered set and is the command each slice's verification names.
 
 ## 17. Failure handling matrix
 

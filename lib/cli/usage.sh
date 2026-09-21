@@ -21,6 +21,7 @@ commands
   sessions list | resume <id> | name <id> <title>
                         canonical sessions across both vendors
   switch --to <vendor>  carry this session into the other vendor
+                        --history summary|transcript selects how much travels
   web <vendor>          start the vendor's native remote surface
   acp <vendor>          start the experimental pinned ACP adapter
 

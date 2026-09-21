@@ -670,6 +670,19 @@ KINDS: dict[str, dict[str, Any]] = {
             "masked": {"type": bool},
             "masking_level": {"type": str, "enum": ("off", "secrets", "standard")},
             "bytes": {"type": int},
+            # How much of the source conversation travelled, and where the rest of it is.
+            # `file` is an absolute path inside the state root, never package content: the
+            # package points at the transcript so the 8 kB bound stays independent of it.
+            "history": {
+                "type": dict,
+                "fields": {
+                    "mode": {"type": str, "enum": ("summary", "transcript")},
+                    "file": {"type": (str, type(None)), "min_len": 1},
+                    "messages": {"type": int, "min": 0},
+                    "bytes": {"type": int, "min": 0},
+                    "truncated": {"type": bool},
+                },
+            },
         },
         "optional": {
             "ledger": {
@@ -906,6 +919,12 @@ KINDS: dict[str, dict[str, Any]] = {
                 "available": {"type": bool},
                 "active": {"type": bool},
                 "verified": {"type": bool},
+            }},
+            # Transcript exports are kept indefinitely, so their growth is a reported fact
+            # rather than something a user discovers by running out of disk.
+            "handoff": {"type": dict, "fields": {
+                "exports": {"type": int, "min": 0},
+                "bytes": {"type": int, "min": 0},
             }},
             "vendors": {"type": dict, "fields": {
                 vendor: {"type": dict, "fields": {

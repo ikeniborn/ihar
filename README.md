@@ -117,6 +117,19 @@ current session, links both canonical session records, and launches the other ve
 Claude carries the package in its initial prompt; Codex consumes the remainder once
 through its SessionStart hook.
 
+`--history summary|transcript` decides how much of the conversation travels.
+`summary` is the default and ships the package alone. `transcript` additionally
+writes the source session to a masked file beside the package and points the next
+agent at it, so it can read the history if the package is not enough:
+
+```bash
+ihar switch --to codex --history transcript
+```
+
+Neither vendor accepts a foreign session, so the transcript arrives as a file the
+next agent may read, never as a session it resumes. Those exports are kept until you
+delete them; `ihar check` reports how many there are and how much space they use.
+
 ## Web access today
 
 Run `ihar web` on the computer that owns the project and vendor login. For now,
