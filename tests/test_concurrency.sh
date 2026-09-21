@@ -60,6 +60,9 @@ source "$IHAR_ROOT/lib/core/logging.sh"
 source "$IHAR_ROOT/lib/core/init.sh"
 source "$IHAR_ROOT/lib/core/lock.sh"
 ihar_link_runtime() { :; }
+ihar_validate_runtime_asset_sources() { :; }
+ihar_verify_runtime_asset_links() { :; }
+ihar_verify_runtime_mutable_links() { :; }
 ihar_verify_runtime_state_links() { :; }
 source "$IHAR_ROOT/lib/state/runtime.sh"
 export IHAR_STATE="$1" IHAR_PROFILE="$2"
