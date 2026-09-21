@@ -8,7 +8,7 @@ Failure class: fail-closed. Exit 0 only when the record covers exactly this bina
 and this manifest and every case passed.
 
 Usage: python3 -m ihar.conformance.check <record> <binary> <manifest>
-       python3 -m ihar.conformance.check --failed-record <record> <binary> <manifest>
+       python3 -m ihar.conformance.check --failed-record <vendor> <record> <binary> <manifest>
 """
 
 from __future__ import annotations
@@ -29,9 +29,13 @@ def _digest(path: str) -> str:
 
 
 def main(argv: list[str]) -> int:
-    failed_record_mode = len(argv) == 4 and argv[0] == "--failed-record"
+    failed_record_mode = bool(argv) and argv[0] == "--failed-record"
     if failed_record_mode:
-        argv = argv[1:]
+        if len(argv) != 5 or argv[1] not in REQUIRED_CASES:
+            print(__doc__, file=sys.stderr)
+            return 2
+        expected_vendor = argv[1]
+        argv = argv[2:]
     elif len(argv) != 3:
         print(__doc__, file=sys.stderr)
         return 2
@@ -41,6 +45,9 @@ def main(argv: list[str]) -> int:
         record = jsonio.read("conformance", record_path)
     except (jsonio.SchemaError, OSError, UnicodeError):
         print("the record is unreadable")
+        return 1
+    if failed_record_mode and record["vendor"] != expected_vendor:
+        print("the record does not match the vendor")
         return 1
 
     try:

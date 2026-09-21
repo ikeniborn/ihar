@@ -264,7 +264,7 @@ def test_failed_record_mode_bounds_invalid_utf8_record():
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             result = conformance_check.main([
-                "--failed-record", record_path, binary, manifest,
+                "--failed-record", "codex", record_path, binary, manifest,
             ])
         assert result == 1
         assert out.getvalue().strip() == "the record is unreadable"
@@ -286,21 +286,25 @@ def test_failed_record_mode_requires_complete_matching_failed_required_case():
         passing = _record("codex", binary, manifest)
         stale = {**failed, "manifest_digest": "0" * 64}
         malformed = {**failed, "cases": {}}
+        other_vendor = _record("claude", binary, manifest, {"deny-blocks-the-tool"})
         optional_only = {**passing, "cases": {
             **passing["cases"], "optional": {"status": "failed", "detail": "SECRET-SENTINEL"},
         }}
         for record, expected in ((failed, 0), (passing, 1), (stale, 1),
-                                 (malformed, 1), (optional_only, 1)):
+                                 (malformed, 1), (other_vendor, 1), (optional_only, 1)):
             with open(record_path, "w", encoding="utf-8") as handle:
                 json.dump(record, handle)
             out, err = io.StringIO(), io.StringIO()
             with redirect_stdout(out), redirect_stderr(err):
                 actual = conformance_check.main([
-                    "--failed-record", record_path, binary, manifest,
+                    "--failed-record", "codex", record_path, binary, manifest,
                 ])
             assert actual == expected, (record["cases"], actual)
             assert record_path not in out.getvalue() + err.getvalue()
             assert "SECRET-SENTINEL" not in out.getvalue() + err.getvalue()
+        assert conformance_check.main([
+            "--failed-record", record_path, binary, manifest,
+        ]) == 2
     finally:
         shutil.rmtree(store, ignore_errors=True)
 

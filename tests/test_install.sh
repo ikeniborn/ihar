@@ -639,13 +639,15 @@ with open(binary, "rb") as stream:
 with open(manifest, "rb") as stream:
     manifest_digest = hashlib.sha256(stream.read()).hexdigest()
 version = f"new-{vendor}"
+record_vendor = ({"claude": "codex", "codex": "claude"}[vendor]
+                 if os.environ["IHAR_TEST_SCENARIO"] == "bootstrap-other-vendor" else vendor)
 record = {
-    "schema": 1, "vendor": vendor, "version": version,
+    "schema": 1, "vendor": record_vendor, "version": version,
     "binary_sha256": binary_digest, "manifest_digest": manifest_digest,
     "created_at": "2026-09-21T00:00:00Z",
     "cases": {
         name: {"status": "failed" if name == "deny-blocks-the-tool" else "passed"}
-        for name in REQUIRED_CASES[vendor]
+        for name in REQUIRED_CASES[record_vendor]
     },
 }
 target = os.path.join(store, "verification", f"{vendor}-{version_slug(version)}.json")
@@ -798,12 +800,14 @@ assert_eq "malformed receipt remains unchanged" \
   "$before_generation" "$(transaction_fingerprint)"
 
 for scenario in bootstrap-prerecord bootstrap-missing-record bootstrap-invalid-record \
+                bootstrap-other-vendor \
                 bootstrap-receipt bootstrap-activation; do
   reset_active_generation
   rm -f -- "$IHAR_TEST_TMP/$scenario.conformance-runs"
   case "$scenario" in
     bootstrap-prerecord) expected_status=3 ;;
-    bootstrap-missing-record|bootstrap-invalid-record) expected_status=1 ;;
+    bootstrap-missing-record|bootstrap-invalid-record|bootstrap-other-vendor)
+      expected_status=1 ;;
     bootstrap-receipt) expected_status=37 ;;
     bootstrap-activation) expected_status=39 ;;
   esac

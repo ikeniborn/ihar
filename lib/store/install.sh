@@ -543,7 +543,7 @@ ihar_install_conformance() {
     run_status=$?
     if [[ "$run_status" == 1 && "${IHAR_INSTALL_BOOTSTRAP:-false}" == true ]]; then
       record="$IHAR_STORE/verification/$vendor-$(ihar_version_slug "$binary").json"
-      if ihar_python ihar.conformance.check --failed-record "$record" "$binary" \
+      if ihar_python ihar.conformance.check --failed-record "$vendor" "$record" "$binary" \
         "$IHAR_ROOT/manifests/hooks.json" >/dev/null 2>&1; then
         rm -f -- "$record" || {
           ihar_warn "cannot discard failed conformance record for $vendor"
