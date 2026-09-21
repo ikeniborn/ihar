@@ -23,7 +23,7 @@ from .. import jsonio
 
 # References the renderer itself resolves. Anything else is left in place for the
 # vendor, which is only safe where the vendor expands.
-_OURS = ("IHAR_PROJECT_ROOT", "IHAR_STATE", "IHAR_STORE")
+_OURS = ("IHAR_PROJECT_ROOT", "IHAR_STATE", "IHAR_STORE", "IHAR_IWIKI_REMOTE_URL")
 
 _REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
