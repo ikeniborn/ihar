@@ -1173,6 +1173,73 @@ else:
         self.assertNotEqual(second["daemon"]["pid"], first["daemon"]["pid"])
         self.assertIsNone(process.poll())
 
+    def test_external_restart_rebinds_changed_configuration_under_original_guardian(self) -> None:
+        process, binary, env = self._start_guarded_review_daemon()
+        from ihar.codex import daemon
+        first = json.loads(self.record.read_text())
+        with mock.patch.dict(os.environ, env):
+            decision = daemon.reconcile(str(binary), str(self.runtime_a),
+                                        str(self.root / "state"), "99887766",
+                                        auth_store=str(self.store))
+            self.assertEqual(decision["action"], daemon.RESTART, decision)
+            applied = daemon.apply(str(binary), str(self.runtime_a),
+                                   str(self.root / "state"), "99887766", decision,
+                                   auth_store=str(self.store))
+        self.assertEqual(applied["action"], "restarted", applied)
+        second = json.loads(self.record.read_text())
+        self.assertEqual(second["guardian"], first["guardian"])
+        self.assertEqual(second["config_hash"], "99887766")
+        self.assertNotEqual(second["daemon"]["pid"], first["daemon"]["pid"])
+        self.assertEqual(json.loads((self.root / "state" / "daemons" / "codex.json").read_text())
+                         ["config_hash"], "99887766")
+        self.assertIsNone(process.poll())
+
+    def test_failed_changed_configuration_restart_retains_blocking_owner(self) -> None:
+        process, binary, env = self._start_guarded_review_daemon("malformed-restart")
+        from ihar.codex import daemon
+        first = json.loads(self.record.read_text())
+        with mock.patch.dict(os.environ, env):
+            with self.assertRaises(auth_owner.AuthOwnerError):
+                daemon.restart(str(binary), str(self.runtime_a), "99887766",
+                               auth_store=str(self.store))
+        second = json.loads(self.record.read_text())
+        self.assertEqual(second["guardian"], first["guardian"])
+        self.assertEqual(second["config_hash"], "99887766")
+        self.assertEqual(second["state"], "blocked")
+        self.assertIsNone(second["daemon"])
+        self.assertIsNone(process.poll())
+        contender = self._guardian("raise SystemExit(23)")
+        self.assertEqual(contender.wait(timeout=3), 3)
+
+    def test_idle_external_control_client_cannot_block_guardian(self) -> None:
+        _process, binary, env = self._start_guarded_review_daemon()
+        from ihar.codex import daemon
+        idle = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_SEQPACKET)
+        idle.connect(str(self.store / "auth" / "codex" / ".guardian.sock"))
+        result: list[dict | BaseException] = []
+
+        def stop() -> None:
+            try:
+                with mock.patch.dict(os.environ, env):
+                    result.append(daemon.stop(str(binary), str(self.runtime_a),
+                                              auth_store=str(self.store)))
+            except BaseException as error:
+                result.append(error)
+
+        try:
+            time.sleep(0.05)
+            worker = threading.Thread(target=stop)
+            worker.start()
+            worker.join(timeout=2)
+            blocked = worker.is_alive()
+        finally:
+            idle.close()
+        worker.join(timeout=5)
+        self.assertFalse(blocked, "idle client blocked the guardian control loop")
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], dict)
+        self.assertEqual(result[0]["status"], "stopped")
+
     def test_control_refuses_other_runtime_and_writer_attachment(self) -> None:
         self._start_guarded_review_daemon()
         from ihar.codex import guardian
@@ -1185,7 +1252,7 @@ else:
                                 {"runtime": str(self.runtime_b), "binary": str(self.root / "review-codex")})
         with self.assertRaises(auth_owner.AuthOwnerError):
             guardian.call_owner(self.store, "daemon-restart",
-                                {"runtime": str(self.runtime_a), "binary": str(self.root / "review-codex"),
+                                {"runtime": str(self.runtime_b), "binary": str(self.root / "review-codex"),
                                  "config_hash": "other"})
         with self.assertRaises(auth_owner.AuthOwnerError):
             guardian.call_owner(self.store, "attach",
@@ -1266,13 +1333,15 @@ pidfile = home + '/daemon.pid'
 detached = home + '/detached.pid'
 mode = os.environ['FAKE_DAEMON_MODE']
 if sys.argv[1:] == ['app-server', 'daemon', 'start']:
+    started_before = os.path.exists(home + '/started-once')
     child = subprocess.Popen([sys.executable, __file__, 'serve'], start_new_session=True,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(200):
         if os.path.exists(sock) and (mode != 'detached' or os.path.exists(detached)): break
         time.sleep(.01)
     if mode == 'slow-start': time.sleep(6)
-    if mode == 'malformed': print('not-json')
+    if mode == 'malformed-restart': open(home + '/started-once', 'w').close()
+    if mode == 'malformed' or (mode == 'malformed-restart' and started_before): print('not-json')
     else: print(json.dumps({'status':'started','pid':child.pid,'socketPath':sock}))
 elif sys.argv[1:] == ['app-server', 'daemon', 'stop']:
     os.killpg(int(open(pidfile).read()), signal.SIGTERM)

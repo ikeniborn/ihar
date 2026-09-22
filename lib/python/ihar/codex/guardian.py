@@ -277,7 +277,8 @@ def _start_daemon(store: Path, runtime: str, config_hash: str, binary: str,
     return answer
 
 
-def _stop_daemon(store: Path, runtime: str, binary: str, guardian_pid: int) -> dict:
+def _stop_daemon(store: Path, runtime: str, binary: str, guardian_pid: int,
+                 *, next_config_hash: str | None = None) -> dict:
     from . import daemon
 
     answer = daemon._daemon_call(binary, runtime, "stop", timeout=60.0)
@@ -294,6 +295,9 @@ def _stop_daemon(store: Path, runtime: str, binary: str, guardian_pid: int) -> d
                 or record.get("runtime") != runtime or identity["binary"] != binary):
                 raise auth_owner.AuthOwnerError("Codex daemon owner changed during stop")
             table = auth_owner._process_table()
+            if (record["guardian"]["pid"] != guardian_pid
+                or not auth_owner._identity_matches(record["guardian"], table)):
+                raise auth_owner.AuthOwnerError("Codex guardian identity changed during stop")
             observed = table.get(identity["pid"])
             if observed is not None and observed["start"] != identity["start"]:
                 raise auth_owner.AuthOwnerError("Codex daemon PID was reused")
@@ -309,6 +313,10 @@ def _stop_daemon(store: Path, runtime: str, binary: str, guardian_pid: int) -> d
             if (socket_gone and not auth_owner._group_active(identity)
                 and not auth_owner._descendants_active(guardian_pid)):
                 record["daemon"] = None
+                if next_config_hash is not None:
+                    auth_owner.verify_runtime_link(runtime, store)
+                    record["config_hash"] = next_config_hash
+                    record["state"] = "pending"
                 auth_owner._write_owner(owner, record)
                 return answer
         if time.monotonic() >= deadline:
@@ -438,7 +446,8 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                 if (daemon is None or fields["runtime"] != record["runtime"]
                     or fields["binary"] != daemon["binary"]
                     or (operation == "daemon-restart"
-                        and fields["config_hash"] != record["config_hash"])
+                        and (not isinstance(fields["config_hash"], str)
+                             or len(fields["config_hash"]) > 256))
                     or not auth_owner._identity_matches(daemon, table)
                     or not auth_owner._daemon_socket_proven(record)):
                     raise auth_owner.AuthOwnerError("Codex daemon stop identity is invalid")
@@ -454,7 +463,9 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                                              guardian_pid)
         elif daemon_action in ("stop", "restart"):
             answer["answer"] = _stop_daemon(store, fields["runtime"], fields["binary"],
-                                            guardian_pid)
+                                            guardian_pid,
+                                            next_config_hash=(fields["config_hash"]
+                                                              if daemon_action == "restart" else None))
             if daemon_action == "restart":
                 answer["answer"] = _start_daemon(store, fields["runtime"],
                                                  fields["config_hash"], fields["binary"],
@@ -684,7 +695,9 @@ def run(store: Path, argv: list[str]) -> int:
                     connection, _ = listener.accept()
                     with connection:
                         connection.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
-                        _handle(selected, connection, os.getpid(), external=True)
+                        readable_connection, _, _ = select.select([connection], [], [], 0.25)
+                        if readable_connection:
+                            _handle(selected, connection, os.getpid(), external=True)
         finally:
             for number, handler in previous_handlers.items():
                 signal.signal(number, handler)
