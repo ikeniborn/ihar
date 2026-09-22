@@ -43,6 +43,16 @@ def request(fd: int, operation: str, fields: dict) -> dict:
             raise auth_owner.AuthOwnerError("Codex guardian request is too large")
         with ExitStack() as stack:
             channel = stack.enter_context(socket.socket(fileno=os.dup(fd)))
+            peer = struct.unpack("3i", channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                            struct.calcsize("3i")))
+            with ExitStack() as owner_stack:
+                owner = auth_owner._locked_owner(auth_owner._lease_store(None), owner_stack)
+                record = auth_owner._read_owner(owner)
+                if (record is None or record.get("schema") != 2
+                    or peer[0] != record["guardian"]["pid"] or peer[1] != os.geteuid()
+                    or not auth_owner._identity_matches(record["guardian"],
+                                                        auth_owner._process_table())):
+                    raise auth_owner.AuthOwnerError("Codex guardian peer identity is invalid")
             reply, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             stack.enter_context(reply)
             stack.enter_context(receiver)
@@ -77,10 +87,12 @@ def _identity(pid: int, binary: str | None, guardian_pid: int,
     return auth_owner._identity_for(pid, binary)
 
 
-def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> None:
+def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
     control_space = socket.CMSG_SPACE(struct.calcsize("3i")) + socket.CMSG_SPACE(
         array.array("i").itemsize)
     message, ancillary, flags, _address = channel.recvmsg(_MAX_MESSAGE + 1, control_space)
+    if not message and not ancillary:
+        return False
     reply_fd = None
     credentials = None
     for level, kind, data in ancillary:
@@ -96,7 +108,7 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> None:
                 for extra in descriptors[1:]:
                     os.close(extra)
     if reply_fd is None:
-        return
+        return True
     try:
         if (not message or len(message) > _MAX_MESSAGE
             or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
@@ -172,6 +184,7 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> None:
             reply.send(json.dumps(answer).encode("ascii"))
     except OSError:
         pass
+    return True
 
 
 def _release_when_quiescent(store: Path, child: subprocess.Popen) -> bool:
@@ -248,7 +261,8 @@ def run(store: Path, argv: list[str]) -> int:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
         gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
         try:
-            environment = dict(os.environ, **{_FD_ENV: str(client.fileno())})
+            environment = dict(os.environ, IHAR_STORE=str(selected),
+                               **{_FD_ENV: str(client.fileno())})
             child = subprocess.Popen([sys.executable, "-c", _BOOT, str(gate_read), *argv],
                                      env=environment, pass_fds=(client.fileno(), gate_read),
                                      start_new_session=True)
@@ -275,6 +289,7 @@ def run(store: Path, argv: list[str]) -> int:
         try:
             status = None
             reported = False
+            channel_open = True
             while True:
                 if status is None:
                     status = child.poll()
@@ -292,9 +307,12 @@ def run(store: Path, argv: list[str]) -> int:
                             descriptor = os.open(os.devnull, os.O_WRONLY)
                             os.dup2(descriptor, sys.stdout.fileno())
                             os.close(descriptor)
-                readable, _, _ = select.select([server], [], [], .05)
+                readable, _, _ = select.select([server] if channel_open else [], [], [],
+                                               .05 if channel_open else .2)
                 if readable:
-                    _handle(selected, server, os.getpid())
+                    channel_open = _handle(selected, server, os.getpid())
+                    if not channel_open:
+                        server.close()
         finally:
             for number, handler in previous_handlers.items():
                 signal.signal(number, handler)

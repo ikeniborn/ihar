@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import array
 import json
 import os
 import signal
@@ -10,6 +11,7 @@ import socket as socket_module
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -93,6 +95,43 @@ class AuthLeaseTests(unittest.TestCase):
         finally:
             auth_owner.release(owner)
 
+    def test_foreign_socket_cannot_forge_guardian_success(self) -> None:
+        from ihar.codex import guardian
+        ready = self.root / "real-guardian-ready"
+        guarded = self._guardian(f"from pathlib import Path; import time; Path({str(ready)!r}).touch(); time.sleep(1.5)")
+        self._wait_for(ready)
+        self.assertEqual(json.loads(self.record.read_text())["schema"], 2)
+        original = self.record.read_bytes()
+        client, foreign = socket_module.socketpair(socket_module.AF_UNIX,
+                                                     socket_module.SOCK_SEQPACKET)
+        self.addCleanup(client.close)
+        self.addCleanup(foreign.close)
+        def forge_success() -> None:
+            foreign.settimeout(.5)
+            try:
+                _payload, controls, _flags, _address = foreign.recvmsg(
+                    4096, socket_module.CMSG_SPACE(array.array("i").itemsize))
+            except (OSError, TimeoutError):
+                return
+            for level, kind, data in controls:
+                if level == socket_module.SOL_SOCKET and kind == socket_module.SCM_RIGHTS:
+                    descriptors = array.array("i")
+                    descriptors.frombytes(data[:descriptors.itemsize])
+                    with socket_module.socket(fileno=descriptors[0]) as reply:
+                        reply.send(b'{"ok":true,"state":"active"}')
+        responder = threading.Thread(target=forge_success, daemon=True)
+        responder.start()
+        try:
+            with self.assertRaises(auth_owner.AuthOwnerError):
+                guardian.request(client.fileno(), "bind-runtime",
+                                 {"runtime": str(self.runtime_a), "config_hash": "forged"})
+            self.assertEqual(self.record.read_bytes(), original)
+        finally:
+            client.close()
+            foreign.close()
+            responder.join(timeout=1)
+        self.assertEqual(guarded.wait(timeout=5), 0, guarded.stderr.read())
+
     def test_guardian_authenticated_child_binds_runtime_and_hash(self) -> None:
         auth_owner.stage(self.store)
         (self.runtime_a / "auth.json").symlink_to(self.store / "auth" / "codex" / "auth.json")
@@ -105,6 +144,22 @@ class AuthLeaseTests(unittest.TestCase):
         self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
         self.assertTrue(marker.exists())
         self.assertFalse(self.record.exists())
+
+    def test_guardian_child_can_request_without_inherited_store_variable(self) -> None:
+        auth_owner.stage(self.store)
+        (self.runtime_a / "auth.json").symlink_to(self.store / "auth" / "codex" / "auth.json")
+        marker = self.root / "bound-without-store-env"
+        script = ("import os; from pathlib import Path; from ihar.codex import guardian; "
+                  "guardian.request(int(os.environ['IHAR_GUARD_FD']), 'bind-runtime', "
+                  f"{{'runtime': {str(self.runtime_a)!r}, 'config_hash': 'hash-a'}}); "
+                  f"Path({str(marker)!r}).touch()")
+        environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "lib" / "python"))
+        environment.pop("IHAR_STORE", None)
+        answer = subprocess.run([sys.executable, "-m", "ihar.codex.guardian", str(self.store),
+                                 "--", sys.executable, "-c", script], env=environment,
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(answer.returncode, 0, answer.stderr)
+        self.assertTrue(marker.exists())
 
     def test_guardian_crash_retains_record_with_live_descendant(self) -> None:
         marker = self.root / "live"
@@ -248,6 +303,29 @@ class AuthLeaseTests(unittest.TestCase):
         self.assertEqual(contender.wait(timeout=3), 23, contender.stderr.read())
         self.assertFalse(self.record.exists())
 
+    def test_opaque_external_codex_consumer_blocks_admission(self) -> None:
+        ready = self.root / "opaque-ready"
+        binary = self.root / "opaque-codex"
+        binary.write_text(f"#!/bin/sh\ntouch '{ready}'\nsleep 30\n")
+        binary.chmod(0o700)
+        environment = dict(os.environ)
+        environment.pop("HOME", None)
+        environment.pop("CODEX_HOME", None)
+        external = subprocess.Popen([str(binary)], env=environment, start_new_session=True)
+        def stop_external() -> None:
+            try:
+                os.killpg(external.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            external.wait(timeout=5)
+        self.addCleanup(stop_external)
+        self._wait_for(ready)
+        contender = self._guardian("raise SystemExit(23)")
+        self.assertEqual(contender.wait(timeout=3), 3)
+        self.assertIn("external Codex consumer runtime cannot be verified",
+                      contender.stderr.read())
+        self.assertFalse(self.record.exists())
+
     def test_bound_daemon_survives_initiating_child_and_holds_owner(self) -> None:
         auth_owner.stage(self.store)
         (self.runtime_a / "auth.json").symlink_to(self.store / "auth" / "codex" / "auth.json")
@@ -279,6 +357,23 @@ class AuthLeaseTests(unittest.TestCase):
                 time.sleep(.02)
             self.assertIsNotNone(json.loads(self.record.read_text())["daemon"])
             self.assertIsNone(process.poll())
+            self.assertEqual(json.loads(process.stdout.readline())["initiating_status"], 0)
+            def guardian_sockets() -> list[str]:
+                found = []
+                for path in (Path("/proc") / str(process.pid) / "fd").iterdir():
+                    try:
+                        target = os.readlink(path)
+                    except FileNotFoundError:
+                        continue
+                    if target.startswith("socket:["):
+                        found.append(target)
+                return found
+            for _ in range(50):
+                if not guardian_sockets():
+                    break
+                time.sleep(.02)
+            self.assertEqual(guardian_sockets(), [], "guardian retained child channel after EOF")
+            self.assertIsNone(process.poll(), "guardian stopped supervising live daemon")
             contender = self._guardian("raise SystemExit(23)")
             self.assertEqual(contender.wait(timeout=3), 3)
             self.assertIn("owns the shared login", contender.stderr.read())
