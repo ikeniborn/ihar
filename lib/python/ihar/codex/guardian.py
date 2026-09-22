@@ -7,6 +7,7 @@ checks and route every Codex executable through an owning guardian.
 from __future__ import annotations
 
 import array
+import fcntl
 import json
 import os
 import select
@@ -17,6 +18,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import ExitStack
 from pathlib import Path
@@ -37,7 +39,8 @@ _BOOT = (
 )
 
 
-def _exchange(channel: socket.socket, store: Path, operation: str, fields: dict) -> dict:
+def _exchange(channel: socket.socket, store: Path, operation: str, fields: dict,
+              descriptors: tuple[int, ...] = ()) -> dict:
     if not isinstance(fields, dict):
         raise auth_owner.AuthOwnerError("Codex guardian descriptor or request is invalid")
     try:
@@ -60,8 +63,8 @@ def _exchange(channel: socket.socket, store: Path, operation: str, fields: dict)
             stack.enter_context(reply)
             stack.enter_context(receiver)
             reply.settimeout({"daemon-start": 125, "daemon-stop": 65,
-                              "daemon-restart": 190}.get(operation, 5))
-            rights = array.array("i", [receiver.fileno()])
+                              "daemon-restart": 190, "attach": 30}.get(operation, 5))
+            rights = array.array("i", [receiver.fileno(), *descriptors])
             channel.sendmsg([message], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
             answer = reply.recv(_MAX_MESSAGE + 1)
         if not answer or len(answer) > _MAX_MESSAGE:
@@ -85,7 +88,8 @@ def request(fd: int, operation: str, fields: dict) -> dict:
         raise auth_owner.AuthOwnerError("Codex guardian channel cannot be verified") from error
 
 
-def call_owner(store: Path, operation: str, fields: dict) -> dict:
+def call_owner(store: Path, operation: str, fields: dict,
+               *, descriptors: tuple[int, ...] = ()) -> dict:
     """Use the original guardian's owner-only control socket, never a new lease."""
     selected = auth_owner._lease_store(store)
     with ExitStack() as stack:
@@ -109,7 +113,59 @@ def call_owner(store: Path, operation: str, fields: dict) -> dict:
             channel.connect(str(path))
         except OSError as error:
             raise auth_owner.AuthOwnerError("Codex daemon guardian socket cannot be reached") from error
-        return _exchange(channel, selected, operation, fields)
+        return _exchange(channel, selected, operation, fields, descriptors)
+
+
+def attach(store: Path, runtime: str, config_hash: str, argv: list[str],
+           stdio_fds: tuple[int, int, int]) -> int:
+    """Run one namespace-confined remote client under the original guardian."""
+    if (len(stdio_fds) != 3 or any(not isinstance(fd, int) or fd < 0 for fd in stdio_fds)
+        or not isinstance(argv, list)):
+        raise auth_owner.AuthOwnerError("Codex remote attachment is invalid")
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in (_FD_ENV, "IHAR_CODEX_GUARD_FD")}
+    payload = json.dumps(environment, separators=(",", ":")).encode("utf-8")
+    if len(payload) > 1 << 20:
+        raise auth_owner.AuthOwnerError("Codex remote environment is too large")
+    environment_fd = os.memfd_create("ihar-codex-remote-env",
+                                     os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    try:
+        os.write(environment_fd, payload)
+        os.lseek(environment_fd, 0, os.SEEK_SET)
+        seals = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+        fcntl.fcntl(environment_fd, fcntl.F_ADD_SEALS, seals)
+        answer = call_owner(store, "attach",
+                            {"runtime": os.path.abspath(runtime), "config_hash": config_hash,
+                             "argv": argv}, descriptors=(*stdio_fds, environment_fd))
+    finally:
+        os.close(environment_fd)
+    attached = answer.get("answer")
+    if (not isinstance(attached, dict) or set(attached) != {"pid", "start"}
+        or not isinstance(attached["pid"], int) or not isinstance(attached["start"], str)):
+        raise auth_owner.AuthOwnerError("Codex remote attachment proof is invalid")
+    interrupted = 0
+    def forward(number: int, _frame: object) -> None:
+        nonlocal interrupted
+        interrupted = number
+    previous = {number: signal.signal(number, forward)
+                for number in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        while True:
+            if interrupted:
+                call_owner(store, "attach-signal", dict(attached, signal=interrupted))
+                interrupted = 0
+            observed = call_owner(store, "attach-status", attached).get("answer")
+            if not isinstance(observed, dict) or not isinstance(observed.get("done"), bool):
+                raise auth_owner.AuthOwnerError("Codex remote attachment status is invalid")
+            if observed["done"]:
+                status = observed.get("status")
+                if not isinstance(status, int):
+                    raise auth_owner.AuthOwnerError("Codex remote attachment result is invalid")
+                return status
+            time.sleep(0.05)
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
 
 
 def daemon_identity(store: Path, runtime: str) -> dict:
@@ -326,14 +382,188 @@ def _stop_daemon(store: Path, runtime: str, binary: str, guardian_pid: int,
         time.sleep(0.05)
 
 
+def _cleanup_client_state(entry: dict) -> None:
+    path = Path(entry["client_state"])
+    metadata = os.stat(path, follow_symlinks=False)
+    if (not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != entry["client_state_identity"]
+        or not shutil.rmtree.avoids_symlink_attacks):
+        raise auth_owner.AuthOwnerError("Codex remote client state cleanup is unsafe")
+    shutil.rmtree(path)
+
+
+def _read_attached_environment(descriptor: int) -> dict[str, str]:
+    expected_seals = (fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW
+                      | fcntl.F_SEAL_WRITE)
+    if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) != expected_seals:
+        raise auth_owner.AuthOwnerError("Codex remote environment is not sealed")
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1 << 20:
+        raise auth_owner.AuthOwnerError("Codex remote environment is invalid")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    parsed = json.loads(os.read(descriptor, (1 << 20) + 1))
+    if (not isinstance(parsed, dict)
+        or any(not isinstance(key, str) or not key or "=" in key or "\0" in key
+               or not isinstance(value, str) or "\0" in value
+               for key, value in parsed.items())):
+        raise auth_owner.AuthOwnerError("Codex remote environment is invalid")
+    parsed.pop(_FD_ENV, None)
+    parsed.pop("IHAR_CODEX_GUARD_FD", None)
+    return parsed
+
+
+def _start_attachment(store: Path, fields: dict, stdio_fds: list[int], environment: dict[str, str],
+                      guardian_pid: int,
+                      attachments: dict[tuple[int, str], dict]) -> dict:
+    from . import remote_sandbox
+
+    runtime = Path(fields["runtime"])
+    canonical_dir = store / "auth" / "codex"
+    auth_owner.verify_runtime_link(runtime, store)
+    state = Path(tempfile.mkdtemp(prefix="ihar-codex-remote-"))
+    os.chmod(state, 0o700)
+    state_metadata = os.stat(state, follow_symlinks=False)
+    sentinels: list[dict] = []
+    proof_read = proof_write = gate_read = gate_write = -1
+    process = None
+    cleaned = False
+    registered = False
+    try:
+        sentinels = remote_sandbox.create_sentinels(runtime, canonical_dir)
+        proof_read, proof_write = os.pipe2(os.O_CLOEXEC)
+        gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
+        command = remote_sandbox.command(store, runtime, state, sentinels,
+                                         proof_write, gate_read, fields["argv"])
+        process = subprocess.Popen(
+            command, env=environment, stdin=stdio_fds[0], stdout=stdio_fds[1],
+            stderr=stdio_fds[2], pass_fds=(proof_write, gate_read), start_new_session=True)
+        os.close(proof_write)
+        proof_write = -1
+        os.close(gate_read)
+        gate_read = -1
+        readable, _, _ = select.select([proof_read], [], [], 20)
+        if not readable:
+            raise auth_owner.AuthOwnerError("Codex remote sandbox proof timed out")
+        payload = os.read(proof_read, _MAX_MESSAGE + 1)
+        proof = json.loads(payload)
+        if (not isinstance(proof, dict) or proof.get("ok") is not True
+            or proof.get("mutations") != {
+                "write": "refused", "truncate": "refused", "rename": "refused",
+                "unlink": "refused", "symlink_replace": "refused"}
+            or proof.get("capabilities") != {
+                "CapEff": "0000000000000000", "CapPrm": "0000000000000000",
+                "CapBnd": "0000000000000000", "NoNewPrivs": "1"}):
+            raise auth_owner.AuthOwnerError("Codex remote sandbox proof is invalid")
+        remote_sandbox.cleanup_sentinels(sentinels)
+        cleaned = True
+        with ExitStack() as stack:
+            owner = auth_owner._locked_owner(store, stack)
+            record = auth_owner._read_owner(owner)
+            table = auth_owner._process_table()
+            daemon = record.get("daemon") if isinstance(record, dict) else None
+            if (record is None or record.get("schema") != 2
+                or record.get("runtime") != str(runtime)
+                or record.get("config_hash") != fields["config_hash"]
+                or daemon is None or daemon["binary"] != fields["argv"][0]
+                or not auth_owner._identity_matches(record["guardian"], table)
+                or record["guardian"]["pid"] != guardian_pid
+                or not auth_owner._identity_matches(daemon, table)
+                or not auth_owner._daemon_socket_proven(record)):
+                raise auth_owner.AuthOwnerError("Codex remote owner changed during setup")
+            identity = dict(auth_owner._identity_for(process.pid, fields["argv"][0]),
+                            client_state=str(state), client_state_dev=state_metadata.st_dev,
+                            client_state_ino=state_metadata.st_ino)
+            if identity["pgrp"] != identity["pid"]:
+                raise auth_owner.AuthOwnerError("Codex remote process group is invalid")
+            record["children"].append(identity)
+            auth_owner._write_owner(owner, record)
+        entry = {"process": process, "identity": identity, "status": None, "done": False,
+                 "completed_at": None, "client_state": str(state),
+                 "client_state_identity": (state_metadata.st_dev, state_metadata.st_ino)}
+        attachments[(identity["pid"], identity["start"])] = entry
+        registered = True
+        os.write(gate_write, b"1")
+        return {"pid": identity["pid"], "start": identity["start"]}
+    except (auth_owner.AuthOwnerError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError,
+            subprocess.SubprocessError, remote_sandbox.SandboxError) as error:
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+        raise auth_owner.AuthOwnerError("Codex remote sandbox setup failed") from error
+    finally:
+        for descriptor in (proof_read, proof_write, gate_read, gate_write):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        if sentinels and not cleaned:
+            try:
+                remote_sandbox.cleanup_sentinels(sentinels)
+            except remote_sandbox.SandboxError as error:
+                raise auth_owner.AuthOwnerError(
+                    "Codex remote sentinel cleanup failed") from error
+        if not registered:
+            try:
+                metadata = os.stat(state, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                if ((metadata.st_dev, metadata.st_ino)
+                    == (state_metadata.st_dev, state_metadata.st_ino)):
+                    shutil.rmtree(state)
+
+
+def _poll_attachments(store: Path, attachments: dict[tuple[int, str], dict]) -> None:
+    now = time.monotonic()
+    for key, entry in list(attachments.items()):
+        if entry["done"]:
+            if entry["completed_at"] is not None and now - entry["completed_at"] > 60:
+                del attachments[key]
+            continue
+        if entry["status"] is None:
+            status = entry["process"].poll()
+            if status is None:
+                continue
+            entry["status"] = 128 - status if status < 0 else status
+        if auth_owner._group_active(entry["identity"]):
+            continue
+        try:
+            _cleanup_client_state(entry)
+            with ExitStack() as stack:
+                owner = auth_owner._locked_owner(store, stack)
+                record = auth_owner._read_owner(owner)
+                if record is None or record.get("schema") != 2:
+                    raise auth_owner.AuthOwnerError("Codex remote owner changed during teardown")
+                children = record.get("children", [])
+                if entry["identity"] not in children:
+                    raise auth_owner.AuthOwnerError("Codex remote identity changed during teardown")
+                children.remove(entry["identity"])
+                auth_owner._write_owner(owner, record)
+        except (OSError, auth_owner.AuthOwnerError):
+            with ExitStack() as stack:
+                owner = auth_owner._locked_owner(store, stack)
+                record = auth_owner._read_owner(owner)
+                if record is not None and record.get("schema") == 2:
+                    record["state"] = "blocked"
+                    auth_owner._write_owner(owner, record)
+            raise
+        entry["done"] = True
+        entry["completed_at"] = now
+
+
 def _handle(store: Path, channel: socket.socket, guardian_pid: int,
-            *, external: bool = False) -> bool:
+            *, external: bool = False,
+            attachments: dict[tuple[int, str], dict] | None = None) -> bool:
     control_space = socket.CMSG_SPACE(struct.calcsize("3i")) + socket.CMSG_SPACE(
-        array.array("i").itemsize)
+        array.array("i").itemsize * 5)
     message, ancillary, flags, _address = channel.recvmsg(_MAX_MESSAGE + 1, control_space)
     if not message and not ancillary:
         return False
-    reply_fd = None
+    received_fds: list[int] = []
     credentials = None
     for level, kind, data in ancillary:
         if level != socket.SOL_SOCKET:
@@ -343,11 +573,12 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
         elif kind == socket.SCM_RIGHTS:
             descriptors = array.array("i")
             descriptors.frombytes(data[:len(data) - len(data) % descriptors.itemsize])
-            if descriptors:
-                reply_fd = descriptors[0]
-                for extra in descriptors[1:]:
-                    os.close(extra)
+            received_fds.extend(descriptors)
+    reply_fd = received_fds[0] if received_fds else None
+    passed_fds = received_fds[1:]
     if reply_fd is None:
+        for descriptor in passed_fds:
+            os.close(descriptor)
         return True
     daemon_action = None
     try:
@@ -359,7 +590,8 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
         if not isinstance(payload, dict) or not isinstance(payload.get("fields"), dict):
             raise auth_owner.AuthOwnerError("Codex guardian request is invalid")
         operation, fields = payload.get("operation"), payload["fields"]
-        if external and operation not in ("daemon-stop", "daemon-restart"):
+        if external and operation not in ("daemon-stop", "daemon-restart",
+                                          "attach", "attach-status", "attach-signal"):
             raise auth_owner.AuthOwnerError("Codex external guardian operation is invalid")
         auth_action = None
         with ExitStack() as stack:
@@ -454,6 +686,39 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                     or not auth_owner._daemon_socket_proven(record)):
                     raise auth_owner.AuthOwnerError("Codex daemon stop identity is invalid")
                 daemon_action = "stop" if operation == "daemon-stop" else "restart"
+            elif operation == "attach" and external and set(fields) == {
+                    "runtime", "config_hash", "argv"}:
+                daemon = record.get("daemon")
+                argv = fields["argv"]
+                remote_uri = (f"unix://{daemon['socket']}" if isinstance(daemon, dict)
+                              and "socket" in daemon else None)
+                if (attachments is None or len(attachments) >= 4 or len(passed_fds) != 4
+                    or daemon is None or fields["runtime"] != record["runtime"]
+                    or fields["config_hash"] != record["config_hash"]
+                    or not isinstance(argv, list) or not 3 <= len(argv) <= 64
+                    or any(not isinstance(item, str) or not item or "\0" in item
+                           for item in argv)
+                    or not os.path.isabs(argv[0]) or argv[0] != daemon["binary"]
+                    or argv.count("--remote") != 1
+                    or argv[argv.index("--remote") + 1:argv.index("--remote") + 2]
+                    != [remote_uri]
+                    or not auth_owner._identity_matches(daemon, table)
+                    or not auth_owner._daemon_socket_proven(record)):
+                    raise auth_owner.AuthOwnerError("Codex remote attachment identity is invalid")
+                daemon_action = "attach"
+            elif operation == "attach-status" and external and set(fields) == {"pid", "start"}:
+                key = (fields["pid"], fields["start"])
+                if (attachments is None or key not in attachments or passed_fds):
+                    raise auth_owner.AuthOwnerError("Codex remote attachment status is invalid")
+                daemon_action = "attach-status"
+            elif operation == "attach-signal" and external and set(fields) == {
+                    "pid", "start", "signal"}:
+                key = (fields["pid"], fields["start"])
+                if (attachments is None or key not in attachments or passed_fds
+                    or fields["signal"] not in (signal.SIGINT, signal.SIGTERM)
+                    or attachments[key]["done"]):
+                    raise auth_owner.AuthOwnerError("Codex remote attachment signal is invalid")
+                daemon_action = "attach-signal"
             else:
                 raise auth_owner.AuthOwnerError("Codex guardian operation is invalid")
             if auth_action is None and daemon_action is None:
@@ -472,6 +737,19 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                 answer["answer"] = _start_daemon(store, fields["runtime"],
                                                  fields["config_hash"], fields["binary"],
                                                  guardian_pid)
+        elif daemon_action == "attach":
+            environment = _read_attached_environment(passed_fds[3])
+            answer["answer"] = _start_attachment(store, fields, passed_fds[:3], environment,
+                                                  guardian_pid, attachments)
+        elif daemon_action == "attach-status":
+            entry = attachments[(fields["pid"], fields["start"])]
+            answer["answer"] = ({"done": False} if not entry["done"] else
+                                {"done": True, "status": entry["status"]})
+            if entry["done"]:
+                del attachments[(fields["pid"], fields["start"])]
+        elif daemon_action == "attach-signal":
+            os.killpg(attachments[(fields["pid"], fields["start"])]["identity"]["pgrp"],
+                      fields["signal"])
         elif auth_action == "stage":
             staged = auth_owner.stage(store)
             existing = (store / "auth" / "codex" / "auth.json").exists()
@@ -530,6 +808,11 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
             reply.send(json.dumps(answer).encode("ascii"))
     except OSError:
         pass
+    for descriptor in passed_fds:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
     return True
 
 
@@ -664,7 +947,9 @@ def run(store: Path, argv: list[str]) -> int:
             reported = False
             channel_open = True
             pending_control: dict[socket.socket, float] = {}
+            attachments: dict[tuple[int, str], dict] = {}
             while True:
+                _poll_attachments(selected, attachments)
                 if status is None:
                     status = child.poll()
                 if status is not None:
@@ -701,7 +986,8 @@ def run(store: Path, argv: list[str]) -> int:
                     ([server] if channel_open else []) + [listener, *pending_control],
                     [], [], timeout)
                 if server in readable:
-                    channel_open = _handle(selected, server, os.getpid())
+                    channel_open = _handle(selected, server, os.getpid(),
+                                           attachments=attachments)
                     if not channel_open:
                         server.close()
                 for connection in list(pending_control):
@@ -709,7 +995,8 @@ def run(store: Path, argv: list[str]) -> int:
                         continue
                     del pending_control[connection]
                     try:
-                        _handle(selected, connection, os.getpid(), external=True)
+                        _handle(selected, connection, os.getpid(), external=True,
+                                attachments=attachments)
                     finally:
                         connection.close()
                 if listener in readable:
@@ -825,6 +1112,8 @@ def _main(arguments: list[str]) -> int:
         request(int(arguments[1]), "bind-runtime",
                 {"runtime": arguments[2], "config_hash": arguments[3]})
         return 0
+    if len(arguments) >= 6 and arguments[0] == "attach" and arguments[4] == "--":
+        return attach(Path(arguments[1]), arguments[2], arguments[3], arguments[5:], (0, 1, 2))
     if len(arguments) >= 5 and arguments[:1] == ["auth"] and arguments[2] == "--":
         fd = int(arguments[1])
         command = arguments[3:]

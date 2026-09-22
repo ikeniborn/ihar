@@ -213,8 +213,29 @@ run 'ihar install'"
     return $?
   fi
 
+  local attach_store="" attach_python_path="" attach_interpreter=""
+  if [[ "$vendor" == codex && "$IHAR_FLAG_WEB" == true ]]; then
+    attach_store="$IHAR_STORE"
+    attach_python_path="$IHAR_ROOT/lib/python"
+    attach_interpreter="$(ihar_python_bin)" || return 3
+  fi
   ihar_env_apply
-  if [[ "$vendor" == codex ]]; then ihar_codex_guard_drop; fi
+  if [[ "$vendor" == codex ]]; then
+    ihar_codex_guard_drop
+    if [[ "$IHAR_FLAG_WEB" == true ]]; then
+      if (( ${#IHAR_ENV[@]} )); then
+        env -i "${IHAR_ENV[@]}" \
+          PYTHONPATH="$attach_python_path" \
+          "$attach_interpreter" -m ihar.codex.guardian attach \
+          "$attach_store" "$runtime" "$hash" -- "${IHAR_ARGV[@]}"
+      else
+        PYTHONPATH="$attach_python_path${PYTHONPATH:+:$PYTHONPATH}" \
+          "$attach_interpreter" -m ihar.codex.guardian attach \
+          "$attach_store" "$runtime" "$hash" -- "${IHAR_ARGV[@]}"
+      fi
+      return $?
+    fi
+  fi
   if (( ${#IHAR_ENV[@]} )); then
     exec env -i "${IHAR_ENV[@]}" "${IHAR_ARGV[@]}"
   fi

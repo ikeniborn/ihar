@@ -1277,6 +1277,242 @@ else:
                 connection.close()
         self.assertEqual(answer["status"], "stopped")
 
+    def test_remote_attach_uses_original_guardian_and_passed_stdio(self) -> None:
+        process, binary, env = self._start_guarded_review_daemon()
+        from ihar.codex import guardian
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.write_text("synthetic-credential", encoding="utf-8")
+        before = json.loads(self.record.read_text())
+        input_path = self.root / "remote.in"
+        output_path = self.root / "remote.out"
+        input_path.write_bytes(b"passed-stdio")
+        with input_path.open("rb") as stdin, output_path.open("wb") as stdout:
+            with mock.patch.dict(os.environ, env):
+                status = guardian.attach(
+                    self.store, str(self.runtime_a), "aabbccdd",
+                    [str(binary), "--remote",
+                     f"unix://{self.runtime_a}/app-server-control/app-server-control.sock"],
+                    (stdin.fileno(), stdout.fileno(), stdout.fileno()))
+        self.assertEqual(status, 0, output_path.read_text(errors="replace"))
+        self.assertEqual(output_path.read_bytes(), b"remote:passed-stdio")
+        after = json.loads(self.record.read_text())
+        self.assertEqual(after["guardian"], before["guardian"])
+        self.assertEqual(after["daemon"], before["daemon"])
+        self.assertEqual(after["children"], [])
+        self.assertIsNone(process.poll())
+
+    def test_remote_attach_refuses_different_generation_before_vendor_start(self) -> None:
+        _process, binary, env = self._start_guarded_review_daemon()
+        from ihar.codex import guardian
+        (self.store / "auth" / "codex" / "auth.json").write_text(
+            "synthetic-credential", encoding="utf-8")
+        marker = self.root / "remote-started"
+        with marker.open("wb") as output:
+            with mock.patch.dict(os.environ, env):
+                with self.assertRaises(auth_owner.AuthOwnerError):
+                    guardian.attach(
+                        self.store, str(self.runtime_a), "different-generation",
+                        [str(binary), "--remote",
+                         f"unix://{self.runtime_a}/app-server-control/app-server-control.sock"],
+                        (0, output.fileno(), output.fileno()))
+        self.assertEqual(marker.read_bytes(), b"")
+
+    def test_remote_attach_forwards_signal_and_returns_signal_status(self) -> None:
+        guardian_process, binary, env = self._start_guarded_review_daemon()
+        (self.store / "auth" / "codex" / "auth.json").write_text(
+            "synthetic-credential", encoding="utf-8")
+        command = [sys.executable, "-m", "ihar.codex.guardian", "attach",
+                   str(self.store), str(self.runtime_a), "aabbccdd", "--", str(binary),
+                   "--remote", f"unix://{self.runtime_a}/app-server-control/app-server-control.sock"]
+        attached = subprocess.Popen(
+            command, env=dict(env, FAKE_REMOTE_HOLD="1"), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        line = attached.stdout.readline().strip()
+        self.assertRegex(line, r"^remote-ready:[1-9][0-9]*$")
+        remote_pid = int(line.partition(":")[2])
+        attached.send_signal(signal.SIGTERM)
+        self.assertEqual(attached.wait(timeout=5), 128 + signal.SIGTERM,
+                         attached.stderr.read())
+        for _ in range(100):
+            if remote_pid not in auth_owner._process_table():
+                break
+            time.sleep(0.02)
+        self.assertNotIn(remote_pid, auth_owner._process_table())
+        self.assertEqual(json.loads(self.record.read_text())["children"], [])
+        self.assertIsNone(guardian_process.poll())
+        attached.stdout.close()
+        attached.stderr.close()
+
+    def test_guardian_crash_retains_remote_identity_and_blocking_owner(self) -> None:
+        guardian_process, binary, env = self._start_guarded_review_daemon()
+        (self.store / "auth" / "codex" / "auth.json").write_text(
+            "synthetic-credential", encoding="utf-8")
+        command = [sys.executable, "-m", "ihar.codex.guardian", "attach",
+                   str(self.store), str(self.runtime_a), "aabbccdd", "--", str(binary),
+                   "--remote", f"unix://{self.runtime_a}/app-server-control/app-server-control.sock"]
+        attached = subprocess.Popen(
+            command, env=dict(env, FAKE_REMOTE_HOLD="1"), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        line = attached.stdout.readline().strip()
+        self.assertRegex(line, r"^remote-ready:[1-9][0-9]*$")
+        remote_pid = int(line.partition(":")[2])
+        guardian_process.kill()
+        guardian_process.wait(timeout=5)
+        self.assertEqual(attached.wait(timeout=10), 3)
+        record = json.loads(self.record.read_text())
+        self.assertEqual(record["children"][0]["pid"], remote_pid)
+        self.assertIn(remote_pid, auth_owner._process_table())
+        contender = self._guardian("raise SystemExit(23)")
+        self.assertEqual(contender.wait(timeout=3), 3)
+        os.killpg(remote_pid, signal.SIGKILL)
+        client_state = Path(record["children"][0]["client_state"])
+        metadata = os.stat(client_state, follow_symlinks=False)
+        self.assertEqual((metadata.st_dev, metadata.st_ino),
+                         (record["children"][0]["client_state_dev"],
+                          record["children"][0]["client_state_ino"]))
+        shutil.rmtree(client_state)
+        attached.stdout.close()
+        attached.stderr.close()
+
+    def test_remote_sandbox_proves_read_only_credentials_and_writable_client_state(self) -> None:
+        from ihar.codex import remote_sandbox
+        auth_owner.stage(self.store)
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.write_text("synthetic-credential", encoding="utf-8")
+        link = self.runtime_b / "auth.json"
+        link.symlink_to(canonical)
+        socket_path = self.runtime_b / "app-server-control" / "app-server-control.sock"
+        socket_path.parent.mkdir()
+        listener = socket_module.socket(socket_module.AF_UNIX)
+        listener.bind(str(socket_path))
+        listener.listen()
+        self.addCleanup(listener.close)
+        client_state = Path(tempfile.mkdtemp(prefix="ihar-remote-state-"))
+        self.addCleanup(shutil.rmtree, client_state, True)
+        marker = client_state / "marker.json"
+        vendor = self.root / "sandbox-vendor"
+        vendor.write_text("""#!/usr/bin/env python3
+import json, os, socket
+runtime = os.environ['CODEX_HOME']
+canonical = os.path.realpath(os.path.join(runtime, 'auth.json'))
+client = socket.socket(socket.AF_UNIX)
+client.connect(os.path.join(runtime, 'app-server-control', 'app-server-control.sock'))
+state = os.environ['IHAR_REMOTE_CLIENT_STATE']
+open(os.path.join(state, 'writable'), 'w').write('yes')
+status = open('/proc/self/status', encoding='utf-8').read().splitlines()
+caps = {line.split(':', 1)[0]: line.split(':', 1)[1].strip()
+        for line in status if line.startswith(('CapEff:', 'CapPrm:', 'CapBnd:', 'NoNewPrivs:'))}
+json.dump({'runtime_ro': bool(os.statvfs(runtime).f_flag & os.ST_RDONLY),
+           'auth_ro': bool(os.statvfs(canonical).f_flag & os.ST_RDONLY),
+           'link': os.readlink(os.path.join(runtime, 'auth.json')),
+           'caps': caps}, open(os.environ['IHAR_REMOTE_MARKER'], 'w'))
+""", encoding="utf-8")
+        vendor.chmod(0o700)
+        link_before = os.lstat(link)
+        canonical_before = os.stat(canonical, follow_symlinks=False)
+        sentinels = remote_sandbox.create_sentinels(self.runtime_b, canonical.parent)
+        self.addCleanup(remote_sandbox.cleanup_sentinels, sentinels)
+        proof_read, proof_write = os.pipe2(os.O_CLOEXEC)
+        gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
+        environment = dict(os.environ, IHAR_REMOTE_MARKER=str(marker),
+                           PYTHONPATH=str(Path(__file__).resolve().parents[1] / "lib" / "python"))
+        command = remote_sandbox.command(
+            self.store, self.runtime_b, client_state, sentinels,
+            proof_write, gate_read, [str(vendor)])
+        process = subprocess.Popen(command, env=environment, pass_fds=(proof_write, gate_read))
+        os.close(proof_write)
+        os.close(gate_read)
+        try:
+            proof = json.loads(os.read(proof_read, 4097))
+            self.assertTrue(proof["ok"], proof)
+            self.assertEqual(proof["mutations"], {
+                "write": "refused", "truncate": "refused", "rename": "refused",
+                "unlink": "refused", "symlink_replace": "refused"})
+            remote_sandbox.cleanup_sentinels(sentinels)
+            os.write(gate_write, b"1")
+        finally:
+            os.close(proof_read)
+            os.close(gate_write)
+        self.assertEqual(process.wait(timeout=5), 0)
+        observed = json.loads(marker.read_text())
+        self.assertTrue(observed["runtime_ro"])
+        self.assertTrue(observed["auth_ro"])
+        self.assertEqual(observed["link"], str(canonical))
+        self.assertEqual(observed["caps"], {
+            "CapEff": "0000000000000000", "CapPrm": "0000000000000000",
+            "CapBnd": "0000000000000000", "NoNewPrivs": "1"})
+        self.assertEqual(canonical.read_text(), "synthetic-credential")
+        link_after = os.lstat(link)
+        canonical_after = os.stat(canonical, follow_symlinks=False)
+        self.assertEqual((link_after.st_dev, link_after.st_ino),
+                         (link_before.st_dev, link_before.st_ino))
+        self.assertEqual((canonical_after.st_dev, canonical_after.st_ino),
+                         (canonical_before.st_dev, canonical_before.st_ino))
+        self.assertEqual((client_state / "writable").read_text(), "yes")
+
+    def _assert_remote_sandbox_failure_precedes_exec(self, failing_step: str) -> None:
+        from ihar.codex import remote_sandbox
+        auth_owner.stage(self.store)
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.write_text("synthetic-credential", encoding="utf-8")
+        (self.runtime_b / "auth.json").symlink_to(canonical)
+        state = Path(tempfile.mkdtemp(prefix="ihar-remote-failure-"))
+        self.addCleanup(shutil.rmtree, state, True)
+        marker = state / "vendor-started"
+        sentinels = remote_sandbox.create_sentinels(self.runtime_b, canonical.parent)
+        self.addCleanup(remote_sandbox.cleanup_sentinels, sentinels)
+        proof_read, proof_write = os.pipe2(os.O_CLOEXEC)
+        gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
+        pid = os.fork()
+        if pid == 0:
+            os.close(proof_read)
+            os.close(gate_write)
+            target = "_enter_namespaces" if failing_step == "namespace" else "_drop_capabilities"
+            try:
+                with mock.patch.object(remote_sandbox, target,
+                                       side_effect=remote_sandbox.SandboxError("synthetic failure")):
+                    status = remote_sandbox.run(
+                        self.store, self.runtime_b, state, sentinels, proof_write, gate_read,
+                        ["/bin/sh", "-c", f"touch {marker}"])
+            except BaseException:
+                status = 99
+            os._exit(status)
+        os.close(proof_write)
+        os.close(gate_read)
+        os.close(gate_write)
+        try:
+            proof = json.loads(os.read(proof_read, 4097))
+        finally:
+            os.close(proof_read)
+        _waited, wait_status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(wait_status), 3)
+        self.assertFalse(proof["ok"])
+        self.assertFalse(marker.exists())
+        remote_sandbox.cleanup_sentinels(sentinels)
+
+    def test_missing_user_namespace_refuses_before_vendor_exec(self) -> None:
+        self._assert_remote_sandbox_failure_precedes_exec("namespace")
+
+    def test_failed_capability_drop_refuses_and_cleans_sentinels_before_vendor_exec(self) -> None:
+        self._assert_remote_sandbox_failure_precedes_exec("capability")
+
+    def test_guardian_cleans_sentinels_when_sandbox_fails_before_exec(self) -> None:
+        guardian_process, binary, _env = self._start_guarded_review_daemon()
+        from ihar.codex import guardian, remote_sandbox
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.write_text("synthetic-credential", encoding="utf-8")
+        fields = {"runtime": str(self.runtime_a), "config_hash": "aabbccdd",
+                  "argv": [str(binary), "--remote",
+                           f"unix://{self.runtime_a}/app-server-control/app-server-control.sock"]}
+        owner = json.loads(self.record.read_text())
+        with mock.patch.object(remote_sandbox, "command", return_value=["/bin/false"]):
+            with self.assertRaises(auth_owner.AuthOwnerError):
+                guardian._start_attachment(self.store, fields, [0, 1, 2], dict(os.environ),
+                                           owner["guardian"]["pid"], {})
+        self.assertEqual(list(self.runtime_a.parent.glob(".ihar-remote-*")), [])
+        self.assertEqual(list(canonical.parent.glob(".ihar-remote-*")), [])
+        self.assertIsNone(guardian_process.poll())
+
     def test_control_refuses_other_runtime_and_writer_attachment(self) -> None:
         self._start_guarded_review_daemon()
         from ihar.codex import guardian
@@ -1390,10 +1626,21 @@ elif sys.argv[1:] == ['app-server', 'daemon', 'version']:
     else: print(json.dumps({'status':'absent'}))
 elif sys.argv[1:] == ['--version']:
     print('codex-cli 0.154.0')
+elif len(sys.argv) == 3 and sys.argv[1] == '--remote':
+    client = socket.socket(socket.AF_UNIX)
+    client.connect(sock)
+    with open(os.path.join(os.environ['IHAR_REMOTE_CLIENT_STATE'], 'state'), 'w') as output:
+        output.write('writable')
+    if os.environ.get('FAKE_REMOTE_HOLD'):
+        print('remote-ready:' + str(os.getpid()), flush=True)
+        while True: time.sleep(1)
+    else:
+        sys.stdout.buffer.write(b'remote:' + sys.stdin.buffer.read())
 elif sys.argv[1:] == ['serve']:
     os.makedirs(os.path.dirname(sock), exist_ok=True)
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(sock)
+    listener.listen()
     open(pidfile,'w').write(str(os.getpid()))
     if mode == 'detached':
         child = subprocess.Popen([sys.executable, __file__, 'descendant'],

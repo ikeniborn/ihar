@@ -63,8 +63,7 @@ assert_contains "LAN uses app-server listen" "$lan" \
 assert_contains "LAN keeps websocket auth arguments" "$lan" \
   "--ws-auth capability-token --ws-token-file /tmp/token"
 
-# Actual Codex web launch: prove a real managed daemon PID/socket, then refuse
-# credential-capable remote setup until its write topology is independently proven.
+# Actual Codex web launch: prove one live daemon and one namespace-confined remote TUI.
 FAKE="$IHAR_TEST_TMP/fake-codex"
 LOG="$IHAR_TEST_TMP/codex.calls"
 cat > "$FAKE" <<'EOF'
@@ -97,6 +96,13 @@ elif sys.argv[1:] == ["app-server", "daemon", "version"]:
     else:
         print(json.dumps({"status": "absent"}))
         sys.exit(1)
+elif len(sys.argv) == 3 and sys.argv[1] == "--remote":
+    client = socket.socket(socket.AF_UNIX)
+    client.connect(path)
+    state = os.environ["IHAR_REMOTE_CLIENT_STATE"]
+    with open(os.path.join(state, "writable"), "w", encoding="utf-8") as output:
+        output.write("yes")
+    print("namespace-attached")
 elif sys.argv[1:] == ["serve"]:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     listener = socket.socket(socket.AF_UNIX)
@@ -113,17 +119,24 @@ elif sys.argv[1:] == ["serve"]:
         time.sleep(1)
 EOF
 chmod +x "$FAKE"
+mkdir -p "$IHAR_STORE/auth/codex"
+chmod 700 "$IHAR_STORE/auth" "$IHAR_STORE/auth/codex"
+printf 'synthetic-credential' > "$IHAR_STORE/auth/codex/auth.json"
+chmod 600 "$IHAR_STORE/auth/codex/auth.json"
 
 actual_status=0
 actual="$(cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
   IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_LOG="$LOG" "$ROOT/ihar.sh" codex --web 2>&1)" || actual_status=$?
+[[ "$actual_status" == 0 ]] || printf '%s\n' "$actual"
 calls="$(cat "$LOG")"
 assert_contains "Codex web starts the managed daemon" "$calls" \
   "app-server daemon start"
-assert_eq "unproved Codex web attachment fails closed" "3" "$actual_status"
-assert_contains "web refusal names credential-write proof" "$actual" "credential-write topology"
-assert_eq "web does not start another credential writer" "0" \
-  "$(grep -Ec 'enable-remote-control|remote-control pair|--remote unix://' "$LOG")"
+assert_eq "namespace-confined Codex web attachment succeeds" "0" "$actual_status"
+assert_contains "Codex web runs the remote client" "$actual" "namespace-attached"
+assert_eq "web starts exactly one attached client" "1" \
+  "$(grep -Ec '^--remote unix://' "$LOG")"
+assert_eq "web preserves canonical credential bytes" "synthetic-credential" \
+  "$(cat "$IHAR_STORE/auth/codex/auth.json")"
 
 record="$(find "$IHAR_STATE_ROOT" -path '*/daemons/codex.json' -print -quit)"
 assert_exit "the managed daemon is recorded" 0 test -f "$record"
