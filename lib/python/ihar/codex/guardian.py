@@ -116,9 +116,22 @@ def call_owner(store: Path, operation: str, fields: dict,
         return _exchange(channel, selected, operation, fields, descriptors)
 
 
+def _require_attach_platform() -> None:
+    required_os = ("memfd_create", "MFD_CLOEXEC", "MFD_ALLOW_SEALING")
+    required_fcntl = ("F_ADD_SEALS", "F_GET_SEALS", "F_SEAL_SEAL", "F_SEAL_SHRINK",
+                      "F_SEAL_GROW", "F_SEAL_WRITE")
+    if (not sys.platform.startswith("linux")
+        or any(not hasattr(os, name) for name in required_os)
+        or not callable(getattr(os, "memfd_create", None))
+        or any(not hasattr(fcntl, name) for name in required_fcntl)):
+        raise auth_owner.AuthOwnerError(
+            "Codex remote attachment requires Linux sealed memfd support")
+
+
 def attach(store: Path, runtime: str, config_hash: str, argv: list[str],
            stdio_fds: tuple[int, int, int]) -> int:
     """Run one namespace-confined remote client under the original guardian."""
+    _require_attach_platform()
     if (len(stdio_fds) != 3 or any(not isinstance(fd, int) or fd < 0 for fd in stdio_fds)
         or not isinstance(argv, list)):
         raise auth_owner.AuthOwnerError("Codex remote attachment is invalid")
@@ -429,7 +442,7 @@ def _start_attachment(store: Path, fields: dict, stdio_fds: list[int], environme
     cleaned = False
     registered = False
     try:
-        sentinels = remote_sandbox.create_sentinels(runtime, canonical_dir)
+        sentinels = remote_sandbox.create_sentinels(runtime, canonical_dir, state.parent)
         proof_read, proof_write = os.pipe2(os.O_CLOEXEC)
         gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
         command = remote_sandbox.command(store, runtime, state, sentinels,
@@ -449,10 +462,12 @@ def _start_attachment(store: Path, fields: dict, stdio_fds: list[int], environme
         if (not isinstance(proof, dict) or proof.get("ok") is not True
             or proof.get("mutations") != {
                 "write": "refused", "truncate": "refused", "rename": "refused",
-                "unlink": "refused", "symlink_replace": "refused"}
+                "unlink": "refused", "symlink_replace": "refused",
+                "host_write": "refused", "proc_root_write": "inaccessible"}
             or proof.get("capabilities") != {
                 "CapEff": "0000000000000000", "CapPrm": "0000000000000000",
-                "CapBnd": "0000000000000000", "NoNewPrivs": "1"}):
+                "CapBnd": "0000000000000000", "NoNewPrivs": "1"}
+            or proof.get("proc") != "private"):
             raise auth_owner.AuthOwnerError("Codex remote sandbox proof is invalid")
         remote_sandbox.cleanup_sentinels(sentinels)
         cleaned = True
@@ -472,14 +487,18 @@ def _start_attachment(store: Path, fields: dict, stdio_fds: list[int], environme
                 raise auth_owner.AuthOwnerError("Codex remote owner changed during setup")
             identity = dict(auth_owner._identity_for(process.pid, fields["argv"][0]),
                             client_state=str(state), client_state_dev=state_metadata.st_dev,
-                            client_state_ino=state_metadata.st_ino)
+                            client_state_ino=state_metadata.st_ino, descendants=[])
             if identity["pgrp"] != identity["pid"]:
                 raise auth_owner.AuthOwnerError("Codex remote process group is invalid")
             record["children"].append(identity)
             auth_owner._write_owner(owner, record)
+        table = auth_owner._process_table()
+        baseline = {(item["pid"], item["start"]) for item in table.values()
+                    if item["ppid"] == guardian_pid and item["pid"] != process.pid}
         entry = {"process": process, "identity": identity, "status": None, "done": False,
                  "completed_at": None, "client_state": str(state),
-                 "client_state_identity": (state_metadata.st_dev, state_metadata.st_ino)}
+                 "client_state_identity": (state_metadata.st_dev, state_metadata.st_ino),
+                 "guardian_pid": guardian_pid, "baseline_guardian_children": baseline}
         attachments[(identity["pid"], identity["start"])] = entry
         registered = True
         os.write(gate_write, b"1")
@@ -517,8 +536,73 @@ def _start_attachment(store: Path, fields: dict, stdio_fds: list[int], environme
                     shutil.rmtree(state)
 
 
+def _observed_identity(item: dict) -> dict:
+    binary = item.get("exe") or next(iter(item.get("argv", [])), None)
+    if not binary:
+        raise auth_owner.AuthOwnerError("Codex remote descendant identity is opaque")
+    return {"pid": item["pid"], "start": item["start"], "binary": binary,
+            "pgrp": item["pgrp"]}
+
+
+def _refresh_attachment_descendants(store: Path,
+                                    attachments: dict[tuple[int, str], dict]) -> dict[int, dict]:
+    table = auth_owner._process_table()
+    if not attachments:
+        return table
+    with ExitStack() as stack:
+        owner = auth_owner._locked_owner(store, stack)
+        record = auth_owner._read_owner(owner)
+        if record is None or record.get("schema") != 2:
+            raise auth_owner.AuthOwnerError("Codex remote owner changed during supervision")
+        owner_identities = [record.get("guardian"), record.get("child"), record.get("daemon")]
+        owner_identities.extend(record.get("children", []))
+        known_owner = {(item["pid"], item["start"]) for item in owner_identities if item}
+        changed_record = False
+        for entry in attachments.values():
+            if entry["done"]:
+                continue
+            durable = next((item for item in record.get("children", [])
+                            if item.get("pid") == entry["identity"]["pid"]
+                            and item.get("start") == entry["identity"]["start"]), None)
+            if durable is None:
+                raise auth_owner.AuthOwnerError("Codex remote identity changed during supervision")
+            descendants = durable.setdefault("descendants", [])
+            tracked = {(entry["identity"]["pid"], entry["identity"]["start"]),
+                       *((item["pid"], item["start"]) for item in descendants)}
+            tracked_pids = {pid for pid, _start in tracked}
+            discovered: list[dict] = []
+            progress = True
+            while progress:
+                progress = False
+                for item in table.values():
+                    key = (item["pid"], item["start"])
+                    if (item["status"] != "Z" and key not in tracked
+                        and item["ppid"] in tracked_pids):
+                        identity = _observed_identity(item)
+                        discovered.append(identity)
+                        tracked.add(key)
+                        tracked_pids.add(item["pid"])
+                        progress = True
+            for item in table.values():
+                key = (item["pid"], item["start"])
+                if (item["status"] != "Z" and item["ppid"] == entry["guardian_pid"]
+                    and key not in tracked and key not in known_owner
+                    and key not in entry["baseline_guardian_children"]):
+                    identity = _observed_identity(item)
+                    discovered.append(identity)
+                    tracked.add(key)
+            if discovered:
+                descendants.extend(discovered)
+                entry["identity"]["descendants"] = list(descendants)
+                changed_record = True
+        if changed_record:
+            auth_owner._write_owner(owner, record)
+    return table
+
+
 def _poll_attachments(store: Path, attachments: dict[tuple[int, str], dict]) -> None:
     now = time.monotonic()
+    table = _refresh_attachment_descendants(store, attachments)
     for key, entry in list(attachments.items()):
         if entry["done"]:
             if entry["completed_at"] is not None and now - entry["completed_at"] > 60:
@@ -529,7 +613,16 @@ def _poll_attachments(store: Path, attachments: dict[tuple[int, str], dict]) -> 
             if status is None:
                 continue
             entry["status"] = 128 - status if status < 0 else status
-        if auth_owner._group_active(entry["identity"]):
+            # Reaping the attachment root can reparent a setsid child to this
+            # subreaper after the process-table snapshot taken above.
+            table = _refresh_attachment_descendants(store, attachments)
+        tracked = [entry["identity"], *entry["identity"].get("descendants", [])]
+        reused = [identity for identity in tracked
+                  if identity["pid"] in table
+                  and table[identity["pid"]]["start"] != identity["start"]]
+        if reused:
+            raise auth_owner.AuthOwnerError("Codex remote descendant PID was reused")
+        if any(auth_owner._identity_matches(identity, table) for identity in tracked):
             continue
         try:
             _cleanup_client_state(entry)
@@ -748,8 +841,16 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
             if entry["done"]:
                 del attachments[(fields["pid"], fields["start"])]
         elif daemon_action == "attach-signal":
-            os.killpg(attachments[(fields["pid"], fields["start"])]["identity"]["pgrp"],
-                      fields["signal"])
+            entry = attachments[(fields["pid"], fields["start"])]
+            table = auth_owner._process_table()
+            tracked = [entry["identity"], *entry["identity"].get("descendants", [])]
+            groups = {identity["pgrp"] for identity in tracked
+                      if auth_owner._identity_matches(identity, table)}
+            if not groups:
+                raise auth_owner.AuthOwnerError("Codex remote attachment signal is unverified")
+            for group in groups:
+                os.killpg(group, fields["signal"])
+            entry["status"] = 128 + fields["signal"]
         elif auth_action == "stage":
             staged = auth_owner.stage(store)
             existing = (store / "auth" / "codex" / "auth.json").exists()

@@ -72,8 +72,9 @@ import json, os, signal, socket, subprocess, sys, time
 home = os.environ["CODEX_HOME"]
 path = home + "/app-server-control/app-server-control.sock"
 pidfile = home + "/fake-daemon.pid"
-with open(os.environ["IHAR_FAKE_LOG"], "a", encoding="utf-8") as log:
-    log.write(" ".join(sys.argv[1:]) + "\n")
+if not (len(sys.argv) == 3 and sys.argv[1] == "--remote"):
+    with open(os.environ["IHAR_FAKE_LOG"], "a", encoding="utf-8") as log:
+        log.write(" ".join(sys.argv[1:]) + "\n")
 if sys.argv[1:] == ["--version"]:
     print("codex-cli 0.154.0")
 elif sys.argv[1:] == ["app-server", "daemon", "start"]:
@@ -134,7 +135,7 @@ assert_contains "Codex web starts the managed daemon" "$calls" \
 assert_eq "namespace-confined Codex web attachment succeeds" "0" "$actual_status"
 assert_contains "Codex web runs the remote client" "$actual" "namespace-attached"
 assert_eq "web starts exactly one attached client" "1" \
-  "$(grep -Ec '^--remote unix://' "$LOG")"
+  "$(grep -Ec '^namespace-attached$' <<< "$actual")"
 assert_eq "web preserves canonical credential bytes" "synthetic-credential" \
   "$(cat "$IHAR_STORE/auth/codex/auth.json")"
 

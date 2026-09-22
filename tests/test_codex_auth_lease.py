@@ -1343,6 +1343,90 @@ else:
         attached.stdout.close()
         attached.stderr.close()
 
+    def test_remote_attach_waits_for_setsid_descendant_before_cleanup(self) -> None:
+        guardian_process, binary, env = self._start_guarded_review_daemon()
+        (self.store / "auth" / "codex" / "auth.json").write_text(
+            "synthetic-credential", encoding="utf-8")
+        output_path = self.root / "detached-remote.out"
+        from ihar.codex import guardian
+        started = time.monotonic()
+        with output_path.open("wb") as output:
+            with mock.patch.dict(os.environ, dict(env, FAKE_REMOTE_DETACH="1")):
+                status = guardian.attach(
+                    self.store, str(self.runtime_a), "aabbccdd",
+                    [str(binary), "--remote",
+                     f"unix://{self.runtime_a}/app-server-control/app-server-control.sock"],
+                    (0, output.fileno(), output.fileno()))
+        self.assertEqual(status, 19)
+        diagnostic_output = output_path.read_text(errors="replace")
+        descendant_pid = int(diagnostic_output.split("detached-remote-ready:", 1)[1].split()[0])
+        descendant = auth_owner._process_table().get(descendant_pid)
+        recorded = json.loads(self.record.read_text())["children"]
+        self.assertIn("detached-remote-done", diagnostic_output)
+        self.assertIsNone(descendant)
+        self.assertGreaterEqual(time.monotonic() - started, 1.5,
+                                "guardian cleared attachment before setsid descendant exited: "
+                                f"{diagnostic_output}; observed={descendant}; recorded={recorded}")
+        self.assertEqual(json.loads(self.record.read_text())["children"], [])
+        self.assertIsNone(guardian_process.poll())
+
+    def test_remote_attach_forwards_signal_to_tracked_setsid_descendant(self) -> None:
+        guardian_process, binary, env = self._start_guarded_review_daemon()
+        (self.store / "auth" / "codex" / "auth.json").write_text(
+            "synthetic-credential", encoding="utf-8")
+        command = [sys.executable, "-m", "ihar.codex.guardian", "attach",
+                   str(self.store), str(self.runtime_a), "aabbccdd", "--", str(binary),
+                   "--remote", f"unix://{self.runtime_a}/app-server-control/app-server-control.sock"]
+        attached = subprocess.Popen(
+            command, env=dict(env, FAKE_REMOTE_DETACH="hold"), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        def cleanup_attached() -> None:
+            if attached.poll() is None:
+                attached.kill()
+            attached.wait(timeout=5)
+            attached.stdout.close()
+            attached.stderr.close()
+        self.addCleanup(cleanup_attached)
+        line = attached.stdout.readline().strip()
+        self.assertRegex(line, r"^detached-remote-ready:[1-9][0-9]*$")
+        descendant_pid = int(line.partition(":")[2])
+        def cleanup_descendant() -> None:
+            try:
+                os.killpg(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.addCleanup(cleanup_descendant)
+        attached.send_signal(signal.SIGTERM)
+        self.assertEqual(attached.wait(timeout=5), 128 + signal.SIGTERM)
+        self.assertNotIn(descendant_pid, auth_owner._process_table())
+        self.assertEqual(json.loads(self.record.read_text())["children"], [])
+        self.assertIsNone(guardian_process.poll())
+        attached.stdout.close()
+        attached.stderr.close()
+
+    def test_remote_attach_missing_memfd_support_fails_closed(self) -> None:
+        from ihar.codex import guardian
+        with mock.patch.object(guardian.os, "memfd_create", None):
+            with self.assertRaisesRegex(auth_owner.AuthOwnerError,
+                                        "Linux sealed memfd support"):
+                guardian.attach(self.store, str(self.runtime_a), "aabbccdd",
+                                ["/bin/false", "--remote", "unix:///absent"], (0, 1, 2))
+
+    def test_remote_attach_cli_missing_memfd_support_exits_three_without_traceback(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = ("import os, runpy, sys; os.memfd_create = None; "
+                  f"sys.argv = ['guardian', 'attach', {str(self.store)!r}, "
+                  f"{str(self.runtime_a)!r}, 'aabbccdd', '--', '/bin/false', "
+                  "'--remote', 'unix:///absent']; "
+                  "runpy.run_module('ihar.codex.guardian', run_name='__main__')")
+        answer = subprocess.run(
+            [sys.executable, "-c", script],
+            env=dict(os.environ, PYTHONPATH=str(root / "lib" / "python")),
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(answer.returncode, 3, answer.stderr)
+        self.assertIn("Linux sealed memfd support", answer.stderr)
+        self.assertNotIn("Traceback", answer.stderr)
+
     def test_guardian_crash_retains_remote_identity_and_blocking_owner(self) -> None:
         guardian_process, binary, env = self._start_guarded_review_daemon()
         (self.store / "auth" / "codex" / "auth.json").write_text(
@@ -1399,22 +1483,34 @@ client = socket.socket(socket.AF_UNIX)
 client.connect(os.path.join(runtime, 'app-server-control', 'app-server-control.sock'))
 state = os.environ['IHAR_REMOTE_CLIENT_STATE']
 open(os.path.join(state, 'writable'), 'w').write('yes')
-status = open('/proc/self/status', encoding='utf-8').read().splitlines()
-caps = {line.split(':', 1)[0]: line.split(':', 1)[1].strip()
-        for line in status if line.startswith(('CapEff:', 'CapPrm:', 'CapBnd:', 'NoNewPrivs:'))}
+host_probe = os.environ['IHAR_REMOTE_HOST_PROBE']
+blocked = {}
+for name, path in [('host', host_probe),
+                   ('proc_root', '/proc/%s/root%s' % (os.environ['IHAR_REMOTE_OUTER_PID'],
+                                                      host_probe))]:
+    try:
+        open(path, 'w').write('escaped')
+    except OSError:
+        blocked[name] = True
 json.dump({'runtime_ro': bool(os.statvfs(runtime).f_flag & os.ST_RDONLY),
            'auth_ro': bool(os.statvfs(canonical).f_flag & os.ST_RDONLY),
            'link': os.readlink(os.path.join(runtime, 'auth.json')),
-           'caps': caps}, open(os.environ['IHAR_REMOTE_MARKER'], 'w'))
+           'blocked': blocked,
+           'proc_entries': os.listdir('/proc')}, open(os.environ['IHAR_REMOTE_MARKER'], 'w'))
 """, encoding="utf-8")
         vendor.chmod(0o700)
         link_before = os.lstat(link)
         canonical_before = os.stat(canonical, follow_symlinks=False)
-        sentinels = remote_sandbox.create_sentinels(self.runtime_b, canonical.parent)
+        sentinels = remote_sandbox.create_sentinels(
+            self.runtime_b, canonical.parent, client_state.parent)
         self.addCleanup(remote_sandbox.cleanup_sentinels, sentinels)
+        host_probe = Path(next(item["path"] for item in sentinels if item["role"] == "host"))
+        host_probe_before = host_probe.read_bytes()
         proof_read, proof_write = os.pipe2(os.O_CLOEXEC)
         gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
         environment = dict(os.environ, IHAR_REMOTE_MARKER=str(marker),
+                           IHAR_REMOTE_HOST_PROBE=str(host_probe),
+                           IHAR_REMOTE_OUTER_PID=str(os.getpid()),
                            PYTHONPATH=str(Path(__file__).resolve().parents[1] / "lib" / "python"))
         command = remote_sandbox.command(
             self.store, self.runtime_b, client_state, sentinels,
@@ -1427,7 +1523,13 @@ json.dump({'runtime_ro': bool(os.statvfs(runtime).f_flag & os.ST_RDONLY),
             self.assertTrue(proof["ok"], proof)
             self.assertEqual(proof["mutations"], {
                 "write": "refused", "truncate": "refused", "rename": "refused",
-                "unlink": "refused", "symlink_replace": "refused"})
+                "unlink": "refused", "symlink_replace": "refused",
+                "host_write": "refused", "proc_root_write": "inaccessible"})
+            self.assertEqual(proof["proc"], "private")
+            self.assertEqual(proof["capabilities"], {
+                "CapEff": "0000000000000000", "CapPrm": "0000000000000000",
+                "CapBnd": "0000000000000000", "NoNewPrivs": "1"})
+            self.assertEqual(host_probe.read_bytes(), host_probe_before)
             remote_sandbox.cleanup_sentinels(sentinels)
             os.write(gate_write, b"1")
         finally:
@@ -1438,9 +1540,8 @@ json.dump({'runtime_ro': bool(os.statvfs(runtime).f_flag & os.ST_RDONLY),
         self.assertTrue(observed["runtime_ro"])
         self.assertTrue(observed["auth_ro"])
         self.assertEqual(observed["link"], str(canonical))
-        self.assertEqual(observed["caps"], {
-            "CapEff": "0000000000000000", "CapPrm": "0000000000000000",
-            "CapBnd": "0000000000000000", "NoNewPrivs": "1"})
+        self.assertEqual(observed["blocked"], {"host": True, "proc_root": True})
+        self.assertEqual(observed["proc_entries"], [])
         self.assertEqual(canonical.read_text(), "synthetic-credential")
         link_after = os.lstat(link)
         canonical_after = os.stat(canonical, follow_symlinks=False)
@@ -1459,7 +1560,8 @@ json.dump({'runtime_ro': bool(os.statvfs(runtime).f_flag & os.ST_RDONLY),
         state = Path(tempfile.mkdtemp(prefix="ihar-remote-failure-"))
         self.addCleanup(shutil.rmtree, state, True)
         marker = state / "vendor-started"
-        sentinels = remote_sandbox.create_sentinels(self.runtime_b, canonical.parent)
+        sentinels = remote_sandbox.create_sentinels(
+            self.runtime_b, canonical.parent, state.parent)
         self.addCleanup(remote_sandbox.cleanup_sentinels, sentinels)
         proof_read, proof_write = os.pipe2(os.O_CLOEXEC)
         gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
@@ -1631,7 +1733,11 @@ elif len(sys.argv) == 3 and sys.argv[1] == '--remote':
     client.connect(sock)
     with open(os.path.join(os.environ['IHAR_REMOTE_CLIENT_STATE'], 'state'), 'w') as output:
         output.write('writable')
-    if os.environ.get('FAKE_REMOTE_HOLD'):
+    if os.environ.get('FAKE_REMOTE_DETACH'):
+        subprocess.Popen([sys.executable, __file__, 'remote-descendant'],
+                         start_new_session=True)
+        sys.exit(19)
+    elif os.environ.get('FAKE_REMOTE_HOLD'):
         print('remote-ready:' + str(os.getpid()), flush=True)
         while True: time.sleep(1)
     else:
@@ -1655,6 +1761,13 @@ elif sys.argv[1:] == ['serve']:
     while True: time.sleep(1)
 elif sys.argv[1:] == ['descendant']:
     time.sleep(30)
+elif sys.argv[1:] == ['remote-descendant']:
+    print('detached-remote-ready:' + str(os.getpid()), flush=True)
+    if os.environ.get('FAKE_REMOTE_DETACH') == 'hold':
+        while True: time.sleep(1)
+    else:
+        time.sleep(2)
+        print('detached-remote-done', flush=True)
 """)
         binary.chmod(0o700)
         def cleanup() -> None:
