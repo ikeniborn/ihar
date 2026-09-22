@@ -280,10 +280,28 @@ def _write_owner(owner: int, record: dict) -> None:
     os.fsync(owner)
 
 
+def _write_guest_handoff(path: str | os.PathLike[str], owner_id: str) -> None:
+    """Persist the cleanup ID before publishing a guest owner record."""
+    handoff = Path(os.path.abspath(path))
+    if handoff.name != "guest-owner-id":
+        raise AuthOwnerError("Codex guest owner handoff path is invalid")
+    _guest_directory_identity(handoff.parent)
+    with ExitStack() as stack:
+        directory = _open_store(handoff.parent, stack)
+        descriptor = os.open(handoff.name, _CREATE_FLAGS, 0o600, dir_fd=directory)
+        try:
+            _write_all(descriptor, (owner_id + "\n").encode("ascii"))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(directory)
+
+
 def acquire(runtime: str | os.PathLike[str], mode: str, *,
             store: str | os.PathLike[str] | None = None,
             attached_daemon_id: str | None = None, config_hash: str = "",
-            guardian_pid: int | None = None) -> str:
+            guardian_pid: int | None = None,
+            guest_handoff: str | os.PathLike[str] | None = None) -> str:
     """Admit one writer, or attach only to the exact verified daemon owner."""
     if mode not in ("foreground", "daemon", "attached", "auth", "guest"):
         raise AuthOwnerError("Codex auth lease mode is invalid")
@@ -325,6 +343,8 @@ def acquire(runtime: str | os.PathLike[str], mode: str, *,
             record["guest_baseline"] = _canonical_identity(owner)
             if record["guest_baseline"] is None:
                 raise AuthOwnerError("Codex shared credential is absent")
+            if guest_handoff is not None:
+                _write_guest_handoff(guest_handoff, owner_id)
         _write_owner(owner, record)
         return owner_id
 
@@ -648,10 +668,11 @@ def _main(arguments: list[str]) -> int:
         return _daemon_guardian(arguments[1:])
     if arguments and arguments[0].startswith("guest-"):
         action = arguments[0]
-        if action == "guest-acquire" and len(arguments) == 3:
-            store, runtime = arguments[1:]
+        if action == "guest-acquire" and len(arguments) == 4:
+            store, runtime, handoff = arguments[1:]
             verify_runtime_link(runtime, store)
-            print(acquire(runtime, "guest", store=store, guardian_pid=os.getppid()))
+            acquire(runtime, "guest", store=store, guardian_pid=os.getppid(),
+                    guest_handoff=handoff)
             return 0
         if action == "guest-register" and len(arguments) == 6:
             store, owner_id, bundle, image, seed = arguments[1:]

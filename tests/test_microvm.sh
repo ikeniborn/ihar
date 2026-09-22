@@ -130,18 +130,43 @@ assert_exit "writable Codex auth path is a real file" 1 \
 assert_exit "policy image has no credential copy" 1 test -e "$guest_bundle/store/auth/codex/auth.json"
 guest_policy_image="$session/guest-policy.ext4"
 _ihar_microvm_make_image "$guest_policy_image" "$guest_bundle" 16
-policy_before="$(sha256sum "$guest_policy_image" | cut -d' ' -f1)"
-readonly_attempt="$(debugfs -R "write $guest_auth /runtime/codex/auth.json" "$guest_policy_image" 2>&1)"
-assert_contains "read-only policy image refuses a credential write" \
-  "$readonly_attempt" 'Filesystem opened read/only'
-assert_eq "read-only policy bytes stay unchanged after write refusal" "$policy_before" \
-  "$(sha256sum "$guest_policy_image" | cut -d' ' -f1)"
 assert_eq "state seed holds private credential bytes" "synthetic-guest-seed" \
   "$(cat "$guest_state/.ihar-guest-codex-home/auth.json")"
 assert_eq "state seed credential stays private" "600" \
   "$(stat -c %a "$guest_state/.ihar-guest-codex-home/auth.json")"
 guest_state_image="$session/guest-state.ext4"
 _ihar_microvm_make_image "$guest_state_image" "$guest_state" 16
+mkdir "$session/guest-config"
+guest_config="$(ihar_microvm_write_config "$session/guest-config" tap-ihar-1 172.31.0.2 \
+  "$session/rootfs.ext4" "$guest_policy_image" "$session/workspace.ext4" "$guest_state_image")"
+policy_before="$(sha256sum "$guest_policy_image" | cut -d' ' -f1)"
+drive_attempt="$(python3 - "$guest_config" <<'PY'
+import errno
+import json
+import os
+import sys
+
+drives = {drive['drive_id']: drive for drive in json.load(open(sys.argv[1]))['drives']}
+for name in ('policy', 'state'):
+    drive = drives[name]
+    read_only = drive['is_read_only']
+    fd = os.open(drive['path_on_host'], os.O_RDONLY if read_only else os.O_RDWR)
+    try:
+        try:
+            os.pwrite(fd, b'X', os.fstat(fd).st_size - 1)
+        except OSError as error:
+            result = 'blocked' if error.errno == errno.EBADF else f'error-{error.errno}'
+        else:
+            result = 'written'
+    finally:
+        os.close(fd)
+    print(f'{name}:{"ro" if read_only else "rw"}:{result}')
+PY
+)"
+assert_contains "emitted policy drive blocks fake-VM write" "$drive_attempt" 'policy:ro:blocked'
+assert_contains "emitted state drive permits fake-VM write" "$drive_attempt" 'state:rw:written'
+assert_eq "policy bytes stay unchanged after fake-VM write refusal" "$policy_before" \
+  "$(sha256sum "$guest_policy_image" | cut -d' ' -f1)"
 assert_eq "writable guest drive contains credential" "synthetic-guest-seed" \
   "$(debugfs -R 'cat /.ihar-guest-codex-home/auth.json' "$guest_state_image" 2>/dev/null)"
 assert_exit "prelaunch state image matches the private seed" 0 \
@@ -200,6 +225,50 @@ assert_eq "early failure preserves canonical credential" "synthetic-early-owner"
   "$(cat "$early_store/auth/codex/auth.json")"
 assert_eq "early cleanup releases gateway only once" "x" \
   "$(cat "$IHAR_TEST_TMP/early-release-count")"
+
+handoff_store="$session/handoff-store"
+handoff_runtime="$session/handoff-runtime"
+mkdir -p "$handoff_store/auth/codex" "$handoff_runtime" "$session/handoff-state"
+chmod 700 "$handoff_store/auth" "$handoff_store/auth/codex"
+printf '%s' synthetic-handoff-owner > "$handoff_store/auth/codex/auth.json"
+chmod 600 "$handoff_store/auth/codex/auth.json"
+ln -s "$handoff_store/auth/codex/auth.json" "$handoff_runtime/auth.json"
+handoff_status=0
+(
+  export IHAR_STORE="$handoff_store" IHAR_STATE_ROOT="$session/handoff-state-root"
+  export IHAR_STATE="$session/handoff-state"
+  source "$ROOT/lib/codex/auth.sh"
+  ihar_microvm_preflight() { :; }
+  ihar_codex_guest_owner() {
+    local action="$1"
+    shift
+    if [[ "$action" == acquire ]]; then
+      local cli_output
+      cli_output="$(ihar_python ihar.codex.auth_owner "guest-$action" "$IHAR_STORE" "$@")" || return
+      printf '%s' "$cli_output" > "$IHAR_TEST_TMP/handoff-cli-output"
+      if ihar_python ihar.codex.auth_owner guest-acquire "$IHAR_STORE" "$@" \
+          > "$IHAR_TEST_TMP/handoff-second-stdout" 2> "$IHAR_TEST_TMP/handoff-second-stderr"; then
+        printf '%s' admitted > "$IHAR_TEST_TMP/handoff-second-result"
+      else
+        printf '%s' blocked > "$IHAR_TEST_TMP/handoff-second-result"
+      fi
+      return 77
+    fi
+    ihar_python ihar.codex.auth_owner "guest-$action" "$IHAR_STORE" "$@"
+  }
+  ihar_microvm_launch codex "$handoff_runtime"
+) > "$session/handoff-stdout" 2> "$session/handoff-stderr" || handoff_status=$?
+assert_eq "post-acquire CLI failure exits closed" "3" "$handoff_status"
+assert_eq "competing writer is blocked during failed handoff" "blocked" \
+  "$(cat "$IHAR_TEST_TMP/handoff-second-result")"
+assert_exit "failed handoff releases unregistered guest owner" 1 \
+  test -e "$handoff_store/auth/codex/.owner.json"
+assert_eq "failed handoff preserves canonical credential" "synthetic-handoff-owner" \
+  "$(cat "$handoff_store/auth/codex/auth.json")"
+assert_eq "guest acquire CLI emits no owner ID" "" "$(cat "$IHAR_TEST_TMP/handoff-cli-output")"
+assert_eq "failed handoff does not print owner ID" "" "$(cat "$session/handoff-stdout")"
+assert_exit "failed handoff does not print credential bytes" 1 \
+  grep -q synthetic-handoff-owner "$session/handoff-stdout" "$session/handoff-stderr"
 
 # --- host-side deny-by-default policy -------------------------------------------------
 

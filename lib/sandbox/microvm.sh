@@ -1190,20 +1190,21 @@ ihar_microvm_launch() {
     || ihar_die 3 "microVM session parent is unsafe"
   session="$(mktemp -d "$IHAR_STATE_ROOT/microvm/${IHAR_LAUNCH_ID:-$$}.XXXXXX")" \
     || ihar_die 3 "cannot create microVM session directory"
-  local codex_runtime="$runtime" guest_owner_id old_umask
+  local codex_runtime="$runtime" guest_owner_id="" guest_owner_file="$session/guest-owner-id" old_umask
   [[ "$vendor" == codex ]] || codex_runtime="${IHAR_OTHER_RUNTIME:?Codex guest runtime is absent}"
   old_umask="$(umask)"
   umask 077
-  ihar_codex_guest_owner acquire "$codex_runtime" > "$session/guest-owner-id" \
-    || ihar_die 3 "Codex guest credential owner is unavailable"
-  umask "$old_umask"
-  IFS= read -r guest_owner_id < "$session/guest-owner-id"
   local guest_vm_started=false early_cleanup_done=false
   _ihar_microvm_early_cleanup() {
     [[ "$early_cleanup_done" != true ]] || return 0
     early_cleanup_done=true
     if [[ "$guest_vm_started" != true ]]; then
-      ihar_codex_guest_owner abort "$guest_owner_id" >/dev/null 2>&1 || true
+      if [[ -z "$guest_owner_id" && -f "$guest_owner_file" ]]; then
+        IFS= read -r guest_owner_id < "$guest_owner_file" || true
+      fi
+      if [[ "$guest_owner_id" =~ ^[a-f0-9]{32}$ ]]; then
+        ihar_codex_guest_owner abort "$guest_owner_id" >/dev/null 2>&1 || true
+      fi
     fi
     ihar_microvm_release_slot
     ihar_launch_state_leave
@@ -1211,6 +1212,13 @@ ihar_microvm_launch() {
   }
   trap _ihar_microvm_early_cleanup EXIT
   trap '_ihar_microvm_early_cleanup; exit 130' INT TERM
+  ihar_codex_guest_owner acquire "$codex_runtime" "$guest_owner_file" \
+    || ihar_die 3 "Codex guest credential owner is unavailable"
+  umask "$old_umask"
+  IFS= read -r guest_owner_id < "$guest_owner_file" \
+    || ihar_die 3 "Codex guest credential owner handoff is unavailable"
+  [[ "$guest_owner_id" =~ ^[a-f0-9]{32}$ ]] \
+    || ihar_die 3 "Codex guest credential owner handoff is invalid"
   ihar_microvm_reserve_slot
   tap="$IHAR_MICROVM_TAP"
 
