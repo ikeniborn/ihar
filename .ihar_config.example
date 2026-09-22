@@ -56,9 +56,11 @@
 # IHAR_HANDOFF_HISTORY=summary
 
 # Byte budget for that export. Oldest messages are dropped first and the package
-# records that it was truncated.
+# records that it was truncated. The default is measured, not round: the presidio
+# engine masks transcript-shaped text at roughly 0.015 MiB/s, and spaCy refuses
+# input over 1,000,000 characters outright.
 # accepted: an integer
-# IHAR_HANDOFF_TRANSCRIPT_BYTES=2000000
+# IHAR_HANDOFF_TRANSCRIPT_BYTES=262144
 
 # Conversation language for the agents.
 # accepted: a language name
