@@ -312,6 +312,9 @@ def _prepare_codex_hooks(binary: str, home: str, workdir: str) -> tuple[bool, st
     return code == 0, "Codex did not trust the staged conformance hooks"
 
 
+_LAST_TURN: dict[str, bool] = {}
+
+
 def _vendor_turn(
     vendor: str,
     binary: str,
@@ -332,11 +335,15 @@ def _vendor_turn(
         argv.append(prompt)
     else:
         env["CODEX_HOME"] = home
+        # Measured against the pinned 0.154.0 rather than assumed: `codex exec` has no
+        # `--ask-for-approval`. It answers `error: unexpected argument` and exits 2, so
+        # every case failed on a usage error that looked like a policy failure. The
+        # approval policy is a configuration key, and `-c` is how exec takes one.
         argv = [
             binary, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
-            "--sandbox", "workspace-write", "--ask-for-approval", "never", prompt,
+            "--sandbox", "workspace-write", "-c", 'approval_policy="never"', prompt,
         ]
-    return subprocess.run(
+    result = subprocess.run(
         argv,
         cwd=workdir,
         env=env,
@@ -344,6 +351,16 @@ def _vendor_turn(
         text=True,
         timeout=180,
     )
+    # One bit, not the text: did this binary reject the argv we built? Without it a
+    # harness that passes a flag the pinned vendor removed looks exactly like a policy
+    # that did not hold, which is what happened with `--ask-for-approval`.
+    _LAST_TURN["rejected_argv"] = bool(
+        result.returncode != 0
+        and ("unexpected argument" in (result.stderr or "")
+             or "unrecognized arguments" in (result.stderr or "")
+             or "unknown option" in (result.stderr or ""))
+    )
+    return result
 
 
 def _observed(marker: str) -> bool:
@@ -364,6 +381,46 @@ def _configure_mcp(home: str, vendor: str, marker: str) -> str | None:
         handle.write('command = "python3"\n')
         handle.write(f"args = {json.dumps(['-I', script, marker])}\n")
     return None
+
+
+# A closed vocabulary, because the record must carry no dynamic text: §14's rule keeps
+# vendor and model output out of anything persisted or printed. A word from this set is
+# not dynamic, and it is the difference between "failed" and "failed because the binary
+# rejected our argv" — which is what two sessions of looking at authentication cost.
+REASONS = (
+    "vendor-rejected-argv",
+    "vendor-exited-nonzero",
+    "hook-never-fired",
+    "sentinel-missing",
+    "decision-not-recorded",
+    "timeout",
+    "case-raised",
+    "unclassified",
+)
+
+# Our own sentences, matched to a word. Nothing here reads vendor output; the mapping is
+# over phrases this module itself writes.
+_REASON_PHRASES = (
+    ("exceeded 180 seconds", "timeout"),
+    ("without firing the probe hook", "hook-never-fired"),
+    ("the turn exited", "vendor-exited-nonzero"),
+    ("did not create its sentinel", "sentinel-missing"),
+    ("did not run", "sentinel-missing"),
+    ("did not receive", "sentinel-missing"),
+    ("without recording an explicit deny", "decision-not-recorded"),
+    ("raised", "case-raised"),
+)
+
+
+def _reason_for(status: str, detail: str, rejected_argv: bool = False) -> str:
+    if status != "failed":
+        return ""
+    if rejected_argv:
+        return "vendor-rejected-argv"
+    for phrase, reason in _REASON_PHRASES:
+        if phrase in (detail or ""):
+            return reason
+    return "unclassified"
 
 
 def _run_live_case(vendor, binary, home, workdir, name):
@@ -713,16 +770,26 @@ def run(
             if name in CLAUDE_ONLY_CASES and vendor != "claude":
                 continue
             try:
-                status, _detail = case(vendor, binary, home, workdir)
+                status, detail = case(vendor, binary, home, workdir)
             except Exception:                      # noqa: BLE001
-                status = "failed"
-            record["cases"][name] = {"status": status, "detail": f"{name}: {status}"}
+                status, detail = "failed", "the case raised"
+            entry = {"status": status, "detail": f"{name}: {status}"}
+            reason = _reason_for(status, detail)
+            if reason:
+                entry["reason"] = reason
+            record["cases"][name] = entry
         for name in sorted(LIVE_CASES):
+            rejected = False
             try:
-                status, _detail = _run_live_case(vendor, binary, home, workdir, name)
+                status, detail = _run_live_case(vendor, binary, home, workdir, name)
+                rejected = _LAST_TURN.get("rejected_argv", False)
             except Exception:                      # noqa: BLE001
-                status = "failed"
-            record["cases"][name] = {"status": status, "detail": f"{name}: {status}"}
+                status, detail = "failed", "the case raised"
+            entry = {"status": status, "detail": f"{name}: {status}"}
+            reason = _reason_for(status, detail, rejected)
+            if reason:
+                entry["reason"] = reason
+            record["cases"][name] = entry
     finally:
         shutil.rmtree(home, ignore_errors=True)
         shutil.rmtree(workdir, ignore_errors=True)
@@ -787,7 +854,9 @@ def main(argv: list[str]) -> int:
         print(json.dumps(record, indent=2, sort_keys=True))
     else:
         for name in failed:
-            print(f"failed {name}")
+            # One word from a closed set, never a sentence and never vendor output.
+            reason = record["cases"][name].get("reason")
+            print(f"failed {name}" + (f" ({reason})" if reason else ""))
     return 1 if failed else 0
 
 

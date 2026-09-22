@@ -16,7 +16,7 @@ CLAUDE_BIN="$IHAR_TEST_TMP/claude"
 CODEX_BIN="$IHAR_TEST_TMP/codex"
 RECORD="$IHAR_TEST_TMP/acp-record"
 IHAR_LOCKFILE="$IHAR_TEST_TMP/.ihar-lockfile.json"
-printf '%s\n' '{"schema":1,"claude":{"version":"2.1.274"},"codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"acp":{"claude-agent-acp":"0.79.0","codex-acp":"6ec22f3"}}' > "$IHAR_LOCKFILE"
+printf '%s\n' '{"schema":1,"claude":{"version":"2.1.274"},"codex":{"version":"0.154.0","tarball":"https://example.invalid/codex.tgz","prefix":"package/vendor/x86_64-unknown-linux-musl","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"acp":{"claude-agent-acp":"0.79.0","codex-acp":"6ec22f3"}}' > "$IHAR_LOCKFILE"
 
 for binary in "$CLAUDE_ACP" "$CODEX_ACP" "$CLAUDE_BIN" "$CODEX_BIN"; do
   cp "$ROOT/tests/fakes/record-exec.sh" "$binary"

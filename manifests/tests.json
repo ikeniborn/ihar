@@ -6,6 +6,7 @@
     "tests/test_concurrency.sh",
     "tests/test_config.sh",
     "tests/test_conformance.py",
+    "tests/test_conformance_argv.py",
     "tests/test_console.py",
     "tests/test_console.sh",
     "tests/test_console_acp.py",
