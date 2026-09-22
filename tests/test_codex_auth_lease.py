@@ -1404,6 +1404,52 @@ else:
         attached.stdout.close()
         attached.stderr.close()
 
+    def test_remote_attach_serializes_active_clients_until_exact_quiescence(self) -> None:
+        guardian_process, binary, env = self._start_guarded_review_daemon()
+        (self.store / "auth" / "codex" / "auth.json").write_text(
+            "synthetic-credential", encoding="utf-8")
+        command = [sys.executable, "-m", "ihar.codex.guardian", "attach",
+                   str(self.store), str(self.runtime_a), "aabbccdd", "--", str(binary),
+                   "--remote", f"unix://{self.runtime_a}/app-server-control/app-server-control.sock"]
+        first = subprocess.Popen(
+            command, env=dict(env, FAKE_REMOTE_HOLD="1"), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        def cleanup_first() -> None:
+            if first.poll() is None:
+                first.send_signal(signal.SIGTERM)
+            try:
+                first.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                first.kill()
+                first.wait(timeout=5)
+            first.stdout.close()
+            first.stderr.close()
+        self.addCleanup(cleanup_first)
+        line = first.stdout.readline().strip()
+        self.assertRegex(line, r"^remote-ready:[1-9][0-9]*$")
+        first_pid = int(line.partition(":")[2])
+        before = json.loads(self.record.read_text())
+        self.assertEqual([item["pid"] for item in before["children"]], [first_pid])
+
+        refused = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=5)
+        self.assertEqual(refused.returncode, 3, refused.stderr)
+        self.assertEqual(refused.stdout, "")
+        self.assertIsNone(first.poll(), "refused attachment signalled the active client")
+        self.assertIn(first_pid, auth_owner._process_table())
+        during = json.loads(self.record.read_text())
+        self.assertEqual(during["children"], before["children"])
+
+        first.send_signal(signal.SIGTERM)
+        self.assertEqual(first.wait(timeout=5), 128 + signal.SIGTERM)
+        self.assertEqual(json.loads(self.record.read_text())["children"], [])
+        admitted = subprocess.run(command, env=env, input="after-quiescence",
+                                  capture_output=True, text=True, timeout=5)
+        self.assertEqual(admitted.returncode, 0, admitted.stderr)
+        self.assertEqual(admitted.stdout, "remote:after-quiescence")
+        self.assertEqual(json.loads(self.record.read_text())["children"], [])
+        self.assertIsNone(guardian_process.poll())
+
     def test_remote_attach_missing_memfd_support_fails_closed(self) -> None:
         from ihar.codex import guardian
         with mock.patch.object(guardian.os, "memfd_create", None):

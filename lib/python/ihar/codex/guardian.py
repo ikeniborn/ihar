@@ -785,7 +785,9 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                 argv = fields["argv"]
                 remote_uri = (f"unix://{daemon['socket']}" if isinstance(daemon, dict)
                               and "socket" in daemon else None)
-                if (attachments is None or len(attachments) >= 4 or len(passed_fds) != 4
+                if (attachments is None
+                    or any(not entry["done"] for entry in attachments.values())
+                    or len(passed_fds) != 4
                     or daemon is None or fields["runtime"] != record["runtime"]
                     or fields["config_hash"] != record["config_hash"]
                     or not isinstance(argv, list) or not 3 <= len(argv) <= 64
