@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 19 (ACP chat tab implemented against the measured protocol, gated and labelled) |
+| Status | revision 20 (ACP promotion is an executable gate; the condition is measured, not recalled) |
 | Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -948,6 +948,12 @@ Two client-side decisions are security-relevant. **The console declares no clien
 
 **The gate follows `acp`, not `console`.** A chat tab is offered only where the profile allows ACP, so `protected` and `isolated` refuse it with the reason named in the tab. **The label is not the tab's own words**: it is the three lines `ihar check` already prints — claude-agent-acp #144, codex-acp #310/#477, and the console's own refusal to offer a filesystem or terminal capability — so the terminal and the window say the same thing rather than two wordings that must be reconciled.
 
+**Promotion is measured by a command, not by memory.** `ihar check --acp-promotion` reads `manifests/acp-promotion.json` — the condition as data — and answers per row: `passed`, `failed` or `unmeasured`. The verdict is `promotable` only when every row passed, and `unmeasured` is never treated as a near-pass: an unreachable tracker, an adapter this machine has not installed, a store without vendor credentials, and a probe whose assertion has never been measured against a real adapter each keep the answer at `not promotable`. The command reports and records; it promotes nothing by itself, and the profiles are untouched by it.
+
+The behavioural probe uses the hook the console already ships rather than one written for the measurement: a `session-status` record appearing for the session is settings hooks firing under the adapter, and its absence is exactly the behaviour #144 describes. A probe-only hook would have proved that the probe's own hook fires.
+
+Measured on 2026-09-22 and recorded so the next reader does not repeat it by hand: all three issues are open — claude-agent-acp #144 "Support for hooks", codex-acp #310 "Sandbox and approval policies from config.toml are ignored", codex-acp #477 "Default Agent prompts overwrite configured writable roots and sandbox permissions". The behavioural half was unmeasurable on that machine: no adapter installed, both vendor auth directories empty. The Codex probe stays deliberately unimplemented, because an assertion about what `codex-acp` reports has never been measured and writing one would be a guess in code.
+
 **ACP launcher mode**: `ihar acp <vendor>` execs the pinned adapter with the runtime environment. Every `hooks: enforced` profile refuses it at the profile gate, which is HLD §6.9's rule. Under `standard`, or another profile that explicitly allows ACP, a real ACP launch must then pass the same install-receipt check for the selected native Claude/Codex executable before the adapter starts; the adapter delegates to that binary, so ACP is not a receipt-verification carve-out. Adapter version/digest integrity remains a separate pinned-asset check. `ihar check` states that settings hooks may not fire (claude-agent-acp #144) and that codex-acp overrides sandbox and approval policy (#310, #477). ACP sessions are learned through the vendor listing path, since `session-register.py` may not run.
 
 ## 14. Install, update, verify
@@ -1009,6 +1015,8 @@ With `--migrate-store`, eligible legacy content is copied into that same store s
 | Release lockfile | §14.1 | `.ihar-lockfile.json` |
 | Install receipt | §14.1 | `$IHAR_STORE/install-receipt.json` |
 | Check result | §12.4 | `ihar check --json` |
+| ACP promotion condition | §13.3 | `manifests/acp-promotion.json` |
+| ACP promotion result | §13.3 | `$IHAR_STORE/verification/acp-promotion.json` |
 | Test inventory | §16 | `manifests/tests.json` |
 | Project configuration | §2.6 | `.ihar_config` |
 
@@ -1105,6 +1113,8 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | console | chat tab requested where the profile sets `acp: refuse` | fail-closed per request | 403 |
 | console | agent asks the console for `fs/*` or `terminal/*` | fail-closed per request | JSON-RPC -32601 |
 | console | agent sends an unparseable line | fail-soft, reported in the tab | 0 |
+| promotion | any condition unmet or unmeasured | fail-soft, `not promotable` naming each | 1 |
+| promotion | the condition manifest does not validate | usage | 2 |
 | handoff | transcript render or its masking fails | fail-soft, degrade to `summary` with a warning | 0 |
 
 ## 18. Delivery plan
@@ -1156,7 +1166,7 @@ Revision 12 records only choices supported by the approved artifacts and reviewe
 Revision 13 opened three. The terminal asset pin is now answered and closed: `xterm.js` 5.5.0 is vendored at `console/vendor/xterm.js`, sha256 `1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495`, with its stylesheet at `ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6`; both digests were taken from the installed files and are recorded in the release lockfile, which the broker verifies before serving. Two remain, each owned by the slice that must measure it rather than assume it:
 
 - **Masking throughput on a transcript (S14).** The 2 MB default budget assumes the masking engine finishes a large render in a time a user will wait for. Presidio's rate on this class of input is unmeasured; S14 measures it and either keeps the default, lowers it, or streams the render, and records the number here.
-- **ACP tab promotion (S13).** claude-agent-acp #144 and codex-acp #310/#477 decide whether an ACP tab can ever be offered under an enforced profile. Until a measurement says they are closed, the tab exists only where `acp: allow` already stands.
+- **ACP tab promotion (S13).** claude-agent-acp #144 and codex-acp #310/#477 decide whether an ACP tab can ever be offered under an enforced profile. The question is now asked by `ihar check --acp-promotion` rather than by hand, and on 2026-09-22 it answered `not promotable` with all three issues open and the behavioural half unmeasurable here. Two things must still be produced by a machine that has the adapters and vendor credentials: a passing `claude-hooks-fire` probe, and a measured run of `codex-acp` from which the `codex-config-survives` assertion can finally be written.
 
 ## 21. Disposition of the architecture review
 

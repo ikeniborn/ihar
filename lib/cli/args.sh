@@ -23,6 +23,7 @@ IHAR_FLAG_MASK_LEVEL=""
 IHAR_FLAG_WEB=false
 IHAR_FLAG_PROMPT=""
 IHAR_FLAG_CONFORMANCE=false
+IHAR_FLAG_ACP_PROMOTION=false
 IHAR_FLAG_DIFF=false
 IHAR_FLAG_MIGRATE_STORE=false
 IHAR_FLAG_TO=""
@@ -151,6 +152,11 @@ try: ihar $1 $IHAR_COMMAND ..."
         [[ "$IHAR_COMMAND" == check ]] \
           || ihar_die 2 "--conformance belongs to 'ihar check'"
         IHAR_FLAG_CONFORMANCE=true; shift; continue
+        ;;
+      --acp-promotion)
+        [[ "$IHAR_COMMAND" == check ]] \
+          || ihar_die 2 "--acp-promotion belongs to 'ihar check'"
+        IHAR_FLAG_ACP_PROMOTION=true; shift; continue
         ;;
       --diff)
         [[ "$IHAR_COMMAND" == check ]] \
