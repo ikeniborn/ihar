@@ -36,6 +36,7 @@ class AuthBusy(AuthOwnerError):
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 _CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+_CREATE_RW_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _MARKER = ".ihar-stage"
 _PENDING = ".auth-publish-pending"
 _COMPLETE = ".auth-publish-complete"
@@ -941,7 +942,7 @@ def _rollback(
 
 def publish(
     stage_path: str | os.PathLike[str], store: str | os.PathLike[str], *, approve_existing: bool
-) -> None:
+) -> dict[str, int | str]:
     """Publish a quiescent staged credential, retaining prior bytes for recovery.
 
     Existing credentials need ``approve_existing is True``. A missing staged
@@ -995,7 +996,7 @@ def publish(
                 os.fsync(recovery_root)
 
             temporary = f".auth-publish-{token}"
-            published_fd = os.open(temporary, _CREATE_FLAGS, 0o600, dir_fd=owner)
+            published_fd = os.open(temporary, _CREATE_RW_FLAGS, 0o600, dir_fd=owner)
             stack.callback(os.close, published_fd)
             _copy_file(candidate_fd, published_fd)
             published = os.fstat(published_fd)
@@ -1041,6 +1042,11 @@ def publish(
                 raise AuthOwnerError(
                     "Codex credential published; transaction cleanup needs manual review"
                 ) from error
+            committed_identity = _identity(published_fd)
+            if any(committed_identity[field] != candidate_before[field]
+                   for field in ("size", "sha256")):
+                raise AuthOwnerError("Codex committed credential differs from staged candidate")
+            return committed_identity
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise AuthOwnerError(
             "Codex auth publication topology or durability check failed"
@@ -1058,13 +1064,9 @@ def _guest_file_identity(path: Path) -> dict:
 
 
 def _guest_image_key(path: Path) -> list[int]:
-    _guest_directory_identity(path.parent)
-    descriptor = os.open(path, _FILE_FLAGS)
+    descriptor = open_guarded_guest_image(path)
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_nlink != 1:
-            raise AuthOwnerError("Codex guest state image is unsafe")
-        return [metadata.st_dev, metadata.st_ino]
+        return _guest_image_fd_key(descriptor)
     finally:
         os.close(descriptor)
 
@@ -1072,9 +1074,25 @@ def _guest_image_key(path: Path) -> list[int]:
 def _guest_image_fd_key(descriptor: int) -> list[int]:
     metadata = os.fstat(descriptor)
     if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
-        or metadata.st_nlink != 1):
+        or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600):
         raise AuthOwnerError("Codex guest state image is unsafe")
     return [metadata.st_dev, metadata.st_ino]
+
+
+def open_guarded_guest_image(path: str | os.PathLike[str]) -> int:
+    """Open one private image through its verified owner-only parent directory."""
+    image = Path(os.path.abspath(path))
+    with ExitStack() as stack:
+        parent = _open_store(image.parent, stack)
+        if stat.S_IMODE(os.fstat(parent).st_mode) != 0o700:
+            raise AuthOwnerError("Codex guest bundle must be private")
+        descriptor = os.open(image.name, _FILE_FLAGS, dir_fd=parent)
+        try:
+            _guest_image_fd_key(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
 
 
 def _guest_directory_identity(path: Path) -> list[int]:
@@ -1154,6 +1172,7 @@ def register_guarded_guest_bundle(bundle: str | os.PathLike[str],
     image_path = Path(os.path.abspath(image))
     seed_path = Path(os.path.abspath(seed))
     _guest_directory_identity(seed_path.parent)
+    _guest_directory_identity(image_path.parent)
     if _guest_file_identity(seed_path)["sha256"] != baseline["sha256"]:
         raise AuthOwnerError("Codex guest seed differs from canonical credential")
     record["guest_bundle"] = {
@@ -1238,9 +1257,14 @@ def publish_guarded_guest(bundle: str | os.PathLike[str], store: Path,
     except OSError as error:
         raise AuthOwnerError("guest credential topology is unsafe") from error
     if candidate_identity["sha256"] != baseline["sha256"]:
-        _publish_verified_refresh_locked(candidate, store, baseline, owner, record, image_fd)
+        committed = _publish_verified_refresh_locked(
+            candidate, store, baseline, owner, record, image_fd)
+        if committed["sha256"] != candidate_identity["sha256"]:
+            raise AuthOwnerError("Codex committed credential differs from guest candidate")
+    else:
+        committed = baseline
     guest["candidate"] = candidate_identity
-    guest["published"] = _canonical_identity(owner)
+    guest["published"] = committed
     acknowledgment = secrets.token_hex(32)
     guest["ack_sha256"] = hashlib.sha256(acknowledgment.encode("ascii")).hexdigest()
     guest["state"] = "published-pending"
@@ -1326,7 +1350,7 @@ def vm_is_active_unlocked(guest: dict) -> bool:
 
 def _publish_verified_refresh_locked(candidate: Path, store: Path,
                                      expected_baseline: dict, owner: int, record: dict,
-                                     image_fd: int | None = None) -> None:
+                                     image_fd: int | None = None) -> dict[str, int | str]:
     _guest_guardian(record)
     guest = _guest_record(record, image_fd=image_fd)
     guest = _guest_record(record, Path(guest["bundle"]), image_fd)
@@ -1348,7 +1372,10 @@ def _publish_verified_refresh_locked(candidate: Path, store: Path,
         _copy_file(source, target)
         if _identity(source) != candidate_before or _canonical_identity(owner) != expected_baseline:
             raise AuthOwnerError("Codex guest candidate or canonical baseline changed")
-    publish(staged, store, approve_existing=True)
+    committed = publish(staged, store, approve_existing=True)
+    if committed["sha256"] != candidate_before["sha256"]:
+        raise AuthOwnerError("Codex committed credential differs from guest candidate")
+    return committed
 
 
 if __name__ == "__main__":

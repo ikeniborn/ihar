@@ -1249,6 +1249,7 @@ ihar_microvm_launch() {
   local state_mib=$(( $(du -sm "$state_seed" | awk '{print $1}') + 64 ))
   _ihar_microvm_make_image "$state_img" "$state_seed" "$state_mib" \
     || ihar_die 3 "cannot build the writable vendor state image"
+  chmod 600 "$state_img" || ihar_die 3 "cannot protect the writable vendor state image"
   _ihar_microvm_image_auth_matches "$state_img" "$state_seed/.ihar-guest-codex-home/auth.json" \
     "$guest_auth_bundle" || ihar_die 3 "Codex guest credential image differs from private seed"
   ihar_codex_guest_owner register "$guest_auth_bundle" "$state_img" \

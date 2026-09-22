@@ -243,6 +243,9 @@ guardian_call="$(
 assert_eq "guest bundle registration uses the inherited guardian channel" \
   "ihar.codex.guardian guest-register 42 /private/bundle /private/state.ext4 /private/seed.json" \
   "$guardian_call"
+guest_registration_flow="$(sed -n '/_ihar_microvm_make_image "$state_img"/,/guest_bundle_registered=true/p' "$ROOT/lib/sandbox/microvm.sh")"
+assert_contains "registered state image is owner-only" \
+  "$guest_registration_flow" 'chmod 600 "$state_img"'
 guest_return_flow="$(sed -n '/ihar_codex_guest_owner quiescent/,/_ihar_microvm_cleanup/p' "$ROOT/lib/sandbox/microvm.sh")"
 assert_contains "guest extraction stays inside the inherited guardian" \
   "$guest_return_flow" 'ihar_codex_guest_owner extract "$guest_auth_bundle"'

@@ -752,7 +752,7 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                     raise auth_owner.AuthOwnerError("Codex guest bundle paths are invalid")
                 if guest_resources is None or guest_resources.get("image_fd") is not None:
                     raise auth_owner.AuthOwnerError("Codex guest image owner is invalid")
-                image_fd = os.open(fields["image"], auth_owner._FILE_FLAGS)
+                image_fd = auth_owner.open_guarded_guest_image(fields["image"])
                 try:
                     auth_owner.register_guarded_guest_bundle(
                         fields["bundle"], fields["image"], fields["seed"], owner, record,

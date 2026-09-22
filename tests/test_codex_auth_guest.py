@@ -138,6 +138,7 @@ class GuestAuthTests(unittest.TestCase):
         self.bundle.mkdir(mode=0o700)
         self.image = self.bundle / "state.ext4"
         self.image.write_bytes(b"synthetic-image")
+        self.image.chmod(0o600)
         self.guest_candidate = self.bundle / "auth.json"
         self.guest_candidate.write_text("synthetic-old", encoding="utf-8")
         self.guest_candidate.chmod(0o600)
@@ -150,6 +151,23 @@ class GuestAuthTests(unittest.TestCase):
         process.terminate()
         process.wait()
         mark_guest_quiescent(self.owner_id, store=self.store)
+
+    def registration_fixture(self, name: str) -> tuple[Path, Path, Path, Path]:
+        root = self.root / name
+        store = root / "store"
+        store.mkdir(parents=True, mode=0o700)
+        canonical = store / "auth" / "codex" / "auth.json"
+        canonical.parent.mkdir(parents=True, mode=0o700)
+        canonical.parent.parent.chmod(0o700)
+        canonical.write_text("synthetic-registration", encoding="utf-8")
+        canonical.chmod(0o600)
+        acquire(root / "runtime", "guest", store=store)
+        bundle = root / "bundle"
+        bundle.mkdir(mode=0o700)
+        seed = bundle / "seed.json"
+        seed.write_text("synthetic-registration", encoding="utf-8")
+        seed.chmod(0o600)
+        return root, store, bundle, seed
 
     def test_process_disappearing_during_status_read_is_not_ambiguity(self) -> None:
         class VanishingProcess:
@@ -238,6 +256,68 @@ class GuestAuthTests(unittest.TestCase):
             acknowledge_guest(self.bundle, self.store, acknowledgment)
         with self.assertRaises(AuthOwnerError):
             release(self.owner_id, store=self.store)
+
+    def test_publish_identity_cannot_bless_replacement_in_snapshot_gap(self) -> None:
+        self.guest_candidate.write_text("synthetic-refresh", encoding="utf-8")
+        self.quiesce()
+        real_publish = auth_owner._publish_verified_refresh_locked
+
+        def replace_after_commit(*arguments, **keywords):
+            committed = real_publish(*arguments, **keywords)
+            replacement = self.canonical.parent / ".foreign"
+            replacement.write_text("synthetic-foreign", encoding="utf-8")
+            replacement.chmod(0o600)
+            os.replace(replacement, self.canonical)
+            return committed
+
+        with mock.patch.object(
+                auth_owner, "_publish_verified_refresh_locked",
+                side_effect=replace_after_commit):
+            acknowledgment = publish_guest(
+                self.bundle, self.original_baseline, self.store, self.owner_id)
+        with self.assertRaisesRegex(AuthOwnerError, "publication changed"):
+            acknowledge_guest(self.bundle, self.store, acknowledgment)
+        self.assertEqual(self.canonical.read_text(encoding="utf-8"), "synthetic-foreign")
+        self.assertEqual(self.guest_candidate.read_text(encoding="utf-8"), "synthetic-refresh")
+        recovered = list((self.canonical.parent / "recovery").glob("*/auth.json"))
+        self.assertEqual([path.read_text(encoding="utf-8") for path in recovered],
+                         ["synthetic-old"])
+        record = json.loads(
+            (self.canonical.parent / ".owner.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["guest_bundle"]["state"], "published-pending")
+        self.assertFalse(record["guest_reconciled"])
+        with self.assertRaises(AuthOwnerError):
+            release(self.owner_id, store=self.store)
+
+    def test_fd_registration_rejects_public_image_parent(self) -> None:
+        root, store, bundle, seed = self.registration_fixture("public-image-parent")
+        public = root / "public"
+        public.mkdir(mode=0o755)
+        image = public / "state.ext4"
+        image.write_bytes(b"synthetic-image")
+        image.chmod(0o600)
+        with ExitStack() as stack:
+            owner = auth_owner._locked_owner(store, stack)
+            record = auth_owner._read_owner(owner)
+            image_fd = os.open(image, auth_owner._FILE_FLAGS)
+            stack.callback(os.close, image_fd)
+            with self.assertRaisesRegex(AuthOwnerError, "bundle must be private"):
+                auth_owner.register_guarded_guest_bundle(
+                    bundle, image, seed, owner, record, image_fd)
+
+    def test_fd_registration_rejects_permissive_image_file(self) -> None:
+        _root, store, bundle, seed = self.registration_fixture("permissive-image")
+        image = bundle / "state.ext4"
+        image.write_bytes(b"synthetic-image")
+        image.chmod(0o644)
+        with ExitStack() as stack:
+            owner = auth_owner._locked_owner(store, stack)
+            record = auth_owner._read_owner(owner)
+            image_fd = os.open(image, auth_owner._FILE_FLAGS)
+            stack.callback(os.close, image_fd)
+            with self.assertRaisesRegex(AuthOwnerError, "state image is unsafe"):
+                auth_owner.register_guarded_guest_bundle(
+                    bundle, image, seed, owner, record, image_fd)
 
     def test_world_readable_guest_candidate_is_rejected(self) -> None:
         self.guest_candidate.chmod(0o644)
@@ -433,6 +513,7 @@ class GuestAuthTests(unittest.TestCase):
         bundle.mkdir(mode=0o700)
         image = bundle / "state.ext4"
         image.write_bytes(b"synthetic-channel-image")
+        image.chmod(0o600)
         seed = bundle / "seed.json"
         seed.write_text("synthetic-channel-old", encoding="utf-8")
         seed.chmod(0o600)
@@ -484,6 +565,7 @@ guardian.request(fd, 'guest-ack', {{'bundle': {str(bundle)!r}, 'ack': published[
         bundle.mkdir(mode=0o700)
         image = bundle / "state.ext4"
         image.write_bytes(b"synthetic-lost-image")
+        image.chmod(0o600)
         seed = bundle / "seed.json"
         seed.write_text("synthetic-lost-old", encoding="utf-8")
         seed.chmod(0o600)
@@ -555,6 +637,7 @@ else: raise SystemExit(4)
             (source / "auth.json").write_text(value, encoding="utf-8")
             subprocess.run(["truncate", "-s", "16M", path], check=True)
             subprocess.run(["mkfs.ext4", "-q", "-d", source.parent, path], check=True)
+            path.chmod(0o600)
         image = bundle / "state.ext4"
         substitute = bundle / "substitute.ext4"
         make_image(image, "synthetic-registered-refresh")
@@ -624,6 +707,7 @@ guardian.request(fd, 'guest-ack', {{'bundle': {str(bundle)!r}, 'ack': published[
         bundle.mkdir(mode=0o700)
         image = bundle / "state.ext4"
         image.write_bytes(b"synthetic-drift-image")
+        image.chmod(0o600)
         seed = bundle / "seed.json"
         seed.write_text("synthetic-drift-old", encoding="utf-8")
         seed.chmod(0o600)
