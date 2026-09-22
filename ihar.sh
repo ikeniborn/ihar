@@ -59,6 +59,19 @@ ihar_main() {
 
   ihar_args_parse "$@"
   ihar_guard_undelivered
+  case "$IHAR_COMMAND:${IHAR_SUBCOMMAND:-}" in
+    codex:*|acp:codex|web:codex)
+      [[ -z "${IHAR_CODEX_GUARD_FD:-}" ]] \
+        || ihar_die 3 "Codex guardian admission cannot be verified"
+      if [[ -n "${IHAR_GUARD_FD:-}" ]]; then
+        ihar_python ihar.codex.guardian admit "$IHAR_GUARD_FD" \
+          || ihar_die 3 "Codex guardian admission cannot be verified"
+      else
+        ihar_python ihar.codex.guardian "$IHAR_STORE" -- "$(readlink -f "$_IHAR_ENTRY")" "$@"
+        return $?
+      fi
+      ;;
+  esac
   case "$IHAR_COMMAND" in
     help)         ihar_usage ;;
     claude|codex) ihar_cmd_launch "$IHAR_COMMAND" ;;

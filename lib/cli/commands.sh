@@ -107,6 +107,10 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
   if [[ "${IHAR_PROFILE_HOOKS:-best-effort}" == "enforced" ]]; then mode=immutable; fi
   ihar_runtime_materialise "$vendor" "$hash" "$render" "$mode" >/dev/null
   runtime="$IHAR_RUNTIME"
+  if [[ "$vendor" == codex ]]; then
+    ihar_python ihar.codex.guardian bind-runtime "$IHAR_GUARD_FD" "$runtime" "$hash" \
+      || ihar_die 3 "Codex runtime guardian binding failed"
+  fi
 
   if [[ "$IHAR_PROFILE_SANDBOX" == microvm ]]; then
     local other_vendor=claude other_render other_hash other_runtime other_mcp_identity
@@ -183,15 +187,9 @@ run 'ihar install'"
     return 0
   fi
 
-  local codex_auth_store="$IHAR_STORE" codex_auth_root="$IHAR_ROOT"
-
   if [[ "${IHAR_ACP_MODE:-false}" == true ]]; then
     ihar_env_apply
-    if [[ "$vendor" == codex ]]; then
-      ihar_codex_auth_run "$codex_auth_store" "$codex_auth_root" \
-        "$runtime" "$hash" foreground "${IHAR_ARGV[@]}"
-      return $?
-    fi
+    if [[ "$vendor" == codex ]]; then ihar_codex_guard_drop; fi
     if (( ${#IHAR_ENV[@]} )); then
       exec env -i "${IHAR_ENV[@]}" "${IHAR_ARGV[@]}"
     fi
@@ -210,13 +208,7 @@ run 'ihar install'"
   fi
 
   ihar_env_apply
-  if [[ "$vendor" == codex ]]; then
-    local owner_mode=foreground
-    [[ "$IHAR_FLAG_WEB" == true ]] && owner_mode=attached
-    ihar_codex_auth_run "$codex_auth_store" "$codex_auth_root" \
-      "$runtime" "$hash" "$owner_mode" "${IHAR_ARGV[@]}"
-    return $?
-  fi
+  if [[ "$vendor" == codex ]]; then ihar_codex_guard_drop; fi
   if (( ${#IHAR_ENV[@]} )); then
     exec env -i "${IHAR_ENV[@]}" "${IHAR_ARGV[@]}"
   fi

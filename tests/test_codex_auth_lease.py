@@ -6,6 +6,7 @@ from __future__ import annotations
 import array
 import json
 import os
+import shutil
 import signal
 import socket as socket_module
 import subprocess
@@ -65,6 +66,93 @@ class AuthLeaseTests(unittest.TestCase):
                 return
             time.sleep(.02)
         self.fail(f"timed out waiting for {path.name}")
+
+    def _run_ihar(self, *arguments: str, guard_fd: str | None = None,
+                  legacy_guard_fd: str | None = None,
+                  binary_source: str | None = None) -> subprocess.CompletedProcess:
+        root = Path(__file__).resolve().parents[1]
+        project = self.root / "project"
+        project.mkdir(exist_ok=True)
+        binary = self.root / "codex"
+        marker = self.root / "app-server-started"
+        binary.write_text(binary_source or
+                          ("#!/bin/sh\n"
+                           f"case \"$1\" in app-server) touch {str(marker)!r} ;; esac\n"
+                           "case \"$1\" in --version) echo 'codex-cli 0.154.0' ;; esac\n"))
+        binary.chmod(0o700)
+        for name in ("hooks", "manifests", "skills"):
+            target = self.store / name
+            if not target.exists():
+                shutil.copytree(root / name, target)
+        environment = dict(os.environ, IHAR_STORE=str(self.store),
+                           IHAR_STATE_ROOT=str(self.root / "state"), IHAR_PY=sys.executable,
+                           IHAR_CODEX_BIN=str(binary), IHAR_LOCKFILE=str(root / ".ihar-lockfile.json"))
+        if guard_fd is not None:
+            environment["IHAR_GUARD_FD"] = guard_fd
+        if legacy_guard_fd is not None:
+            environment["IHAR_CODEX_GUARD_FD"] = legacy_guard_fd
+        return subprocess.run([str(root / "ihar.sh"), *arguments], cwd=project,
+                              env=environment, capture_output=True, text=True, timeout=15)
+
+    def test_busy_owner_blocks_preflight_for_codex_entrypoints(self) -> None:
+        first = self._guardian("import time; time.sleep(5)")
+        self._wait_for(self.record)
+        for arguments in (("--dry-run", "codex"), ("codex", "--", "mcp", "list"),
+                          ("acp", "codex"), ("codex", "--", "login", "status")):
+            with self.subTest(arguments=arguments):
+                marker = self.root / "app-server-started"
+                marker.unlink(missing_ok=True)
+                result = self._run_ihar(*arguments)
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertFalse(marker.exists(), result.stderr)
+        first.wait(timeout=8)
+
+    def test_spoofed_guard_descriptor_fails_before_codex_start(self) -> None:
+        result = self._run_ihar("--dry-run", "codex", guard_fd="3")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertFalse((self.root / "app-server-started").exists(), result.stderr)
+
+    def test_copied_legacy_guard_marker_cannot_skip_admission(self) -> None:
+        result = self._run_ihar("--dry-run", "codex", legacy_guard_fd="3")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertFalse((self.root / "app-server-started").exists(), result.stderr)
+
+    def test_guarded_login_status_reads_private_stage_without_reacquiring(self) -> None:
+        auth_owner.stage(self.store)
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.write_text("synthetic-credential")
+        observed = self.root / "login-status-observed"
+        source = ("#!/bin/sh\n"
+                  f"case \"$1 $2\" in 'login status') printf '%s\\n' \"$CODEX_HOME\" > {str(observed)!r} ;; esac\n")
+        result = self._run_ihar("codex", "--", "login", "status", binary_source=source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("/auth/codex/staging/", observed.read_text())
+        self.assertEqual(canonical.read_text(), "synthetic-credential")
+        self.assertFalse(self.record.exists())
+
+    def test_guarded_direct_cli_uses_preflight_owner_until_vendor_exit(self) -> None:
+        observed = self.root / "direct-cli-observed"
+        source = ("#!/bin/sh\n"
+                  f"case \"$1\" in mcp) cp {str(self.record)!r} {str(observed)!r} ;; esac\n")
+        result = self._run_ihar("codex", "--", "mcp", "list", binary_source=source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(observed.read_text())["schema"], 2)
+        self.assertFalse(self.record.exists())
+
+    def test_guarded_cli_preserves_vendor_status_without_leaking_control_fd(self) -> None:
+        source = ("#!/bin/sh\n"
+                  "case \"$1\" in mcp) test -z \"${IHAR_GUARD_FD:-}\" || exit 88; exit 17 ;; esac\n")
+        result = self._run_ihar("codex", "--", "mcp", "list", binary_source=source)
+        self.assertEqual(result.returncode, 17, result.stderr)
+        self.assertFalse(self.record.exists())
+
+    def test_only_exact_login_status_uses_private_auth_stage(self) -> None:
+        observed = self.root / "non-auth-home"
+        source = ("#!/bin/sh\n"
+                  f"case \"$1\" in 'login status') printf '%s\\n' \"$CODEX_HOME\" > {str(observed)!r} ;; esac\n")
+        result = self._run_ihar("codex", "--", "login status", binary_source=source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("/auth/codex/staging/", observed.read_text())
 
     def test_guardian_records_pending_before_child_exec_and_blocks_competitor(self) -> None:
         observed = self.root / "observed.json"
