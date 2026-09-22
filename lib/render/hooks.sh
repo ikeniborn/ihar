@@ -64,6 +64,14 @@ ihar_registry_digest() {
   sha256sum "$registry" | cut -c1-16
 }
 
+# ihar_effective_mcp_identity <vendor> — secret-free identity of the selected render.
+# Compute it before selecting a runtime path; the renderer does not expand that path.
+ihar_effective_mcp_identity() {
+  local vendor="$1" registry="$IHAR_ROOT/manifests/mcp/registry.json"
+  ihar_python ihar.render.mcp "$vendor" "$IHAR_PROFILE" "$registry" --identity \
+    || ihar_die 3 "cannot identify the effective MCP render for $vendor"
+}
+
 # ihar_render_mcp <vendor> <render-dir> — the MCP servers this profile offers.
 ihar_render_mcp() {
   local vendor="$1" render="$2"

@@ -19,22 +19,26 @@ ihar_check_conformance_status() { # <vendor> <binary>
 }
 
 _ihar_check_config_hash() { # <vendor>
-  local vendor="$1"
+  local vendor="$1" mcp_identity
+  mcp_identity="$(ihar_effective_mcp_identity "$vendor")" || return
   ihar_config_hash \
     "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
     "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
-    "$(ihar_manifest_digest)" "$(ihar_registry_digest)" "$(ihar_vendor_version "$vendor")"
+    "$(ihar_manifest_digest)" "$(ihar_registry_digest)" "$(ihar_vendor_version "$vendor")" \
+    "$mcp_identity"
 }
 
 _ihar_check_runtime() { # <vendor> [state]
-  local vendor="$1" state="${2:-$(_ihar_project_state)}"
-  printf '%s/r/%s/%s\n' "$state" "$(_ihar_check_config_hash "$vendor")" "$vendor"
+  local vendor="$1" state="${2:-$(_ihar_project_state)}" hash
+  hash="$(_ihar_check_config_hash "$vendor")" || return
+  printf '%s/r/%s/%s\n' "$state" "$hash" "$vendor"
 }
 
 # ihar_check_collect <target-json> — gather every fact exactly once.
 ihar_check_collect() {
-  local target="$1" vendor binary capabilities notes
+  local target="$1" vendor binary capabilities notes runtime
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
+  IHAR_STATE="$(_ihar_project_state)"; export IHAR_STATE
   ihar_env_prepare claude
 
   _IHAR_CHECK_MASK_ENGINE="$(ihar_python ihar.mask.describe "$IHAR_GATEWAY_MASKING_LEVEL" 2>/dev/null || echo unknown)"
@@ -56,7 +60,8 @@ ihar_check_collect() {
       "$(ihar_check_receipt_status "$vendor" "$binary")"
     printf -v "_IHAR_CHECK_${vendor^^}_CONFORMANCE" '%s' \
       "$(ihar_check_conformance_status "$vendor" "$binary")"
-    printf -v "_IHAR_CHECK_${vendor^^}_RUNTIME" '%s' "$(_ihar_check_runtime "$vendor")"
+    runtime="$(_ihar_check_runtime "$vendor")" || return
+    printf -v "_IHAR_CHECK_${vendor^^}_RUNTIME" '%s' "$runtime"
     printf -v "_IHAR_CHECK_${vendor^^}_BINARY" '%s' "$binary"
     printf -v "_IHAR_CHECK_MCP_${vendor^^}" '%s' "$notes"
   done
@@ -110,7 +115,7 @@ ihar_check_diff() (
   for vendor in claude codex; do
     desired="$temp/$vendor"
     ihar_render_all "$vendor" "$desired"
-    active="$(_ihar_check_runtime "$vendor" "$state")"
+    active="$(_ihar_check_runtime "$vendor" "$state")" || return
     while IFS= read -r -d '' file; do
       relative="${file#"$desired"/}"
       if [[ -z "$active" || ! -f "$active/$relative" ]]; then

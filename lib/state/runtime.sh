@@ -34,12 +34,12 @@ ihar_upgrade_runtime_state() {
 }
 
 # ihar_config_hash <profile> <masking> <gateway> <sandbox> <mcp-strict>
-#                  <hooks-digest> <registry-digest> <vendor-version>
-# The eight explicit inputs plus validated persistent-state and tracked-asset
+#                  <hooks-digest> <registry-digest> <vendor-version> <mcp-identity>
+# The nine explicit inputs plus validated persistent-state and tracked-asset
 # identities decide how the vendor behaves. Folding both link inventories into the
 # generation prevents a runtime built for older topology from being reused.
 ihar_config_hash() {
-  (( $# == 8 )) || ihar_die 2 "ihar_config_hash: expected 8 inputs, got $#"
+  (( $# == 9 )) || ihar_die 2 "ihar_config_hash: expected 9 inputs, got $#"
   local state_manifest_digest asset_manifest_identity
   state_manifest_digest="$(ihar_state_manifest_digest)" \
     || ihar_die 3 "cannot digest persistent-state manifest"

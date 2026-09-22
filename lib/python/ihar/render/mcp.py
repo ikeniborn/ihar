@@ -9,11 +9,12 @@ the vendor reads it from the process environment; `headers` may reference one, a
 `bearer_token_env_var` is how Codex spells the same thing.
 
 Usage:
-    python3 -m ihar.render.mcp <vendor> <profile> <registry> [--report]
+    python3 -m ihar.render.mcp <vendor> <profile> <registry> [--report|--identity]
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -149,15 +150,29 @@ def render_codex(registry, profile, environment):
     return text, notes
 
 
+def effective_identity(registry, profile, environment, vendor):
+    rendered, _ = (
+        render_claude(registry, profile, environment)
+        if vendor == "claude"
+        else render_codex(registry, profile, environment)
+    )
+    body = json.dumps(rendered, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 3:
         print(__doc__, file=sys.stderr)
         return 2
     vendor, profile, registry_path = argv[:3]
     report = "--report" in argv
+    identity = "--identity" in argv
 
     try:
         registry = jsonio.read("mcp-registry", registry_path)
+        if identity:
+            print(effective_identity(registry, profile, os.environ, vendor))
+            return 0
         if vendor == "claude":
             rendered, notes = render_claude(registry, profile, os.environ)
             body = json.dumps(rendered, indent=2, sort_keys=True)

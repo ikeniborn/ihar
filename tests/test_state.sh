@@ -12,6 +12,8 @@ source "$ROOT/lib/store/assets.sh"
 source "$ROOT/lib/state/state.sh"
 source "$ROOT/lib/state/links.sh"
 source "$ROOT/lib/state/runtime.sh"
+source "$ROOT/lib/render/hooks.sh"
+IHAR_CODEX_BIN="$IHAR_TEST_TMP/missing-codex"
 source "$ROOT/lib/state/migrate.sh"
 source "$ROOT/lib/state/gc.sh"
 
@@ -109,17 +111,37 @@ assert_eq "the upgraded marker is schema 3" "3" \
 
 # --- configuration hash ------------------------------------------------------------
 
-h1="$(ihar_config_hash protected standard explicit vendor true aaa bbb 2.1.274)"
-h2="$(ihar_config_hash protected standard explicit vendor true aaa bbb 2.1.274)"
+h1="$(ihar_config_hash protected standard explicit vendor true aaa bbb 2.1.274 mcp)"
+h2="$(ihar_config_hash protected standard explicit vendor true aaa bbb 2.1.274 mcp)"
 assert_eq "the hash is deterministic" "$h1" "$h2"
 assert_eq "the hash is eight characters" "8" "$(printf '%s' "$h1" | wc -c | awk '{print $1-0}')"
 
-h3="$(ihar_config_hash standard off off vendor-default false aaa bbb 2.1.274)"
+h3="$(ihar_config_hash standard off off vendor-default false aaa bbb 2.1.274 mcp)"
 assert_exit "a different profile yields a different hash" 1 test "$h1" = "$h3"
-h4="$(ihar_config_hash protected secrets explicit vendor true aaa bbb 2.1.274)"
+h4="$(ihar_config_hash protected secrets explicit vendor true aaa bbb 2.1.274 mcp)"
 assert_exit "a different masking level yields a different hash" 1 test "$h1" = "$h4"
-h5="$(ihar_config_hash protected standard explicit vendor true aaa bbb 2.1.999)"
+h5="$(ihar_config_hash protected standard explicit vendor true aaa bbb 2.1.999 mcp)"
 assert_exit "a different vendor version yields a different hash" 1 test "$h1" = "$h5"
+
+# The registry bytes stay fixed while requires_env changes the selected server set.
+IHAR_PROFILE=standard
+export IHAR_PROFILE
+unset IWIKI_REMOTE_TOKEN
+for vendor in claude codex; do
+  absent_identity="$(IHAR_IWIKI_REMOTE_URL=https://wiki.example/mcp \
+    ihar_effective_mcp_identity "$vendor")"
+  present_identity="$(IHAR_IWIKI_REMOTE_URL=https://wiki.example/mcp \
+    IWIKI_REMOTE_TOKEN=synthetic ihar_effective_mcp_identity "$vendor")"
+  changed_value_identity="$(IHAR_IWIKI_REMOTE_URL=https://wiki.example/mcp \
+    IWIKI_REMOTE_TOKEN=other-synthetic ihar_effective_mcp_identity "$vendor")"
+  absent_hash="$(ihar_config_hash standard off off vendor-default false aaa bbb 2.1.274 "$absent_identity")"
+  present_hash="$(ihar_config_hash standard off off vendor-default false aaa bbb 2.1.274 "$present_identity")"
+  changed_value_hash="$(ihar_config_hash standard off off vendor-default false aaa bbb 2.1.274 "$changed_value_identity")"
+  assert_exit "$vendor required environment presence selects a generation" 1 \
+    test "$absent_hash" = "$present_hash"
+  assert_eq "$vendor secret value does not select a generation" \
+    "$present_hash" "$changed_value_hash"
+done
 
 ASSET_HASH_ROOT="$IHAR_TEST_TMP/asset-hash-root"
 ASSET_HASH_STORE="$IHAR_TEST_TMP/asset-hash-store"
@@ -134,7 +156,7 @@ cat > "$ASSET_HASH_ROOT/manifests/assets.json" <<'JSON'
 {"schema":1,"entries":[{"vendor":"common","source":"optional/tools","target":"tools","kind":"directory","required":false,"runtime":true}]}
 JSON
 asset_hash_missing="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
-  ihar_config_hash asset identity optional source a b c d)"
+  ihar_config_hash asset identity optional source a b c d mcp)"
 asset_runtime_missing="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
   IHAR_STATE="$ASSET_HASH_STATE" ihar_runtime_materialise claude "$asset_hash_missing")"
 assert_exit "an absent optional store source is absent from its generation" 1 \
@@ -145,7 +167,7 @@ assert_exit "an absent optional store source is absent from its generation" 1 \
 mkdir -p "$ASSET_HASH_STORE/optional"
 printf 'wrong kind\n' > "$ASSET_HASH_STORE/optional/tools"
 asset_hash_wrong_kind="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
-  ihar_config_hash asset identity optional source a b c d)"
+  ihar_config_hash asset identity optional source a b c d mcp)"
 assert_exit "an optional wrong-kind store source has a distinct generation" 1 \
   test "$asset_hash_missing" = "$asset_hash_wrong_kind"
 asset_runtime_wrong_kind="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
@@ -157,7 +179,7 @@ rm -rf "$ASSET_HASH_STORE/optional"
 mkdir -p "$ASSET_HASH_STORE/outside-optional/tools"
 ln -s "$ASSET_HASH_STORE/outside-optional" "$ASSET_HASH_STORE/optional"
 asset_hash_symlink="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
-  ihar_config_hash asset identity optional source a b c d)"
+  ihar_config_hash asset identity optional source a b c d mcp)"
 assert_exit "a symlinked optional store parent has a distinct generation" 1 \
   test "$asset_hash_wrong_kind" = "$asset_hash_symlink"
 asset_runtime_symlink="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
@@ -171,13 +193,13 @@ rm "$ASSET_HASH_STORE/optional"
 # generation rather than silently reuse the link-less one.
 mkdir -p "$ASSET_HASH_ROOT/optional/tools"
 asset_hash_before_install="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
-  ihar_config_hash asset identity optional source a b c d)"
+  ihar_config_hash asset identity optional source a b c d mcp)"
 assert_eq "repository presence alone does not change runtime asset identity" \
   "$asset_hash_missing" "$asset_hash_before_install"
 IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
   ihar_asset_install "$ASSET_HASH_STORE" >/dev/null
 asset_hash_present="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
-  ihar_config_hash asset identity optional source a b c d)"
+  ihar_config_hash asset identity optional source a b c d mcp)"
 assert_exit "an optional store asset becoming available selects a new generation" 1 \
   test "$asset_hash_missing" = "$asset_hash_present"
 assert_exit "an optional correct-kind store source differs from wrong kind" 1 \
@@ -204,7 +226,7 @@ PY
 mkdir -p "$ASSET_HASH_ROOT/required"
 printf 'required\n' > "$ASSET_HASH_ROOT/required/new.txt"
 asset_hash_required_absent="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
-  ihar_config_hash asset identity optional source a b c d)"
+  ihar_config_hash asset identity optional source a b c d mcp)"
 required_absent_runtime="$IHAR_TEST_TMP/required-absent-runtime"
 mkdir -p "$required_absent_runtime"
 printf 'runtime stays\n' > "$required_absent_runtime/sentinel"
@@ -220,7 +242,7 @@ assert_eq "required absence preserves existing runtime bytes" "runtime stays" \
 
 mkdir -p "$ASSET_HASH_STORE/required/new.txt"
 asset_hash_required_wrong="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
-  ihar_config_hash asset identity optional source a b c d)"
+  ihar_config_hash asset identity optional source a b c d mcp)"
 assert_exit "a required wrong-kind store source has a distinct generation" 1 \
   test "$asset_hash_required_absent" = "$asset_hash_required_wrong"
 required_wrong_runtime="$IHAR_TEST_TMP/required-wrong-runtime"
@@ -273,7 +295,7 @@ rm -rf "$ASSET_HASH_STORE/required/new.txt"
 IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
   ihar_asset_install "$ASSET_HASH_STORE" >/dev/null
 asset_hash_required_added="$(IHAR_ROOT="$ASSET_HASH_ROOT" IHAR_STORE="$ASSET_HASH_STORE" \
-  ihar_config_hash asset identity optional source a b c d)"
+  ihar_config_hash asset identity optional source a b c d mcp)"
 assert_exit "a required runtime asset addition selects a new generation" 1 \
   test "$asset_hash_present" = "$asset_hash_required_added"
 assert_exit "a required correct-kind store source differs from wrong kind" 1 \
@@ -341,7 +363,7 @@ assert_eq "a writable runtime file stays owner-only" "600" \
 # blanket chmod made that read-only and the next launch aborted with "failed to
 # initialize sqlite state runtime", so hook verification could never pass.
 ihar_seal_runtime() { printf 'vendor state\n' > "$2/logs_2.sqlite"; }
-sealed="$(ihar_runtime_materialise claude "$(ihar_config_hash s e a l e d 1 2)" "$RENDER")"
+sealed="$(ihar_runtime_materialise claude "$(ihar_config_hash s e a l e d 1 2 mcp)" "$RENDER")"
 unset -f ihar_seal_runtime
 assert_eq "the seal covers the rendered files" "444" \
   "$(stat -c '%a' "$sealed/settings.json")"
@@ -350,7 +372,7 @@ assert_exit "and leaves vendor-written state writable" 0 test -w "$sealed/logs_2
 
 # --- links -------------------------------------------------------------------------
 
-rt2_hash="$(ihar_config_hash a b c d e f g h)"
+rt2_hash="$(ihar_config_hash a b c d e f g h mcp)"
 rt2="$(ihar_runtime_materialise claude "$rt2_hash" "$RENDER")"
 assert_exit "a present store entry is linked" 0 test -L "$rt2/skills"
 assert_exit "an absent store entry is skipped" 1 test -e "$rt2/router.json"
@@ -481,7 +503,7 @@ rm "$rt2/.credentials.json"
 ln -s "$IHAR_STORE/auth/claude/.credentials.json" "$rt2/.credentials.json"
 
 profile_runtime="$(ihar_runtime_materialise claude \
-  "$(ihar_config_hash mutable links cross profile a b c d)" "$RENDER")"
+  "$(ihar_config_hash mutable links cross profile a b c d mcp)" "$RENDER")"
 assert_eq "another profile shares the same mutable auth owner" \
   "$IHAR_STORE/auth/claude/.credentials.json" \
   "$(readlink "$profile_runtime/.credentials.json")"
@@ -491,7 +513,7 @@ assert_eq "auth written through one profile reaches the other" "profile update" 
   "$(printf 'profile update\n' > "$rt2/.credentials.json"; cat "$profile_runtime/.credentials.json")"
 
 codex_mutable_runtime="$(ihar_runtime_materialise codex \
-  "$(ihar_config_hash mutable links codex inventory a b c d)" "$RENDER")"
+  "$(ihar_config_hash mutable links codex inventory a b c d mcp)" "$RENDER")"
 assert_eq "Codex auth links to the global store" "$IHAR_STORE/auth/codex/auth.json" \
   "$(readlink "$codex_mutable_runtime/auth.json")"
 assert_eq "Codex plugins link to the global store" "$IHAR_STORE/plugins/codex" \
@@ -648,7 +670,7 @@ PY
 assert_eq "the independent reuse matrix covers every runtime asset" \
   "$(sort <<< "$EXPECTED_RUNTIME_ASSETS")" "$(sort <<< "$manifest_runtime_assets")"
 
-asset_codex_hash="$(ihar_config_hash asset reuse codex matrix a b c d)"
+asset_codex_hash="$(ihar_config_hash asset reuse codex matrix a b c d mcp)"
 asset_codex_runtime="$(ihar_runtime_materialise codex "$asset_codex_hash" "$RENDER")"
 WRONG_STORE_TARGET="$IHAR_TEST_TMP/wrong-store-target"
 mkdir -p "$WRONG_STORE_TARGET"
@@ -751,7 +773,7 @@ assert_eq "a wrong link is repointed" "$IHAR_STORE/hooks" "$(readlink "$rt2/hook
 # is never linked merely because it happens to exist.
 mkdir -p "$IHAR_STORE/undeclared"
 printf 'not portable\n' > "$IHAR_STORE/undeclared/data"
-rt_assets="$(ihar_runtime_materialise codex "$(ihar_config_hash asset inventory runtime links a b c d)" "$RENDER")"
+rt_assets="$(ihar_runtime_materialise codex "$(ihar_config_hash asset inventory runtime links a b c d mcp)" "$RENDER")"
 while IFS=$'\t' read -r asset_vendor asset_source asset_target asset_kind asset_required; do
   [[ "$asset_vendor" == codex ]] || continue
   [[ -e "$IHAR_STORE/$asset_source" ]] || continue
@@ -833,7 +855,7 @@ assert_exit "a SQLite SHM is linked" 0 test -L "$MANIFEST_RUNTIME/state.sqlite-s
 SAVED_IHAR_STATE="$IHAR_STATE"
 SAVED_IHAR_RUNTIME="${IHAR_RUNTIME:-}"
 IHAR_STATE="$MANIFEST_LINK_STATE"
-manifest_runtime_hash="$(ihar_config_hash manifest reuse state links a b c d)"
+manifest_runtime_hash="$(ihar_config_hash manifest reuse state links a b c d mcp)"
 ihar_runtime_materialise codex "$manifest_runtime_hash" "$RENDER" >/dev/null
 MANIFEST_REUSE_RUNTIME="$IHAR_RUNTIME"
 rm "$MANIFEST_REUSE_RUNTIME/state.sqlite-wal"
@@ -861,7 +883,7 @@ with open(path, "w", encoding="utf-8") as handle:
     json.dump(manifest, handle)
 PY
 printf 'added\n' > "$MANIFEST_LEGACY/added.jsonl"
-manifest_runtime_hash_added="$(ihar_config_hash manifest reuse state links a b c d)"
+manifest_runtime_hash_added="$(ihar_config_hash manifest reuse state links a b c d mcp)"
 assert_exit "a state-manifest change selects a new runtime generation" 1 \
   test "$manifest_runtime_hash" = "$manifest_runtime_hash_added"
 MANIFEST_LINK_STATE_ADDED="$IHAR_TEST_TMP/manifest-link-state-added"
@@ -895,7 +917,7 @@ printf 'old runtime db\n' > "$UPGRADE_OLD/state.sqlite"
 printf 'old runtime wal\n' > "$UPGRADE_OLD/state.sqlite-wal"
 printf 'old runtime shm\n' > "$UPGRADE_OLD/state.sqlite-shm"
 IHAR_STATE="$UPGRADE_STATE"
-upgrade_hash="$(ihar_config_hash runtime upgrade manifest identity a b c d)"
+upgrade_hash="$(ihar_config_hash runtime upgrade manifest identity a b c d mcp)"
 ihar_runtime_materialise codex "$upgrade_hash" "$RENDER" >/dev/null
 UPGRADE_NEW="$IHAR_RUNTIME"
 assert_eq "runtime upgrade publishes materialized directory state" "old runtime record" \

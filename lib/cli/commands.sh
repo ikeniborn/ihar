@@ -79,12 +79,13 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
 
   # 6. render. The hook block and the effective policy are produced here; the MCP
   #    registry and the managed config regions arrive with S6 and S7.
-  local render hooks_digest registry_digest
+  local render hooks_digest registry_digest mcp_identity
   render="$(mktemp -d "${TMPDIR:-/tmp}/ihar-render-XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -rf '$render'" RETURN
   hooks_digest="$(ihar_manifest_digest)"
   registry_digest="$(ihar_registry_digest)"
+  mcp_identity="$(ihar_effective_mcp_identity "$vendor")" || return
   ihar_render_all "$vendor" "$render"
 
   # 7. runtime home, keyed by the configuration and never rewritten
@@ -93,21 +94,23 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
   hash="$(ihar_config_hash \
             "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
             "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
-            "$hooks_digest" "$registry_digest" "$version")"
+            "$hooks_digest" "$registry_digest" "$version" "$mcp_identity")"
   local mode=writable
   if [[ "${IHAR_PROFILE_HOOKS:-best-effort}" == "enforced" ]]; then mode=immutable; fi
   ihar_runtime_materialise "$vendor" "$hash" "$render" "$mode" >/dev/null
   runtime="$IHAR_RUNTIME"
 
   if [[ "$IHAR_PROFILE_SANDBOX" == microvm ]]; then
-    local other_vendor=claude other_render other_hash other_runtime
+    local other_vendor=claude other_render other_hash other_runtime other_mcp_identity
     [[ "$vendor" == claude ]] && other_vendor=codex
+    other_mcp_identity="$(ihar_effective_mcp_identity "$other_vendor")" || return
     other_render="$(mktemp -d "${TMPDIR:-/tmp}/ihar-render-other-XXXXXX")"
     ihar_render_all "$other_vendor" "$other_render"
     other_hash="$(ihar_config_hash \
       "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
       "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
-      "$hooks_digest" "$registry_digest" "$(ihar_vendor_version "$other_vendor")")"
+      "$hooks_digest" "$registry_digest" "$(ihar_vendor_version "$other_vendor")" \
+      "$other_mcp_identity")"
     ihar_runtime_materialise "$other_vendor" "$other_hash" "$other_render" "$mode" >/dev/null
     other_runtime="$IHAR_RUNTIME"
     ihar_verify_hook_trust "$other_vendor" "$other_runtime"

@@ -69,6 +69,34 @@ claude_home="$(ihar --dry-run claude | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
 codex_home="$(ihar --dry-run codex | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
 assert_exit "each vendor gets its own runtime home" 1 test "$claude_home" = "$codex_home"
 
+# A change in selected MCP servers chooses a new immutable home for each vendor.
+# The variable's value is forwarded by name, so changing only that value does not.
+unset IWIKI_REMOTE_TOKEN IHAR_IWIKI_REMOTE_URL
+for vendor in claude codex; do
+  absent_home="$(ihar --dry-run "$vendor" | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
+  if [[ "$vendor" == claude ]]; then
+    old_render=settings.json
+  else
+    old_render=config.toml
+  fi
+  absent_inode="$(stat -c '%i' "$absent_home/$old_render")"
+  enabled_home="$(IWIKI_REMOTE_TOKEN=synthetic \
+    IHAR_IWIKI_REMOTE_URL=https://wiki.example/mcp \
+    ihar --dry-run "$vendor" | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
+  changed_value_home="$(IWIKI_REMOTE_TOKEN=other-synthetic \
+    IHAR_IWIKI_REMOTE_URL=https://wiki.example/mcp \
+    ihar --dry-run "$vendor" | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
+  assert_exit "$vendor selected MCP server chooses a new runtime" 1 \
+    test "$absent_home" = "$enabled_home"
+  assert_eq "$vendor token value reuses its runtime" "$enabled_home" "$changed_value_home"
+  assert_exit "$vendor old generation remains available" 0 test -d "$absent_home"
+  assert_eq "$vendor old generation is not rewritten" "$absent_inode" \
+    "$(stat -c '%i' "$absent_home/$old_render")"
+done
+enabled_diff="$(IWIKI_REMOTE_TOKEN=synthetic \
+  IHAR_IWIKI_REMOTE_URL=https://wiki.example/mcp ihar check --diff)"
+assert_eq "check selects the same MCP generations as launch" "no differences" "$enabled_diff"
+
 # --- the project's own configuration is what is read ------------------------------------
 #
 # Regression. The loader defaulted to the harness checkout, so a project pinning a
