@@ -58,6 +58,13 @@
         <option value="codex">codex</option>
       </select>
     </label>
+    <label>Tab
+      <select id="launch-kind">
+        <option value="pty">terminal — the agent's own interface, full profile</option>
+        <option value="acp">chat — experimental, fewer guarantees</option>
+      </select>
+    </label>
+    <p id="launch-caveats" class="caveats" hidden></p>
     <menu>
       <button value="cancel">cancel</button>
       <button id="launch-go" value="go">launch</button>

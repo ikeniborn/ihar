@@ -22,6 +22,7 @@ import argparse
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import pty
 import select
@@ -34,6 +35,7 @@ import threading
 import time
 
 from .. import jsonio
+from .acp import AcpClient
 
 # Output kept for a reattaching browser. In memory only: a file here would be a second
 # uncontrolled copy of the transcript, which the session index contract forbids.
@@ -82,12 +84,14 @@ class Supervisor:
         self.lock = threading.Lock()
         self.master = -1
         self.child = -1
+        self.acp: AcpClient | None = None
 
     # ----------------------------------------------------------------- record
     def write_record(self, **changes) -> None:
         record = {
             "schema": 1, "sid": self.args.sid, "ihar_id": self.args.launch_id,
-            "kind": "pty", "vendor": self.args.vendor, "project_root": self.args.project,
+            "kind": self.args.kind, "vendor": self.args.vendor,
+            "project_root": self.args.project,
             "state_id": hashlib.sha256(self.args.project.encode()).hexdigest()[:8],
             "profile": self.args.profile, "pid": os.getpid(), "socket": self.args.socket,
             "started_at": self.started_at, "exit_code": None,
@@ -139,7 +143,9 @@ class Supervisor:
                     return
                 kind, length = head[0], int.from_bytes(head[1:], "big")
                 payload = self._recv_exactly(client, length) or b""
-                if kind == INPUT and self.master >= 0:
+                if kind == INPUT and self.args.kind == "acp":
+                    self.handle_acp_input(payload)
+                elif kind == INPUT and self.master >= 0:
                     os.write(self.master, payload)
                 elif kind == RESIZE:
                     cols, _, rows = payload.decode(errors="replace").partition(",")
@@ -172,6 +178,48 @@ class Supervisor:
                 return
             threading.Thread(target=self.serve_client, args=(client,), daemon=True).start()
 
+    # ------------------------------------------------------------------- acp
+    def run_acp(self, listener: socket.socket) -> int:
+        """Drive an ACP conversation instead of a pseudo-terminal (LLD 13.3).
+
+        Events arrive as one JSON object per line and go through the same ring buffer, so a
+        reattaching browser replays the conversation the way a terminal tab replays bytes.
+        """
+        def emit(event: dict) -> None:
+            line = (json.dumps(event, sort_keys=True) + "\n").encode()
+            self.ring.append(line)
+            self.broadcast(_frame(OUTPUT, line))
+
+        self.acp = AcpClient(self.command, self.args.project, dict(os.environ), emit)
+        self.write_record()
+        threading.Thread(target=self.accept_loop, args=(listener,), daemon=True).start()
+        signal.signal(signal.SIGTERM, lambda *_: self.acp.stop() if self.acp else None)
+        self.acp.start()
+        process = self.acp.process
+        code = process.wait() if process else 1
+        self.write_record(exit_code=code)
+        self.broadcast(_frame(EXIT, str(code).encode()))
+        listener.close()
+        if os.path.exists(self.args.socket):
+            os.unlink(self.args.socket)
+        return 0
+
+    def handle_acp_input(self, payload: bytes) -> None:
+        """One JSON command from the window: a prompt, a cancel or a permission answer."""
+        if not self.acp:
+            return
+        try:
+            message = json.loads(payload or b"{}")
+        except ValueError:
+            return
+        kind = message.get("type")
+        if kind == "prompt":
+            self.acp.prompt(str(message.get("text") or ""))
+        elif kind == "cancel":
+            self.acp.cancel()
+        elif kind == "permission":
+            self.acp.answer(str(message.get("request_id")), message.get("option_id"))
+
     # ------------------------------------------------------------------- run
     def run(self) -> int:
         self.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -182,6 +230,8 @@ class Supervisor:
         listener.bind(self.args.socket)
         os.chmod(self.args.socket, 0o600)
         listener.listen(8)
+        if self.args.kind == "acp":
+            return self.run_acp(listener)
         self.spawn()
         self.write_record()
         threading.Thread(target=self.accept_loop, args=(listener,), daemon=True).start()
@@ -232,6 +282,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     for name in ("sid", "record", "socket", "project", "vendor", "profile", "launch-id"):
         parser.add_argument(f"--{name}", required=True)
+    parser.add_argument("--kind", default="pty", choices=("pty", "acp"))
     parser.add_argument("--cols", type=int, default=120)
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("command", nargs=argparse.REMAINDER)

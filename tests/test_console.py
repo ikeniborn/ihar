@@ -53,11 +53,13 @@ def fake_root(tmp: Path) -> Path:
         (root / "console" / "vendor" / name).write_bytes(
             (real / "console" / "vendor" / name).read_bytes())
     (root / ".ihar-lockfile.json").write_bytes((real / ".ihar-lockfile.json").read_bytes())
+    (root / "acp-agent.py").write_bytes((real / "tests" / "fakes" / "acp-agent.py").read_bytes())
     script = root / "ihar.sh"
     script.write_text(
         "#!/usr/bin/env bash\n"
         'if [[ "$1" == sessions ]]; then printf "%s\\n" "$*" >> "$HOME/rename.log"; exit 0; fi\n'
         'if [[ "$1" == check ]]; then printf "profile      standard\\nconsole      running\\n"; exit 0; fi\n'
+        'if [[ "$1" == acp ]]; then exec python3 "$(dirname "$0")/acp-agent.py"; fi\n'
         'env > "$HOME/env-dump.$$"\n'
         'printf "tab-ready vendor=%s\\n" "$1"\n'
         "sleep 30\n", encoding="utf-8")
@@ -436,10 +438,67 @@ def main():
                                      cookie=token, body={"to": "claude", "history": "everything"})
         check("an unknown history mode is refused", status == 400)
 
+        # The cap was just proven, so make room before the next kind of tab.
+        for record in (state_root / "console" / "s").glob("*.json"):
+            stopped = json.loads(record.read_text(encoding="utf-8"))
+            request(port, "POST", f"/api/tabs/{stopped['sid']}/stop", cookie=token, body={})
+        time.sleep(0.6)
+
+        # A chat tab is a second kind of tab, gated by the profile that allows ACP.
+        chat = tmp / "chat-project"
+        chat.mkdir()
+        status, _, payload = request(port, "POST", "/api/tabs", cookie=token,
+                                     body={"project_root": str(chat), "vendor": "claude",
+                                           "kind": "acp"})
+        created = json.loads(payload) if status == 201 else {}
+        check("a chat tab is created under a profile that allows ACP", status == 201)
+        check("the tab says which kind it is", created.get("kind") == "acp")
+        check("the tab carries its caveats", len(created.get("caveats") or []) == 3)
+        chat_record = wait_for(state_root / "console" / "s" / f"{created.get('sid')}.json") \
+            if created else None
+        check("the chat record says acp", (chat_record or {}).get("kind") == "acp")
+
+        stream, line = websocket(port, f"/ws/{created.get('sid')}", token,
+                                 f"http://127.0.0.1:{port}")
+        check(f"the chat tab attaches ({line})", stream is not None)
+        if stream:
+            def collect(deadline):
+                out = []
+                for frame in read_frames(stream, deadline=deadline):
+                    for row in frame.decode(errors="replace").splitlines():
+                        try:
+                            out.append(json.loads(row))
+                        except ValueError:
+                            pass
+                return out
+
+            # The handshake first: a prompt before the session exists is not a test of
+            # anything the window would do, since the window prompts only once it can.
+            events = collect(6.0)
+            check("the chat tab replays the session handshake",
+                  any(event.get("type") == "session" for event in events))
+            send_text(stream, json.dumps({"type": "input",
+                                          "data": json.dumps({"type": "prompt",
+                                                              "text": "do the thing"})}).encode())
+            events += collect(8.0)
+            kinds = [event.get("type") for event in events]
+            check("the agent's answer reaches the window",
+                  any(event.get("kind") == "agent_message_chunk" for event in events))
+            check("a permission request reaches the window", "permission" in kinds)
+            check("an unoffered client method is refused in the window", "refused" in kinds)
+            check("no terminal bytes are pretended to be a conversation",
+                  all(isinstance(event, dict) for event in events))
+            stream.close()
+
+        chat_written = [path for path in (state_root / "console").rglob("*")
+                        if path.is_file() and path.suffix not in (".json", ".sock")
+                        and path.name not in ("token", "broker.err")]
+        check(f"a chat tab writes no conversation to disk ({chat_written})", not chat_written)
+
         broker.terminate()
         broker.wait(timeout=10)
         # A supervisor outlives its broker: that is why it exists.
-        alive = session and Path(f"/proc/{session['pid']}").exists()
+        alive = chat_record and Path(f"/proc/{chat_record['pid']}").exists()
         check("the supervisor survives the broker", bool(alive))
         for record in (state_root / "console" / "s").glob("*.json"):
             try:

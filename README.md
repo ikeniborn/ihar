@@ -192,6 +192,15 @@ pane that reads a chain across a `switch`, a panel with that project's `ihar che
 and buttons to rename a session or hand it to the other agent. Browser notifications,
 if you allow them, tell you when a session starts waiting for you.
 
+A tab comes in two kinds. The default runs the agent's own terminal and carries the
+profile unchanged. The second is an experimental chat over ACP: it is offered only where
+the profile allows ACP, so `protected` and `isolated` refuse it, and the tab states what
+it does not carry — hooks that may not fire under the Claude adapter, a sandbox and
+approval policy the Codex adapter replaces, and the console's own refusal to give the
+agent a filesystem or terminal through the browser. Those are the same three lines
+`ihar check` prints. A permission the agent asks for is shown and waits for you; nothing
+answers it on your behalf.
+
 Everything the page loads is served by the broker from a pinned copy — the terminal is
 `xterm.js` 5.5.0, vendored with its digest in the release lockfile, and a build whose
 bytes do not match is refused rather than served. Nothing is fetched from the network,

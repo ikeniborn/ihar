@@ -50,6 +50,12 @@ STATIC = {
     "xterm.css": ("console/vendor/xterm.css", "text/css; charset=utf-8", True),
 }
 CHECK_SECONDS = 30.0
+# What an ACP tab does not carry, in the words `ihar check` already uses for the mode.
+ACP_CAVEATS = [
+    "claude-agent-acp #144: settings hooks may not fire",
+    "codex-acp #310/#477: sandbox and approval policy are overridden",
+    "ihar console: an ACP chat tab is offered no filesystem or terminal capability",
+]
 MAX_BODY = 64 * 1024
 _GUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11F"
 _CONFIG_LINE = re.compile(r"^(IHAR_[A-Z0-9_]+)=(.*)$")
@@ -221,11 +227,23 @@ class Broker:
                     return match.group(2).strip().strip("\"'")
         return "standard"
 
-    def console_allowed(self, profile: str) -> bool:
+    def profile_file(self, profile: str) -> dict:
         path = self.root / "manifests" / "profiles" / f"{profile}.json"
         if not path.is_file():
             raise FileNotFoundError(profile)
-        return jsonio.read("profile", str(path)).get("console") == "allow"
+        return jsonio.read("profile", str(path))
+
+    def console_allowed(self, profile: str) -> bool:
+        return self.profile_file(profile).get("console") == "allow"
+
+    def acp_allowed(self, profile: str) -> bool:
+        """The chat tab follows `acp`, not `console` (LLD 13.3).
+
+        A profile that refuses ACP refuses it here too: the adapter does not fire settings
+        hooks and replaces the sandbox and approval policy, so a chat tab under an enforced
+        profile would carry a guarantee nobody can keep.
+        """
+        return self.profile_file(profile).get("acp") == "allow"
 
     def cli(self) -> str:
         candidate = self.root / "ihar.sh"
@@ -241,7 +259,8 @@ class Broker:
         environment["IHAR_CONSOLE_LAUNCH_ID"] = launch_id
         return environment
 
-    def open_tab(self, project: str, vendor: str, requested: str | None) -> dict:
+    def open_tab(self, project: str, vendor: str, requested: str | None,
+                 kind: str = "pty") -> dict:
         root = Path(project).resolve()
         if not root.is_dir():
             raise ValueError(f"no such project directory: {project}")
@@ -249,27 +268,39 @@ class Broker:
             raise ValueError(f"unknown vendor: {vendor}")
         if len(self.running()) >= self.max_sessions:
             raise RuntimeError(f"the console already runs {self.max_sessions} sessions")
+        if kind not in ("pty", "acp"):
+            raise ValueError(f"unknown tab kind: {kind}")
         profile = self.profile_of(root, requested)
         if not self.console_allowed(profile):
             raise PermissionError(f"profile '{profile}' sets console: refuse")
-        return self.spawn_tab(root, vendor, profile, [self.cli(), vendor])
+        if kind == "acp" and not self.acp_allowed(profile):
+            raise PermissionError(
+                f"profile '{profile}' sets acp: refuse; a chat tab cannot promise its hooks "
+                "or its sandbox, so it is not offered here")
+        command = [self.cli(), "acp", vendor] if kind == "acp" else [self.cli(), vendor]
+        return self.spawn_tab(root, vendor, profile, command, kind=kind)
 
     def spawn_tab(self, root: Path, vendor: str, profile: str, command: list[str],
-                  launch_id: str | None = None) -> dict:
+                  launch_id: str | None = None, kind: str = "pty") -> dict:
         launch_id = launch_id or str(ids.uuid7())
         sid = str(ids.uuid7()).replace("-", "")[:12]
         supervisor = [sys.executable, "-m", "ihar.console.supervisor",
                       "--sid", sid, "--record", str(self.sessions / f"{sid}.json"),
                       "--socket", str(self.sessions / f"{sid}.sock"),
                       "--project", str(root), "--vendor", vendor, "--profile", profile,
-                      "--launch-id", launch_id, "--", *command]
+                      "--launch-id", launch_id, "--kind", kind, "--", *command]
         environment = self.tab_environment(launch_id)
         environment["PYTHONPATH"] = os.environ.get("PYTHONPATH", "")
         self.spawned[sid] = subprocess.Popen(
             supervisor, env=environment, start_new_session=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return {"sid": sid, "ihar_id": launch_id, "vendor": vendor, "profile": profile,
-                "project_root": str(root)}
+        tab = {"sid": sid, "ihar_id": launch_id, "vendor": vendor, "profile": profile,
+               "project_root": str(root), "kind": kind}
+        if kind == "acp":
+            # The label travels with the tab, because two kinds that look alike and
+            # guarantee differently is the confusion this exists to prevent.
+            tab["caveats"] = ACP_CAVEATS
+        return tab
 
     def rename(self, state_id: str, ihar_id: str, title: str) -> bool:
         """Push a title to the vendor through the CLI, so native pickers agree (LLD 13.2)."""
@@ -425,8 +456,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                   "max_sessions": self.broker.max_sessions,
                                   "sessions": self.broker.live()})
         elif path == "/api/sidebar":
-            tabs = self.broker.live()
-            self.json_reply(200, self.broker.sidebar.build(tabs, force=query == "refresh=1"))
+            view = self.broker.sidebar.build(self.broker.live(), force=query == "refresh=1")
+            # A reattaching window must be able to label a chat tab it did not open.
+            for project in view.get("projects", []):
+                for row in project.get("sessions", []):
+                    if (row.get("tab") or {}).get("kind") == "acp":
+                        row["tab"]["caveats"] = ACP_CAVEATS
+            self.json_reply(200, view)
         elif path.startswith("/api/check/"):
             self.json_reply(200, self.broker.check(path[len("/api/check/"):]))
         elif path.startswith("/api/thread/"):
@@ -489,7 +525,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             tab = self.broker.open_tab(body.get("project_root") or "",
                                        body.get("vendor") or "",
-                                       body.get("profile"))
+                                       body.get("profile"),
+                                       str(body.get("kind") or "pty"))
         except (PermissionError, jsonio.SchemaError) as error:
             # A profile that refuses the console and a profile whose contract does not
             # validate are the same outcome: the tab does not start. Neither is a bad

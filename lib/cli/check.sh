@@ -42,7 +42,9 @@ ihar_check_collect() {
   _IHAR_CHECK_GATEWAY_INSTANCES="$(ihar_gateway_status)" || return $?
   _IHAR_CHECK_ASSETS="$(ihar_asset_diagnostics)" || return $?
   _IHAR_CHECK_NETWORK_EVIDENCE="$(ihar_microvm_network_evidence)" || return $?
-  _IHAR_CHECK_KNOWN_GAPS=$'claude-agent-acp #144: settings hooks may not fire\ncodex-acp #310/#477: sandbox and approval policy are overridden'
+  # The console's chat tab shows these same lines, so a user reads one wording in the
+  # terminal and in the window rather than two that have to be reconciled (LLD 13.3).
+  _IHAR_CHECK_KNOWN_GAPS=$'claude-agent-acp #144: settings hooks may not fire\ncodex-acp #310/#477: sandbox and approval policy are overridden\nihar console: an ACP chat tab is offered no filesystem or terminal capability'
 
   for vendor in claude codex; do
     binary="$(eval echo "\$IHAR_${vendor^^}_BIN")"
