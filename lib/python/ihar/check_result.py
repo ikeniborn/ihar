@@ -445,7 +445,10 @@ def _auth_diff(runtime: str, store: str) -> int:
         return 0
     if not stat.S_ISLNK(metadata.st_mode):
         kind = "materialized" if stat.S_ISREG(metadata.st_mode) else "unsafe type"
-        print(f"codex mutable-link: {kind} credential preserved; user-approved recovery required")
+        print(
+            f"codex mutable-link: {kind} credential preserved, not adopted or deleted; "
+            "user-approved recovery required"
+        )
         return 0
     try:
         auth_owner.verify_runtime_link(runtime, store)
@@ -456,6 +459,8 @@ def _auth_diff(runtime: str, store: str) -> int:
             record = auth_owner._read_owner(owner)
         if record is None:
             status = "no recorded owner"
+        elif record.get("schema") == 2 and record.get("state") == "blocked":
+            status = "blocked"
         elif not auth_owner.owner_identity_proven(record):
             status = "unverified"
         elif auth_owner.owner_is_active(record):

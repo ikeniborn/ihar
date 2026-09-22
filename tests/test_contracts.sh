@@ -365,6 +365,8 @@ diagnostic_output="$(python3 -m ihar.check_result auth-diff \
 assert_eq "materialized Codex auth diagnostic is available" "0" "$diagnostic_status"
 assert_contains "materialized Codex auth is a mutable-link issue" "$diagnostic_output" "mutable-link: materialized"
 assert_contains "materialized Codex auth needs approval" "$diagnostic_output" "user-approved recovery"
+assert_contains "materialized Codex auth is neither adopted nor deleted" "$diagnostic_output" \
+  "not adopted or deleted"
 assert_exit "auth diagnostic never prints credential bytes" 1 \
   grep -F 'synthetic-credential-do-not-print' <<<"$diagnostic_output"
 assert_eq "auth diagnostic preserves materialized bytes" 'synthetic-credential-do-not-print' \
@@ -409,6 +411,17 @@ with ExitStack() as stack:
     _root, _auth, owner = auth_owner._owner_directories(store, stack, create=False)
     auth_owner._write_owner(owner, record)
 report("busy")
+record = {
+    "schema": 2, "state": "blocked", "guardian": auth_owner._identity_for(os.getpid()),
+    "child": None, "children": [], "daemon": None, "guest": None,
+    "guest_bundle": None, "guest_reconciled": False,
+    "runtime": str(runtime), "config_hash": "synthetic-generation",
+}
+with ExitStack() as stack:
+    _root, _auth, owner = auth_owner._owner_directories(store, stack, create=False)
+    auth_owner._write_owner(owner, record)
+report("blocked")
+record["state"] = "active"
 record["guardian"] = {"pid": 99999999, "start": "synthetic", "binary": "/no-such-binary"}
 with ExitStack() as stack:
     _root, _auth, owner = auth_owner._owner_directories(store, stack, create=False)
@@ -422,6 +435,8 @@ assert_contains "valid auth link names recorded-owner scope" "$auth_categories" 
   "valid=codex mutable-link: valid; auth-owner: no recorded owner"
 assert_contains "active lease has busy category" "$auth_categories" \
   "busy=codex mutable-link: valid; auth-owner: busy"
+assert_contains "blocked guardian has a bounded blocked category" "$auth_categories" \
+  "blocked=codex mutable-link: valid; auth-owner: blocked"
 assert_contains "unproven lease has unverified category" "$auth_categories" \
   "unverified=codex mutable-link: valid; auth-owner: unverified"
 for withheld in synthetic-token-not-for-output synthetic-owner-id "$IHAR_TEST_TMP/auth-owner-categories"; do
