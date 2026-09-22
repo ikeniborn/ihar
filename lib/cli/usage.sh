@@ -40,6 +40,8 @@ launch flags
   --model <m>           model for this session
   --effort <e>          reasoning effort for this session
   --approval <policy>   never, on-request, on-failure, untrusted
+  --acp-promotion       measure whether the console's ACP chat tab may leave experimental
+                        status; reports, promotes nothing by itself
   --mask-level <l>      off, secrets, standard; may only tighten the profile's floor
   --web                 start the agent's own remote surface
 

@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "conditions": [
+    {
+      "id": "claude-hooks-issue",
+      "kind": "issue",
+      "repo": "agentclientprotocol/claude-agent-acp",
+      "issue": 144,
+      "requirement": "settings hooks are supported by the adapter"
+    },
+    {
+      "id": "codex-config-issue",
+      "kind": "issue",
+      "repo": "agentclientprotocol/codex-acp",
+      "issue": 310,
+      "requirement": "sandbox and approval policies from config.toml are honoured"
+    },
+    {
+      "id": "codex-roots-issue",
+      "kind": "issue",
+      "repo": "agentclientprotocol/codex-acp",
+      "issue": 477,
+      "requirement": "default agent prompts do not overwrite configured roots and permissions"
+    },
+    {
+      "id": "claude-hooks-fire",
+      "kind": "probe",
+      "vendor": "claude",
+      "requirement": "a SessionStart hook observably fires during an ACP session"
+    },
+    {
+      "id": "codex-config-survives",
+      "kind": "probe",
+      "vendor": "codex",
+      "requirement": "the sandbox and approval policy the rendered config.toml asked for survive into the ACP session",
+      "unimplemented": "no measured run of codex-acp exists yet, so the assertion would be a guess"
+    }
+  ]
+}

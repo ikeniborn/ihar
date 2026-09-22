@@ -201,6 +201,17 @@ agent a filesystem or terminal through the browser. Those are the same three lin
 `ihar check` prints. A permission the agent asks for is shown and waits for you; nothing
 answers it on your behalf.
 
+Whether that chat tab can ever stop being experimental is a measurement rather than an
+opinion, and one command takes it:
+
+```bash
+ihar check --acp-promotion
+```
+
+It reads the condition from a manifest, reports each part as passed, failed or unmeasured,
+and refuses to say "promotable" while anything is unmeasured. It changes no profile. As of
+today it answers *not promotable*: the three upstream issues it names are still open.
+
 Everything the page loads is served by the broker from a pinned copy — the terminal is
 `xterm.js` 5.5.0, vendored with its digest in the release lockfile, and a build whose
 bytes do not match is refused rather than served. Nothing is fetched from the network,

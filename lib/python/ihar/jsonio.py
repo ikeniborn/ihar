@@ -714,6 +714,49 @@ KINDS: dict[str, dict[str, Any]] = {
         },
         "rules": [],
     },
+    # LLD 13.3, plan task S13.4. The promotion condition as data: prose in a plan gets
+    # re-read from memory, a manifest gets measured.
+    "acp-promotion": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "conditions": {"type": list, "items": {
+                "type": dict,
+                "fields": {
+                    "id": {"type": str, "pattern": _SLUG},
+                    "kind": {"type": str, "enum": ("issue", "probe")},
+                    "requirement": {"type": str, "min_len": 1},
+                },
+                "optional": {
+                    "repo": {"type": str, "min_len": 1},
+                    "issue": {"type": int, "min": 1},
+                    "vendor": {"type": str, "enum": _VENDOR},
+                    # Present when the assertion has never been measured against a real
+                    # adapter; the gate then refuses to call the condition passed.
+                    "unimplemented": {"type": str, "min_len": 1},
+                },
+            }},
+        },
+        "rules": [],
+    },
+    # The measurement itself, kept so a later reader sees when and on what it was taken.
+    "acp-promotion-result": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "measured_at": {"type": str, "pattern": _TS},
+            "promotable": {"type": bool},
+            "conditions": {"type": list, "items": {
+                "type": dict,
+                "fields": {
+                    "id": {"type": str, "pattern": _SLUG},
+                    "kind": {"type": str, "enum": ("issue", "probe")},
+                    "requirement": {"type": str, "min_len": 1},
+                    "state": {"type": str, "enum": ("passed", "failed", "unmeasured")},
+                    "detail": {"type": str, "min_len": 1},
+                },
+            }},
+        },
+        "rules": [],
+    },
     # LLD 13.2
     "console-daemon": {
         "fields": {

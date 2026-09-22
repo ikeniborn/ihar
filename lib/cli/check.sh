@@ -125,8 +125,26 @@ ihar_check_diff() (
   [[ "$found" == true ]] || printf 'no differences\n'
 )
 
+# ihar_cmd_acp_promotion — measure the console chat tab's promotion condition (LLD 13.3).
+#
+# Reports and records; it promotes nothing. Exit 1 while any condition is unmet or
+# unmeasured, because the tab's experimental status is the safe answer either way.
+ihar_cmd_acp_promotion() {
+  local record="$IHAR_STORE/verification/acp-promotion.json"
+  mkdir -p -- "$(dirname "$record")"
+  IHAR_CLI="${IHAR_ENTRY:-$IHAR_ROOT/ihar.sh}" \
+  IHAR_PROJECT_ROOT="$IHAR_PROJECT_ROOT" IHAR_STATE="${IHAR_STATE:-}" \
+    ihar_python ihar.acp_promotion --manifest "$IHAR_ROOT/manifests/acp-promotion.json" \
+      --record "$record" ${IHAR_FLAG_JSON:+$([[ "$IHAR_FLAG_JSON" == true ]] && printf -- --json)}
+}
+
 ihar_cmd_check() (
   local result="" conformance_status=0 status=0
+  if [[ "$IHAR_FLAG_ACP_PROMOTION" == true ]]; then
+    ihar_state_setup "$IHAR_PROJECT_ROOT" >/dev/null 2>&1 || true
+    ihar_cmd_acp_promotion
+    return $?
+  fi
   trap '[[ -z "$result" ]] || rm -f -- "$result"' EXIT
   if [[ "$IHAR_FLAG_CONFORMANCE" == true ]]; then
     if [[ "$IHAR_FLAG_JSON" == true ]]; then
