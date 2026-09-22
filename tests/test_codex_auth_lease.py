@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib" / "python"))
@@ -38,6 +39,300 @@ class AuthLeaseTests(unittest.TestCase):
     @property
     def record(self) -> Path:
         return self.store / "auth" / "codex" / ".owner.json"
+
+    def _guardian(self, script: str) -> subprocess.Popen:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "ihar.codex.guardian", str(self.store), "--",
+             sys.executable, "-c", script],
+            env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "lib" / "python")),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        def cleanup() -> None:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            process.stdout.close()
+            process.stderr.close()
+        self.addCleanup(cleanup)
+        return process
+
+    def _wait_for(self, path: Path) -> None:
+        for _ in range(100):
+            if path.exists():
+                return
+            time.sleep(.02)
+        self.fail(f"timed out waiting for {path.name}")
+
+    def test_guardian_records_pending_before_child_exec_and_blocks_competitor(self) -> None:
+        observed = self.root / "observed.json"
+        script = ("import json, os, time; from pathlib import Path; "
+                  f"Path({str(observed)!r}).write_text(Path({str(self.record)!r}).read_text()); "
+                  "time.sleep(1)")
+        first = self._guardian(script)
+        self._wait_for(observed)
+        snapshot = json.loads(observed.read_text())
+        self.assertEqual(snapshot["schema"], 2)
+        self.assertEqual(snapshot["state"], "pending")
+        started = time.monotonic()
+        second = self._guardian("raise SystemExit(23)")
+        self.assertEqual(second.wait(timeout=3), 3)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(first.wait(timeout=5), 0)
+        self.assertFalse(self.record.exists())
+
+    def test_spoofed_guard_environment_cannot_bind_owner(self) -> None:
+        from ihar.codex import guardian
+        owner = auth_owner.acquire(self.runtime_a, "foreground")
+        original_record = self.record.read_bytes()
+        try:
+            with mock.patch.dict(os.environ, {"IHAR_GUARD_FD": "-1", "IHAR_OWNER_ID": owner}):
+                with self.assertRaises(auth_owner.AuthOwnerError):
+                    guardian.request(-1, "bind-runtime", {"runtime": str(self.runtime_a)})
+            self.assertEqual(self.record.read_bytes(), original_record)
+        finally:
+            auth_owner.release(owner)
+
+    def test_guardian_authenticated_child_binds_runtime_and_hash(self) -> None:
+        auth_owner.stage(self.store)
+        (self.runtime_a / "auth.json").symlink_to(self.store / "auth" / "codex" / "auth.json")
+        marker = self.root / "bound"
+        script = ("import os; from pathlib import Path; from ihar.codex import guardian; "
+                  "guardian.request(int(os.environ['IHAR_GUARD_FD']), 'bind-runtime', "
+                  f"{{'runtime': {str(self.runtime_a)!r}, 'config_hash': 'hash-a'}}); "
+                  f"Path({str(marker)!r}).touch()")
+        process = self._guardian(script)
+        self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
+        self.assertTrue(marker.exists())
+        self.assertFalse(self.record.exists())
+
+    def test_guardian_crash_retains_record_with_live_descendant(self) -> None:
+        marker = self.root / "live"
+        script = f"from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(30)"
+        process = self._guardian(script)
+        self._wait_for(marker)
+        process.kill()
+        process.wait(timeout=5)
+        original = self.record.read_bytes()
+        second = self._guardian("raise SystemExit(23)")
+        self.assertEqual(second.wait(timeout=3), 3)
+        self.assertEqual(self.record.read_bytes(), original)
+        self.assertIn("owns the shared login", second.stderr.read())
+        child = json.loads(original)["child"]
+        try:
+            os.killpg(child["pgrp"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    def test_schema_one_owner_record_blocks_new_guardian(self) -> None:
+        owner = auth_owner.acquire(self.runtime_a, "foreground")
+        original = self.record.read_bytes()
+        try:
+            contender = self._guardian("raise SystemExit(23)")
+            self.assertEqual(contender.wait(timeout=3), 3)
+            self.assertEqual(self.record.read_bytes(), original)
+        finally:
+            auth_owner.release(owner)
+
+    def test_unsupported_guardian_platform_returns_three_without_record(self) -> None:
+        from ihar.codex import guardian
+        with mock.patch.object(guardian.sys, "platform", "darwin"):
+            self.assertEqual(guardian.run(self.store, ["/bin/true"]), 3)
+        self.assertFalse(self.record.exists())
+
+    def test_replaced_daemon_socket_blocks_schema_two_release(self) -> None:
+        from ihar.codex import guardian
+        auth_owner.stage(self.store)
+        socket_path = self.root / "daemon.sock"
+        listener = socket_module.socket(socket_module.AF_UNIX)
+        listener.bind(str(socket_path))
+        self.addCleanup(listener.close)
+        metadata = socket_path.stat()
+        absent_pid = 2147483647
+        record = {"schema": 2, "state": "active", "guardian": auth_owner._identity_for(os.getpid()),
+                  "child": {"pid": absent_pid, "start": "absent", "binary": "/bin/false",
+                            "pgrp": absent_pid},
+                  "children": [], "daemon": {"pid": absent_pid, "start": "absent",
+                                                  "binary": "/bin/false", "pgrp": absent_pid,
+                                                  "socket": str(socket_path),
+                                                  "socket_dev": metadata.st_dev,
+                                                  "socket_ino": metadata.st_ino + 1},
+                  "guest": None, "guest_reconciled": False, "runtime": None,
+                  "config_hash": None}
+        self.record.write_text(json.dumps(record))
+        self.record.chmod(0o600)
+        with self.assertRaises(auth_owner.AuthOwnerError):
+            guardian._release_when_quiescent(self.store, SimpleNamespace(pid=absent_pid))
+        self.assertTrue(self.record.exists())
+
+    def test_legacy_acquire_never_mutates_schema_two_record(self) -> None:
+        auth_owner.stage(self.store)
+        socket_path = self.root / "control.sock"
+        listener = socket_module.socket(socket_module.AF_UNIX)
+        listener.bind(str(socket_path))
+        self.addCleanup(listener.close)
+        metadata = socket_path.stat()
+        record = {"schema": 2, "state": "active", "guardian": auth_owner._identity_for(os.getpid()),
+                  "runtime": str(self.runtime_a), "config_hash": "", "child": None,
+                  "daemon": {"socket": str(socket_path), "socket_dev": metadata.st_dev,
+                             "socket_ino": metadata.st_ino}}
+        self.record.write_text(json.dumps(record))
+        self.record.chmod(0o600)
+        original = self.record.read_bytes()
+        with self.assertRaises(auth_owner.AuthBusy):
+            auth_owner.acquire(self.runtime_a, "foreground")
+        self.assertEqual(self.record.read_bytes(), original)
+        with self.assertRaises(auth_owner.AuthOwnerError):
+            auth_owner.release(None)
+        self.assertEqual(self.record.read_bytes(), original)
+
+    def test_legacy_release_cannot_delete_pending_schema_two_record(self) -> None:
+        auth_owner.stage(self.store)
+        self.record.write_text(json.dumps({"schema": 2, "state": "pending",
+                                           "guardian": auth_owner._identity_for(os.getpid()),
+                                           "child": None, "daemon": None}))
+        self.record.chmod(0o600)
+        original = self.record.read_bytes()
+        with self.assertRaises(auth_owner.AuthOwnerError):
+            auth_owner.release(None)
+        self.assertEqual(self.record.read_bytes(), original)
+
+    def test_reused_child_pid_blocks_schema_two_release(self) -> None:
+        from ihar.codex import guardian
+        auth_owner.stage(self.store)
+        absent_pid = 2147483647
+        self.record.write_text(json.dumps({"schema": 2, "state": "active",
+                                           "guardian": auth_owner._identity_for(os.getpid()),
+                                           "child": {"pid": absent_pid, "start": "old-start",
+                                                     "binary": "/bin/false", "pgrp": absent_pid},
+                                           "guest": None, "daemon": None, "runtime": None}))
+        self.record.chmod(0o600)
+        original = self.record.read_bytes()
+        table = auth_owner._process_table()
+        table[absent_pid] = {"pid": absent_pid, "ppid": 1, "pgrp": 1, "status": "R",
+                             "start": "reused-start", "exe": "/bin/false", "argv": [],
+                             "name": "unrelated"}
+        with mock.patch.object(auth_owner, "_process_table", return_value=table):
+            with self.assertRaises(auth_owner.AuthOwnerError):
+                guardian._release_when_quiescent(self.store, SimpleNamespace(pid=absent_pid))
+        self.assertEqual(self.record.read_bytes(), original)
+
+    def test_schema_two_pid_reuse_keeps_original_record(self) -> None:
+        auth_owner.stage(self.store)
+        record = {"schema": 2, "state": "pending",
+                  "guardian": dict(auth_owner._identity_for(os.getpid()), start="reused-pid"),
+                  "child": None}
+        self.record.write_text(json.dumps(record))
+        self.record.chmod(0o600)
+        original = self.record.read_bytes()
+        contender = self._guardian("raise SystemExit(23)")
+        self.assertEqual(contender.wait(timeout=3), 3)
+        self.assertEqual(self.record.read_bytes(), original)
+        self.assertIn("cannot be verified", contender.stderr.read())
+
+    def test_external_codex_without_explicit_home_uses_independent_default(self) -> None:
+        binary = self.root / "default-home-codex"
+        binary.write_text("#!/bin/sh\nsleep 30\n")
+        binary.chmod(0o700)
+        environment = dict(os.environ)
+        environment.pop("CODEX_HOME", None)
+        external = subprocess.Popen([str(binary)], env=environment, start_new_session=True)
+        def stop_external() -> None:
+            try:
+                os.killpg(external.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            external.wait(timeout=5)
+        self.addCleanup(stop_external)
+        contender = self._guardian("raise SystemExit(23)")
+        self.assertEqual(contender.wait(timeout=3), 23, contender.stderr.read())
+        self.assertFalse(self.record.exists())
+
+    def test_bound_daemon_survives_initiating_child_and_holds_owner(self) -> None:
+        auth_owner.stage(self.store)
+        (self.runtime_a / "auth.json").symlink_to(self.store / "auth" / "codex" / "auth.json")
+        directory = self.runtime_a / "app-server-control"
+        directory.mkdir()
+        daemon_pid = self.root / "daemon.pid"
+        socket_path = directory / "app-server-control.sock"
+        daemon_code = ("import os,signal,socket,sys,time; s=socket.socket(socket.AF_UNIX); "
+                       "s.bind(sys.argv[1]); s.listen(); "
+                       "signal.signal(signal.SIGTERM, lambda *_: (s.close(),os.unlink(sys.argv[1]),sys.exit(0))); "
+                       "time.sleep(30)")
+        script = ("import os,subprocess,sys,time; from pathlib import Path; "
+                  "from ihar.codex import guardian; "
+                  "fd=int(os.environ['IHAR_GUARD_FD']); "
+                  f"guardian.request(fd,'bind-runtime',{{'runtime':{str(self.runtime_a)!r},'config_hash':'hash-a'}}); "
+                  f"p=subprocess.Popen([sys.executable,'-c',{daemon_code!r},{str(socket_path)!r}],"
+                  "start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+                  f"Path({str(daemon_pid)!r}).write_text(str(p.pid)); "
+                  f"sock=Path({str(socket_path)!r}); "
+                  "[(time.sleep(.02)) for _ in range(100) if not sock.exists()]; "
+                  f"guardian.request(fd,'bind-daemon',{{'pid':p.pid,'binary':sys.executable,'socket':{str(socket_path)!r}}})")
+        process = self._guardian(script)
+        self._wait_for(daemon_pid)
+        self._wait_for(socket_path)
+        try:
+            for _ in range(100):
+                if self.record.exists() and json.loads(self.record.read_text()).get("daemon"):
+                    break
+                time.sleep(.02)
+            self.assertIsNotNone(json.loads(self.record.read_text())["daemon"])
+            self.assertIsNone(process.poll())
+            contender = self._guardian("raise SystemExit(23)")
+            self.assertEqual(contender.wait(timeout=3), 3)
+            self.assertIn("owns the shared login", contender.stderr.read())
+        finally:
+            try:
+                os.killpg(int(daemon_pid.read_text()), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
+        self.assertFalse(self.record.exists())
+
+    def test_guest_without_reconciliation_blocks_after_exit(self) -> None:
+        guest_pid = self.root / "guest.pid"
+        script = ("import os,subprocess,sys; from pathlib import Path; "
+                  "from ihar.codex import guardian; "
+                  "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],"
+                  "start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+                  f"Path({str(guest_pid)!r}).write_text(str(p.pid)); "
+                  "guardian.request(int(os.environ['IHAR_GUARD_FD']),'register-guest',"
+                  "{'pid':p.pid,'binary':sys.executable})")
+        process = self._guardian(script)
+        self._wait_for(guest_pid)
+        for _ in range(100):
+            if self.record.exists() and json.loads(self.record.read_text()).get("guest"):
+                break
+            time.sleep(.02)
+        self.assertIsNotNone(json.loads(self.record.read_text())["guest"])
+        self.assertIsNone(process.poll())
+        try:
+            os.killpg(int(guest_pid.read_text()), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        self.assertEqual(process.wait(timeout=5), 3)
+        self.assertEqual(json.loads(self.record.read_text())["state"], "blocked")
+
+    def test_guest_release_claim_without_durable_proof_is_refused(self) -> None:
+        refused = self.root / "guest-release-refused"
+        script = f"""import os, subprocess, sys
+from pathlib import Path
+from ihar.codex import guardian
+from ihar.codex.auth_owner import AuthOwnerError
+fd = int(os.environ['IHAR_GUARD_FD'])
+p = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(.3)'], start_new_session=True)
+guardian.request(fd, 'register-guest', {{'pid': p.pid, 'binary': sys.executable}})
+p.wait()
+try:
+    guardian.request(fd, 'release', {{'guest_reconciled': True}})
+except AuthOwnerError:
+    Path({str(refused)!r}).touch()
+"""
+        process = self._guardian(script)
+        self.assertEqual(process.wait(timeout=5), 3, process.stderr.read())
+        self.assertTrue(refused.exists())
+        self.assertEqual(json.loads(self.record.read_text())["state"], "blocked")
 
     def test_second_runtime_cannot_own_login(self) -> None:
         first = auth_owner.acquire(self.runtime_a, "foreground")

@@ -190,6 +190,8 @@ def _external_consumer_present(store: Path, table: dict[int, dict]) -> bool:
                 environment = (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0")
                 home = next((os.fsdecode(value[11:]) for value in environment
                              if value.startswith(b"CODEX_HOME=")), None)
+                default_root = next((os.fsdecode(value[5:]) for value in environment
+                                     if value.startswith(b"HOME=")), None)
             else:
                 answer = subprocess.run(["/bin/ps", "-Eww", "-p", str(pid), "-o", "command="],
                                         capture_output=True, text=True, timeout=5)
@@ -198,12 +200,17 @@ def _external_consumer_present(store: Path, table: dict[int, dict]) -> bool:
                 marker = "CODEX_HOME="
                 home = next((part[len(marker):] for part in answer.stdout.split()
                              if part.startswith(marker)), None)
+                default_root = next((part[5:] for part in answer.stdout.split()
+                                     if part.startswith("HOME=")), None)
         except FileNotFoundError:
             continue
         except (OSError, subprocess.SubprocessError) as error:
             raise AuthOwnerError("external Codex consumer cannot be verified") from error
-        if not home:
-            continue
+        implicit_home = home is None
+        if implicit_home:
+            if not default_root or not os.path.isabs(default_root):
+                raise AuthBusy("external Codex consumer runtime cannot be verified")
+            home = os.path.join(default_root, ".codex")
         if not os.path.isabs(home):
             raise AuthOwnerError("external Codex consumer runtime cannot be verified")
         if os.path.abspath(home) == str(store / "auth" / "codex"):
@@ -214,7 +221,7 @@ def _external_consumer_present(store: Path, table: dict[int, dict]) -> bool:
         except FileNotFoundError:
             continue
         except OSError as error:
-            if os.path.exists(os.path.join(home, "auth.json")):
+            if not implicit_home and os.path.exists(os.path.join(home, "auth.json")):
                 raise AuthOwnerError("external Codex consumer auth path cannot be verified") from error
     return False
 
@@ -259,7 +266,7 @@ def _read_owner(owner: int) -> dict | None:
             or metadata.st_size > 8192):
             raise AuthOwnerError("Codex auth owner record is unsafe")
         record = json.loads(os.read(descriptor, 8193))
-        if not isinstance(record, dict) or record.get("schema") != 1:
+        if not isinstance(record, dict) or record.get("schema") not in (1, 2):
             raise AuthOwnerError("Codex auth owner record is invalid")
         return record
     except (ValueError, OSError) as error:
@@ -313,6 +320,10 @@ def acquire(runtime: str | os.PathLike[str], mode: str, *,
         _guard_no_pending(owner)
         existing = _read_owner(owner)
         if existing is not None:
+            if existing["schema"] == 2:
+                if owner_identity_proven(existing):
+                    raise AuthBusy("another Codex runtime owns the shared login")
+                raise AuthOwnerError("Codex auth owner cannot be verified")
             if not owner_identity_proven(existing):
                 raise AuthOwnerError("Codex auth owner cannot be verified")
             if owner_is_active(existing):
@@ -353,7 +364,7 @@ def _update_owner(owner_id: str, update, *, store: str | os.PathLike[str] | None
     with ExitStack() as stack:
         owner = _locked_owner(_lease_store(store), stack)
         record = _read_owner(owner)
-        if record is None or record.get("id") != owner_id:
+        if record is None or record.get("schema") != 1 or record.get("id") != owner_id:
             raise AuthOwnerError("Codex auth owner ID does not match")
         update(record, owner)
 
@@ -376,7 +387,8 @@ def daemon_owner_id(runtime: str | os.PathLike[str], *,
     with ExitStack() as stack:
         owner = _locked_owner(_lease_store(store), stack)
         record = _read_owner(owner)
-        if (record is None or record.get("runtime") != os.path.abspath(runtime)
+        if (record is None or record.get("schema") != 1
+            or record.get("runtime") != os.path.abspath(runtime)
             or not owner_identity_proven(record) or not _daemon_socket_proven(record)
             or not owner_is_active(record)):
             raise AuthOwnerError("Codex daemon auth owner cannot be verified")
@@ -389,7 +401,8 @@ def daemon_stop_owner_id(runtime: str | os.PathLike[str], *,
     with ExitStack() as stack:
         owner = _locked_owner(_lease_store(store), stack)
         record = _read_owner(owner)
-        if (record is None or record.get("runtime") != os.path.abspath(runtime)
+        if (record is None or record.get("schema") != 1
+            or record.get("runtime") != os.path.abspath(runtime)
             or record.get("mode") != "daemon" or not record.get("daemon")
             or (record.get("state") != "quiescent" and not owner_identity_proven(record))):
             raise AuthOwnerError("Codex daemon auth owner cannot be verified")
