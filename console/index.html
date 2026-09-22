@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<!--
+  The console window (LLD 13.2). Everything it loads is served by the broker from the
+  pinned asset directory: no CDN, no network at runtime, nothing that would make a local
+  tool depend on being online.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ihar console</title>
+<link rel="stylesheet" href="/static/xterm.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<aside id="sidebar">
+  <header>
+    <span class="title">ihar</span>
+    <button id="refresh" title="Rebuild the list now">refresh</button>
+  </header>
+  <div id="projects"></div>
+  <footer>
+    <span id="reach" title="One token starts launches in each of these projects"></span>
+  </footer>
+</aside>
+
+<main>
+  <nav id="tabs"></nav>
+  <section id="panes">
+    <div id="terminal"></div>
+    <div id="history" hidden>
+      <header>
+        <span id="history-title">history</span>
+        <button data-close="history">close</button>
+      </header>
+      <div id="history-items"></div>
+    </div>
+    <div id="check" hidden>
+      <header>
+        <span id="check-title">check</span>
+        <button data-close="check">close</button>
+      </header>
+      <pre id="check-body"></pre>
+    </div>
+  </section>
+  <div id="empty">
+    <p>No tab open.</p>
+    <p>Pick a project on the left to launch an agent, or a session to read its history.</p>
+  </div>
+</main>
+
+<dialog id="launch">
+  <form method="dialog">
+    <p id="launch-project"></p>
+    <label>Agent
+      <select id="launch-vendor">
+        <option value="claude">claude</option>
+        <option value="codex">codex</option>
+      </select>
+    </label>
+    <menu>
+      <button value="cancel">cancel</button>
+      <button id="launch-go" value="go">launch</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="switch">
+  <form method="dialog">
+    <p id="switch-session"></p>
+    <label>Continue in
+      <select id="switch-vendor">
+        <option value="codex">codex</option>
+        <option value="claude">claude</option>
+      </select>
+    </label>
+    <label>History
+      <select id="switch-history">
+        <option value="summary">summary — the package alone</option>
+        <option value="transcript">transcript — plus a masked export to read</option>
+      </select>
+    </label>
+    <menu>
+      <button value="cancel">cancel</button>
+      <button id="switch-go" value="go">switch</button>
+    </menu>
+  </form>
+</dialog>
+
+<script src="/static/xterm.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
