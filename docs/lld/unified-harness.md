@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 21 (masking throughput measured; a failed analysis is refused instead of silently downgraded) |
+| Status | revision 22 (the masking engine ships: two pinned language models, patterns first, named entities on top) |
 | Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -665,7 +665,13 @@ Engine (`ihar.mask.engine`): Presidio with spaCy when available, the iclaude reg
 
 **Throughput, measured rather than assumed.** On transcript-shaped text — prose with paths, identifiers, an address and a planted credential — the presidio engine ran at 0.012 to 0.016 MiB/s (64 KiB in 3.99 s, 256 KiB in 20.58 s) and the regex engine at about 6 MiB/s, linearly to 2 MiB. Two consequences are already in force: the handoff transcript budget is 256 KiB rather than 2 MB (§11.2), which is roughly twenty seconds in the slow engine and stays under the hard limit; and a gateway body large enough to matter now refuses rather than degrades.
 
-**What ships today is the regex engine.** This checkout has no `lib/python/requirements.lock`, so `ihar install` installs no Python dependency at all and `AnalyzerEngine` never imports; `ihar check` reports `engine: regex` truthfully. The presidio numbers above were taken in a scratch environment, so they describe what would happen once the dependency is delivered, not what happens now. Plan task X2.4 owns that gap.
+**The dependency ships, pinned and hashed.** `lib/python/requirements.lock` is compiled by `uv pip compile --generate-hashes` from `requirements.in`, and carries 54 packages with sha256 hashes, including both spaCy models by release URL. `ihar install` installs it into the store venv — including into a venv that already exists, which is what previously left every store on the patterns while the documents described Presidio. A machine that cannot install it warns and falls back, and `ihar check` names the engine that actually ran.
+
+**Both languages are pinned, and the small models are the measured choice.** `en_core_web_sm` (12 MiB) and `ru_core_news_sm` (15 MiB) run at 0.016 to 0.030 MiB/s; `en_core_web_lg` (382 MiB) and `ru_core_news_lg` (490 MiB) run at 0.012 to 0.016. The large pair costs thirty-two times the download to be no faster, so the small pair ships and the lockfile is where that choice can be reversed in one line. Russian is pinned because the project writes in both languages and an engine that knew only English would miss a Russian name while every report said the same word.
+
+**Two layers, in this order.** The patterns run first and always, then the named-entity engine on the already-masked text. Measured on 2026-09-22: Presidio alone mangles an address, because its URL recognizer matches fragments and replacing by offsets leaves the rest visible — `X-urlith@X-urlvalid` in English, `X-urlrov@X-urlvalid` in Russian. Using it instead of the patterns, which is what the code did before, would have been a regression on email. Language comes from the script the text is written in, never from a configured hint: Cyrillic gets the Russian pass, Latin the English one, text with both gets both.
+
+**Limits of this construction, measured rather than assumed.** In mixed-language text a name in the minority language can survive, because each pass sees the whole text and a model reads its own language's context; the sample `Иван wrote to John from Berlin` masked the English span and left the Russian name. And a token the patterns already inserted can be caught again by the named-entity pass and reported under a second kind, which over-reports `kinds` without exposing anything. Both are named here rather than discovered later.
 
 ### 8.5 Transparent mode spike: no-go
 
@@ -1172,7 +1178,6 @@ Revision 12 records only choices supported by the approved artifacts and reviewe
 
 Revision 13 opened three. The terminal asset pin is now answered and closed: `xterm.js` 5.5.0 is vendored at `console/vendor/xterm.js`, sha256 `1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495`, with its stylesheet at `ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6`; both digests were taken from the installed files and are recorded in the release lockfile, which the broker verifies before serving. Two remain, each owned by the slice that must measure it rather than assume it:
 
-- **The masking engine is not installed by anything (plan task X2.4).** `lib/python/ihar/mask/engine.py` selects Presidio when it imports, and §1.4's `protected` guarantee is written against that engine, but this checkout carries no `lib/python/requirements.lock`, so `ihar install` builds an empty venv and the regex fallback is always what runs. `ihar check` reports it truthfully, so nothing is overclaimed today; what is undelivered is the dependency, and with it the difference between a named-entity engine and a pattern list. Whether to ship it — and at which spaCy model, given the 400 MB `en_core_web_lg` the analyzer pulls by default — is the decision X2.4 owes.
 - **ACP tab promotion (S13).** claude-agent-acp #144 and codex-acp #310/#477 decide whether an ACP tab can ever be offered under an enforced profile. The question is now asked by `ihar check --acp-promotion` rather than by hand, and on 2026-09-22 it answered `not promotable` with all three issues open and the behavioural half unmeasurable here. Two things must still be produced by a machine that has the adapters and vendor credentials: a passing `claude-hooks-fire` probe, and a measured run of `codex-acp` from which the `codex-config-survives` assertion can finally be written.
 
 ## 21. Disposition of the architecture review

@@ -7,16 +7,26 @@ two that have to agree.
 Failure class: the caller's. This module masks or reports that it cannot; refusing a
 request is the gateway's decision.
 
-Presidio is used when it imports, and a regex engine is the fallback. That is not a
-silent degradation: `describe()` reports which engine is active and `ihar check`
-prints it, because "standard" masking backed by regexes alone is a weaker promise
-than the same word backed by named-entity recognition.
+The two layers run in order, and both always run at `standard`. Measured on 2026-09-22:
+Presidio alone mangles an address, because its URL recognizer matches fragments of one
+and replacing by offsets then leaves the rest visible — `X-urlith@X-urlvalid` in English
+and `X-urlrov@X-urlvalid` in Russian. The tuned patterns match a whole address, so they
+run first and Presidio adds names, places and organisations on top of already-masked
+text. Using Presidio instead of the patterns would have been a regression on email.
+
+Language is chosen by the script the text is written in, not by a configured hint: a
+Russian name in a session labelled English must not survive because a setting said so.
+Cyrillic gets the Russian pass, Latin the English one, and a text carrying both gets
+both. `describe()` names the engine and the languages, and `ihar check` prints it,
+because "standard" masking backed by patterns alone is a weaker promise than the same
+word backed by named-entity recognition.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import unicodedata
 
 from ._shared import SECRET_PATTERNS
 
@@ -59,10 +69,12 @@ class Masker:
         if level != "off" and engine == "presidio":
             self._analyzer = _load_presidio()
             if self._analyzer is not None:
-                self._engine = "presidio"
+                self._engine = "presidio(" + ",".join(
+                    code for code, _ in LANGUAGE_MODELS) + ")+regex"
 
     def describe(self) -> dict:
         return {"level": self.level, "engine": self._engine}
+
 
     def secrets_only(self, text: str) -> tuple[str, list[str]]:
         """Credentials only, leaving everything else untouched.
@@ -82,13 +94,37 @@ class Masker:
         text, kinds = _apply(text, SECRET_PATTERNS, self.token)
         if self.level == "secrets":
             return text, kinds
-        if self._analyzer is not None:
-            text, found = _presidio_mask(self._analyzer, text, self.token)
-            kinds.extend(found)
-            return text, kinds
+        # The patterns always run: they match a whole address, which the named-entity
+        # engine does not (see the module docstring).
         text, found = _apply(text, _PII_PATTERNS, self.token)
         kinds.extend(found)
+        if self._analyzer is not None:
+            for language in languages_for(text):
+                text, named = _presidio_mask(self._analyzer, text, self.token, language)
+                kinds.extend(named)
         return text, kinds
+
+
+def languages_for(text: str) -> tuple[str, ...]:
+    """The languages worth analysing this text in, from the scripts it uses."""
+    cyrillic = latin = False
+    for character in text:
+        if not character.isalpha():
+            continue
+        try:
+            name = unicodedata.name(character)
+        except ValueError:
+            continue
+        cyrillic = cyrillic or name.startswith("CYRILLIC")
+        latin = latin or name.startswith("LATIN")
+        if cyrillic and latin:
+            break
+    languages = []
+    if cyrillic:
+        languages.append("ru")
+    if latin:
+        languages.append("en")
+    return tuple(languages) or ("en",)
 
 
 def _apply(text: str, patterns, token: str) -> tuple[str, list[str]]:
@@ -100,15 +136,32 @@ def _apply(text: str, patterns, token: str) -> tuple[str, list[str]]:
     return text, kinds
 
 
+LANGUAGE_MODELS = (("en", "en_core_web_sm"), ("ru", "ru_core_news_sm"))
+
+
 def _load_presidio():
+    """Build the two-language analyzer, or report that there is none.
+
+    Both models are pinned by `lib/python/requirements.lock`. A build that cannot load
+    them falls back to the patterns rather than to one language: an analyzer that
+    silently knew only English would mask a Russian transcript worse while every report
+    still said the same word.
+    """
     if os.environ.get("IHAR_GATEWAY_ENGINE") == "regex":
         return None
     try:
-        from presidio_analyzer import AnalyzerEngine       # type: ignore
+        from presidio_analyzer import AnalyzerEngine              # type: ignore
+        from presidio_analyzer.nlp_engine import NlpEngineProvider  # type: ignore
     except Exception:                                      # noqa: BLE001
         return None
     try:
-        return AnalyzerEngine()
+        provider = NlpEngineProvider(nlp_configuration={
+            "nlp_engine_name": "spacy",
+            "models": [{"lang_code": code, "model_name": name}
+                       for code, name in LANGUAGE_MODELS],
+        })
+        return AnalyzerEngine(nlp_engine=provider.create_engine(),
+                              supported_languages=[code for code, _ in LANGUAGE_MODELS])
     except Exception:                                      # noqa: BLE001
         # Installed but unusable, typically a missing language model. Falling back is
         # right; pretending it worked is not, which is why describe() reports the
@@ -116,12 +169,13 @@ def _load_presidio():
         return None
 
 
-def _presidio_mask(analyzer, text: str, token: str) -> tuple[str, list[str]]:
+def _presidio_mask(analyzer, text: str, token: str, language: str = "en") -> tuple[str, list[str]]:
     try:
-        results = analyzer.analyze(text=text, language="en")
+        results = analyzer.analyze(text=text, language=language)
     except Exception as error:                             # noqa: BLE001
         raise MaskingUnavailable(
-            f"the presidio engine could not analyse {len(text)} characters: {error}"
+            f"the presidio engine could not analyse {len(text)} characters "
+            f"as {language}: {error}"
         ) from error
     kinds: list[str] = []
     # Replace from the end so earlier offsets stay valid.

@@ -414,25 +414,36 @@ ihar_install_python() {
   fi
 
   local python="$IHAR_STORE/venv/bin/python3"
-  if [[ -x "$python" ]]; then
-    ihar_info "python environment already present"
-    return 0
-  fi
-
-  if [[ -x "$uv" ]]; then
-    "$uv" venv --quiet "$IHAR_STORE/venv" 2>/dev/null || true
-  fi
   if [[ ! -x "$python" ]]; then
-    python3 -m venv "$IHAR_STORE/venv" 2>/dev/null \
-      || { ihar_warn "no python environment could be created; the regex masking engine will be used"; return 0; }
+    if [[ -x "$uv" ]]; then
+      "$uv" venv --quiet "$IHAR_STORE/venv" 2>/dev/null || true
+    fi
+    if [[ ! -x "$python" ]]; then
+      python3 -m venv "$IHAR_STORE/venv" 2>/dev/null \
+        || { ihar_warn "no python environment could be created; the regex masking engine will be used"; return 0; }
+    fi
   fi
 
-  # Presidio is optional by design. Without it the masking engine falls back to
-  # regexes and says so in `ihar check`, which is a weaker promise honestly reported
-  # rather than a failed install.
-  if [[ -f "$IHAR_ROOT/lib/python/requirements.lock" ]]; then
-    "$IHAR_STORE/venv/bin/pip" install --quiet -r "$IHAR_ROOT/lib/python/requirements.lock" \
-      2>/dev/null || ihar_warn "optional python packages were not installed; the regex engine will be used"
+  # The lock is installed even into a venv that already exists. Returning early on a
+  # present interpreter is what left every store on the regex engine while the
+  # documents described Presidio: the environment was there, so the dependency the
+  # guarantee rests on was never fetched.
+  local lock="$IHAR_ROOT/lib/python/requirements.lock"
+  if [[ -f "$lock" ]]; then
+    local installed=1
+    # uv first: a uv-created venv has no pip, and uv verifies the same hashes.
+    if [[ -x "$uv" ]]; then
+      "$uv" pip install --quiet --python "$python" -r "$lock" 2>/dev/null && installed=0
+    fi
+    if (( installed != 0 )) && [[ -x "$IHAR_STORE/venv/bin/pip" ]]; then
+      "$IHAR_STORE/venv/bin/pip" install --quiet -r "$lock" 2>/dev/null && installed=0
+    fi
+    if (( installed != 0 )); then
+      # Fail-soft by design: the engine falls back to the patterns and says so in
+      # `ihar check`, which is a weaker promise honestly reported rather than a
+      # failed install. It is a warning, not a silence.
+      ihar_warn "the masking engine's packages were not installed; the regex engine will be used"
+    fi
   fi
   ihar_info "python environment ready"
 }
