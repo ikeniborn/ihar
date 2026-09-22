@@ -25,6 +25,8 @@ from . import auth_owner
 
 
 _MAX_MESSAGE = 4096
+_MAX_PENDING_CONTROL_CLIENTS = 8
+_CONTROL_CLIENT_TTL = 5.0
 _FD_ENV = "IHAR_GUARD_FD"
 _REPORT_ENV = "IHAR_GUARD_REPORT_FD"
 _BOOT = (
@@ -621,7 +623,8 @@ def run(store: Path, argv: list[str]) -> int:
         listener = sockets.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
         listener.bind(str(control_path))
         os.chmod(control_path, 0o600)
-        listener.listen(8)
+        listener.listen(_MAX_PENDING_CONTROL_CLIENTS)
+        listener.setblocking(False)
         metadata = os.stat(control_path, follow_symlinks=False)
         with ExitStack() as stack:
             owner = auth_owner._locked_owner(selected, stack)
@@ -660,6 +663,7 @@ def run(store: Path, argv: list[str]) -> int:
             status = None
             reported = False
             channel_open = True
+            pending_control: dict[socket.socket, float] = {}
             while True:
                 if status is None:
                     status = child.poll()
@@ -685,20 +689,45 @@ def run(store: Path, argv: list[str]) -> int:
                             os.dup2(descriptor, sys.stdout.fileno())
                             os.dup2(descriptor, sys.stderr.fileno())
                             os.close(descriptor)
-                readable, _, _ = select.select(([server] if channel_open else []) + [listener],
-                                               [], [], .05 if channel_open else .2)
+                now = time.monotonic()
+                for connection, deadline in list(pending_control.items()):
+                    if deadline <= now:
+                        connection.close()
+                        del pending_control[connection]
+                timeout = .05 if channel_open else .2
+                if pending_control:
+                    timeout = min(timeout, max(0, min(pending_control.values()) - now))
+                readable, _, _ = select.select(
+                    ([server] if channel_open else []) + [listener, *pending_control],
+                    [], [], timeout)
                 if server in readable:
                     channel_open = _handle(selected, server, os.getpid())
                     if not channel_open:
                         server.close()
+                for connection in list(pending_control):
+                    if connection not in readable:
+                        continue
+                    del pending_control[connection]
+                    try:
+                        _handle(selected, connection, os.getpid(), external=True)
+                    finally:
+                        connection.close()
                 if listener in readable:
-                    connection, _ = listener.accept()
-                    with connection:
+                    try:
+                        connection, _ = listener.accept()
+                    except BlockingIOError:
+                        pass
+                    else:
                         connection.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
-                        readable_connection, _, _ = select.select([connection], [], [], 0.25)
-                        if readable_connection:
-                            _handle(selected, connection, os.getpid(), external=True)
+                        connection.setblocking(False)
+                        if len(pending_control) >= _MAX_PENDING_CONTROL_CLIENTS:
+                            connection.close()
+                        else:
+                            pending_control[connection] = (time.monotonic()
+                                                           + _CONTROL_CLIENT_TTL)
         finally:
+            for connection in pending_control:
+                connection.close()
             for number, handler in previous_handlers.items():
                 signal.signal(number, handler)
 

@@ -1240,6 +1240,43 @@ else:
         self.assertIsInstance(result[0], dict)
         self.assertEqual(result[0]["status"], "stopped")
 
+    def test_delayed_authenticated_control_client_is_served(self) -> None:
+        _process, binary, _env = self._start_guarded_review_daemon()
+        from ihar.codex import guardian
+        with socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_SEQPACKET) as channel:
+            channel.connect(str(self.store / "auth" / "codex" / ".guardian.sock"))
+            time.sleep(2.25)
+            answer = guardian._exchange(
+                channel, self.store, "daemon-stop",
+                {"runtime": str(self.runtime_a), "binary": str(binary)})
+        self.assertEqual(answer["answer"]["status"], "stopped")
+
+    def test_pending_control_client_limit_rejects_excess_and_recovers(self) -> None:
+        _process, binary, env = self._start_guarded_review_daemon()
+        from ihar.codex import daemon, guardian
+        path = str(self.store / "auth" / "codex" / ".guardian.sock")
+        idle: list[socket_module.socket] = []
+        try:
+            for _ in range(guardian._MAX_PENDING_CONTROL_CLIENTS):
+                connection = socket_module.socket(socket_module.AF_UNIX,
+                                                  socket_module.SOCK_SEQPACKET)
+                connection.connect(path)
+                idle.append(connection)
+            time.sleep(0.2)
+            with socket_module.socket(socket_module.AF_UNIX,
+                                      socket_module.SOCK_SEQPACKET) as excess:
+                excess.settimeout(2)
+                excess.connect(path)
+                self.assertEqual(excess.recv(1), b"")
+            idle.pop().close()
+            with mock.patch.dict(os.environ, env):
+                answer = daemon.stop(str(binary), str(self.runtime_a),
+                                     auth_store=str(self.store))
+        finally:
+            for connection in idle:
+                connection.close()
+        self.assertEqual(answer["status"], "stopped")
+
     def test_control_refuses_other_runtime_and_writer_attachment(self) -> None:
         self._start_guarded_review_daemon()
         from ihar.codex import guardian
