@@ -133,7 +133,9 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
   # 8b. Create the control-plane identity before either vendor starts. The hook
   # claims it using its own payload session id, never the daemon's environment.
   if [[ "${IHAR_ACP_MODE:-false}" != true ]]; then
-    IHAR_LAUNCH_ID="${IHAR_HANDOFF_TARGET_ID:-${IHAR_RESUME_IHAR_ID:-$(ihar_uuid)}}"; export IHAR_LAUNCH_ID
+    # A console tab is minted by the broker so its record and the session index agree on
+    # one id; the handoff and resume ids keep precedence over it (LLD 13.2).
+    IHAR_LAUNCH_ID="${IHAR_HANDOFF_TARGET_ID:-${IHAR_RESUME_IHAR_ID:-${IHAR_CONSOLE_LAUNCH_ID:-$(ihar_uuid)}}}"; export IHAR_LAUNCH_ID
     ihar_handoff_prepare "$vendor"
   fi
 

@@ -94,7 +94,7 @@ raise RuntimeError('boom')
 
 base='{"schema":1,"name":"x","guarantee":"g","hooks":"best-effort","gateway":"off",
        "masking_level":"off","sandbox":"vendor-default","netpolicy":None,"remote":[],
-       "mcp":{"strict":False},"acp":"allow","env_passthrough":[],
+       "mcp":{"strict":False},"acp":"allow","console":"allow","env_passthrough":[],
        "handoff":{"system_prompt":False}}'
 
 reject "masking above off with no gateway is rejected" profile \

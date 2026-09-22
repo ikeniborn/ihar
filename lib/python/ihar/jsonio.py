@@ -477,6 +477,8 @@ KINDS: dict[str, dict[str, Any]] = {
             "remote": {"type": list, "items": {"type": str, "enum": _VENDOR}},
             "mcp": {"type": dict, "fields": {"strict": {"type": bool}}},
             "acp": {"type": str, "enum": ("allow", "refuse")},
+            # Gates the console tab, not the browser: the tab kind then follows `acp`.
+            "console": {"type": str, "enum": ("allow", "refuse")},
             "env_passthrough": {"type": list, "items": {"type": str, "pattern": _ENVVAR}},
             "handoff": {"type": dict, "fields": {"system_prompt": {"type": bool}}},
         },
@@ -695,6 +697,40 @@ KINDS: dict[str, dict[str, Any]] = {
                 },
             },
             "summary": {"type": str},
+        },
+        "rules": [],
+    },
+    # LLD 13.2
+    "console-daemon": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "pid": {"type": int, "min": 1},
+            "port": {"type": int, "min": 1, "max": 65535},
+            # Only the digest: the token itself lives in its own 600 file, so a record a
+            # reader may copy for diagnostics never carries the credential.
+            "token_sha256": {"type": str, "pattern": _SHA256},
+            # Null in a checkout with no install receipt, where there is no release to name.
+            "release_digest": {"type": (str, type(None)), "pattern": _SHA256},
+            "started_at": {"type": str, "pattern": _TS},
+            "max_sessions": {"type": int, "min": 1},
+        },
+        "rules": [],
+    },
+    # LLD 13.2. Metadata only, like the session index: no field here can hold output.
+    "console-session": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "sid": {"type": str, "pattern": r"[0-9a-f]{12}"},
+            "ihar_id": {"type": str, "pattern": _UUID},
+            "kind": {"type": str, "enum": ("pty", "acp")},
+            "vendor": {"type": str, "enum": _VENDOR},
+            "state_id": {"type": str, "pattern": _HASH8},
+            "project_root": {"type": str, "min_len": 1},
+            "profile": {"type": str, "pattern": _SLUG},
+            "pid": {"type": int, "min": 1},
+            "socket": {"type": str, "min_len": 1},
+            "started_at": {"type": str, "pattern": _TS},
+            "exit_code": {"type": (int, type(None))},
         },
         "rules": [],
     },
@@ -925,6 +961,15 @@ KINDS: dict[str, dict[str, Any]] = {
             "handoff": {"type": dict, "fields": {
                 "exports": {"type": int, "min": 0},
                 "bytes": {"type": int, "min": 0},
+            }},
+            # The console's reach is a fact, not a promise: one token starts launches in
+            # every project state it lists, which is wider than any single launch.
+            "console": {"type": dict, "fields": {
+                "state": {"type": str, "enum": ("running", "stopped")},
+                "port": {"type": (int, type(None)), "min": 1, "max": 65535},
+                "live_sessions": {"type": int, "min": 0},
+                "token_present": {"type": bool},
+                "reach": {"type": list, "items": {"type": str, "pattern": _HASH8}},
             }},
             "vendors": {"type": dict, "fields": {
                 vendor: {"type": dict, "fields": {

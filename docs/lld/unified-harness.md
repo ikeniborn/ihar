@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 15 (inline-script convention of the Python helper recorded after a shipped switch defect) |
+| Status | revision 16 (console broker, supervisor and boundary implemented; gate G6 evidenced) |
 | Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -879,11 +879,14 @@ $IHAR_STATE_ROOT/console/
   token                      32 random bytes, urlsafe, 600, rewritten at every start
   s/<sid>.json               per-session record, schema 1, 600
   s/<sid>.sock               per-session control socket, 600
+  broker.err                 the broker's own stderr, so a start that fails can say why
 ```
 
 There is no scrollback file and no transcript file, in this tree or anywhere else. A tab's output lives in the owning supervisor's memory as a bounded ring buffer (`IHAR_CONSOLE_MAX_SESSIONS` tabs, 256 KiB each) and is replayed to a reconnecting browser; when the ring wraps, the tab shows an explicit truncation marker rather than silently losing the top. `<sid>` is the first twelve hex characters of the `ihar_id`, because the socket path enters the same preflight budget as the Codex control socket (§2.2) and a full UUID does not fit it.
 
-**Two processes, and the reason for the second.** The broker serves the browser; a per-session supervisor owns the pseudo-terminal. Without the supervisor a broker restart would send `SIGHUP` to every tab, which is the outcome the daemon decision exists to avoid. Each supervisor is `setsid`-detached, so it survives the broker, and the broker reattaches by reconnecting to `s/<sid>.sock`. The supervisor holds no policy: it opens the pty, spawns the CLI, keeps the ring buffer, forwards input and window size, records the exit code and removes its own record.
+**Two processes, and the reason for the second.** The broker serves the browser; a per-session supervisor owns the pseudo-terminal. Without the supervisor a broker restart would send `SIGHUP` to every tab, which is the outcome the daemon decision exists to avoid. Each supervisor is `setsid`-detached, so it survives the broker, and the broker reattaches by reconnecting to `s/<sid>.sock`. The supervisor holds no policy: it opens the pty, spawns the CLI, keeps the ring buffer, forwards input and window size, and on exit records the code in its own record and removes only its socket. Revision 13 said it removed the record; the implementation keeps it, because a tab that vanishes the instant it exits takes its exit status with it and the sidebar has nothing to show. The record is removed when the user closes the tab.
+
+**A detached daemon closes what it inherited.** `ihar console start` runs under a required lock, held on a file descriptor the broker would otherwise inherit and keep open for its whole life; every later `console stop` then waited ten seconds for a lock whose holder had already exited. The broker therefore closes descriptors 3 upward before it binds. This is measured behaviour, not a precaution: the timeout was observed before the close was added.
 
 ```json
 {"schema": 1, "pid": 4711, "port": 8712, "token_sha256": "…",
@@ -900,9 +903,13 @@ Both records are metadata; `ihar.jsonio.check` rejects an unknown key, and neith
 
 **Broker lifecycle mirrors §5.5, because the failure it prevents is the same one.** `ihar console start` takes the console lock, refuses a second broker for the same user, writes the token and the record, and prints `http://127.0.0.1:<port>/?t=<token>`; the broker exchanges that parameter once for an `HttpOnly; SameSite=Strict` cookie and redirects, so the token is not re-sent on every request. A live broker whose `release_digest` differs from the installed receipt is stopped and restarted rather than serving a window from code that is no longer installed. `ihar update` stops the broker before replacing binaries and restarts it only if it was running, the rule §14.3 already applies to the Codex daemon. Supervisors are not stopped by either path: they are detached, and their tabs reattach to the new broker.
 
-**Access control, all three checks fail-closed.** The listener binds `127.0.0.1` only; a configured bind that is not loopback is exit 2 with the reason named, never a silent downgrade to loopback and never a network bind. Every request and every WebSocket upgrade requires the cookie, compared to the token in constant time; a missing or wrong one is 401. The upgrade additionally requires `Origin` to equal the console's own origin, which closes the cross-site WebSocket path that a token cookie alone would leave open. Remote use is an SSH tunnel, which is the same answer §13.1 gives for `toad serve`.
+**Access control, all three checks fail-closed.** The listener binds `127.0.0.1` only; a bind that is not loopback is exit 2 with the reason named, never a silent downgrade to loopback and never a network bind. The address is a broker flag rather than a project key on purpose: a configuration file that can ask for a network bind invites the refusal to be argued with, while the flag keeps the refusal testable without offering it as a setting. Every request and every WebSocket upgrade requires the cookie, compared to the token in constant time; a missing or wrong one is 401. The upgrade additionally requires `Origin` to equal the console's own origin, which closes the cross-site WebSocket path that a token cookie alone would leave open. Remote use is an SSH tunnel, which is the same answer §13.1 gives for `toad serve`.
+
+**Refusals are HTTP statuses, and the mapping is fixed.** A missing or wrong cookie is 401; a foreign `Origin`, a profile whose `console` is `refuse`, and a profile file that does not validate are all 403, because each ends the same way — the tab does not start — and none of them is a malformed request; the session cap is 409; an unknown tab or route is 404; a body over 64 kB is 413. A refused tab never stops the window, which is why none of these reaches the broker's own exit code.
 
 **Environment.** A console session never inherits the broker's ambient environment, in any profile. The supervisor builds the base environment of §3.4 — `HOME`, `PATH`, `TERM`, `LANG`, `SHELL`, `USER`, `TMPDIR`, `XDG_*` — adds `IHAR_CONSOLE=1`, and lets the CLI apply the profile's own rules from there. Inheriting instead would carry one shell's `AWS_*` and `GITHUB_TOKEN` into every project in the window, which is exactly what a cross-project surface must not do. The consequence is stated rather than hidden: a name a project lists in `env_passthrough` reaches a console tab only if the broker's own environment carried it at start, and the console reads secrets from nowhere else.
+
+**A console tab names its own launch.** The broker mints the `ihar_id` before spawning and passes it as `IHAR_CONSOLE_LAUNCH_ID`, which the lifecycle adopts after the handoff and resume ids and before minting one of its own (§3.3). Without it the record and the session index would disagree on the identity of the same session, and the sidebar join of §10.4 would have nothing to join on.
 
 **Sidebar.** One list, grouped by project, built from three sources and nothing else: the index reader of §10.4 for every project state under `$IHAR_STATE_ROOT`, the session records above for what is live in this window, and the status records below for the badge. Discovery is the marker file of §4.1 — a directory without a valid `home.json` is skipped, not guessed at. Rename writes through the adapter (`claude -n`, Codex `thread/name/set`, §19) so the native pickers show the same title, and resume opens a new tab through `ihar sessions resume <id>`.
 
@@ -1062,12 +1069,14 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | handoff | masking engine unavailable, level above `off` | fail-closed | 3 |
 | sessions | no vendor source readable | runtime | 1 |
 | profile | `--web` for a vendor not in `remote`; `acp` under `refuse` | usage | 2 |
-| console | configured bind is not loopback | usage | 2 |
-| console | tab requested for a project whose profile is `console: refuse` | usage | 2 in the tab |
+| console | bind is not loopback | usage | 2 |
+| console | tab requested for a project whose profile is `console: refuse`, or whose profile file does not validate | fail-closed per request | 403 |
 | console | token file missing, unreadable, or wrong mode | fail-closed | 3 |
-| console | request or upgrade without a valid cookie, or with a foreign `Origin` | fail-closed per request | 401 / 403 |
-| console | second broker for the same user, or a live broker on a different release digest | fail-closed, restart the broker | 3 |
-| console | `max_sessions` reached | usage | 2 in the tab |
+| console | request or upgrade without a valid cookie | fail-closed per request | 401 |
+| console | upgrade carrying a foreign `Origin` | fail-closed per request | 403 |
+| console | second broker for the same user | fail-closed | 3 |
+| console | live broker on a different release digest | fail-closed, restart the broker | 3 |
+| console | `max_sessions` reached | fail-closed per request | 409 |
 | console | supervisor socket unreachable for a recorded session | fail-soft, tab shown as detached | 0 |
 | console | status record present with no live process | fail-soft, badge shown as unknown | 0 |
 | console | adapter read fails while projecting a thread | fail-soft, labelled gap in the pane | 0 |
@@ -1092,7 +1101,7 @@ The review is right that the original slice order puts feature work before the c
 | S9 | Web flags over native remote surfaces | `tests/test_web.sh`; manual protocol in `docs/manual/web-surfaces.md` |
 | S10 | `isolated`: microVM with both binaries, read-only policy bundle, deny-by-default network and observed prelaunch-to-live evidence | `tests/test_microvm.sh` |
 | S11 | ACP launcher mode, experimental | `tests/test_acp.sh` |
-| S12 | Console broker and supervisors, PTY tabs, cross-project sidebar, status hooks, thread projection, check panel, rename, handoff button | `tests/test_console.sh`, `tests/test_console.py` |
+| S12 | Console broker and supervisors, PTY tabs, cross-project sidebar, status hooks, thread projection, check panel, rename, handoff button. Delivered in three ledger slices: the boundary first, then the data layer, then the front end | `tests/test_console.sh`, `tests/test_console.py` |
 | S13 | ACP chat tab inside the console, experimental | `tests/test_console_acp.sh` |
 | S14 | Handoff history modes: `transcript` export, budget, masking, degradation | `tests/test_handoff_history.py` |
 | — | concurrency suite, run from S1 onward and extended by each slice | `tests/test_concurrency.sh` |
@@ -1121,7 +1130,7 @@ Revision 12 records only choices supported by the approved artifacts and reviewe
 
 Revision 13 opens three, each owned by the slice that must measure it rather than assume it:
 
-- **Terminal asset pin (S12).** The browser terminal needs a pinned `xterm.js` build in `manifests/assets.json` with its digest; the version and digest are recorded when the asset is first installed, never from memory, and the console refuses to serve a mismatched one.
+- **Terminal asset pin (S12, front-end slice).** The browser terminal needs a pinned `xterm.js` build in `manifests/assets.json` with its digest; the version and digest are recorded when the asset is first installed, never from memory, and the console refuses to serve a mismatched one. The boundary slice ships no front end, so the broker currently serves a placeholder page behind the same cookie.
 - **Masking throughput on a transcript (S14).** The 2 MB default budget assumes the masking engine finishes a large render in a time a user will wait for. Presidio's rate on this class of input is unmeasured; S14 measures it and either keeps the default, lowers it, or streams the render, and records the number here.
 - **ACP tab promotion (S13).** claude-agent-acp #144 and codex-acp #310/#477 decide whether an ACP tab can ever be offered under an enforced profile. Until a measurement says they are closed, the tab exists only where `acp: allow` already stands.
 

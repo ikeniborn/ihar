@@ -148,9 +148,40 @@ incompatible with that vendor feature. Codex works with `standard` and `protecte
 `ihar` starts its managed app-server daemon, prints a pairing code, and attaches
 the terminal client to it. The `isolated` profile offers neither web surface.
 
-This is not a separate ihar browser UI, and `ihar` does not issue web credentials.
-For the vendor-specific flow and the optional authenticated Codex LAN listener,
-see [Native web surfaces](docs/manual/web-surfaces.md).
+These bridges are vendor-owned and each carries one session. For the vendor-specific
+flow and the optional authenticated Codex LAN listener, see
+[Native web surfaces](docs/manual/web-surfaces.md).
+
+## Multi-session console
+
+`ihar console start` runs a local broker that launches ihar sessions and serves their
+terminals in one place, across every project on the machine:
+
+```bash
+ihar console start
+ihar console status
+ihar console stop
+```
+
+It prints a `http://127.0.0.1:<port>/?t=<token>` URL. The listener is loopback only —
+a bind that is not loopback is refused rather than downgraded — so reaching it from
+another machine means an SSH tunnel. The token is exchanged once for an `HttpOnly`
+cookie; every request needs it and every WebSocket needs this origin as well.
+
+Each tab runs the ordinary CLI under a pseudo-terminal, so a tab is a normal launch:
+the profile, its hooks, its gateway and its sandbox all apply unchanged, and a project
+whose profile sets `console: refuse` fails in that tab without disturbing the others.
+`standard` and `protected` allow the console; `isolated` refuses it, because its
+session runs inside the guest.
+
+Terminal output is never written to disk: it lives in a bounded in-memory buffer per
+tab and is replayed when a browser reattaches. A tab outlives the broker, so restarting
+the console — or updating ihar — does not kill the agents running in it.
+
+One caveat worth stating plainly: a console token starts launches in every project
+state on this machine, which is wider than a single launch. `ihar check` prints that
+reach. The browser interface itself lands in the next slice; today the broker serves
+its API and terminal sockets.
 
 ## Configure
 
