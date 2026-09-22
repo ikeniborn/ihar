@@ -1,6 +1,6 @@
 ---
 review:
-  intent_hash: 09f5ef3b067a6597
+  intent_hash: d21d7719748e2853
   last_run: 2026-09-22
   phases:
     structure: { status: passed }
@@ -58,8 +58,8 @@ Restore Codex and Claude launches through ihar after the observed authentication
 ## Autonomy Zones
 
 - Full autonomy (reversible, low risk): inspect non-secret metadata, diagnose, write tests and code, update documentation, and run focused and regression checks.
-- Guarded (log + confidence threshold): create and verify a new runtime generation or recovery mechanism after proving its inputs and existing data ownership.
-- Proposal-first (needs approval): move or replace any live credential file, including the materialised Codex `auth.json` currently preserved in a runtime home.
+- Guarded (log + confidence threshold): create and verify a new runtime generation or recovery mechanism after proving its inputs and existing data ownership; reconcile a new Codex credential file produced by an ihar-launched vendor process only when its sole owner, destination, and consumer quiescence are proven, preserving the prior version until durable publication succeeds.
+- Proposal-first (needs approval): move or replace any pre-existing or ambiguously owned credential file, including the materialised Codex `auth.json` currently preserved in a runtime home.
 - No autonomy (human only): complete vendor account login, disclose or select account credentials, or weaken fail-closed protection.
 
 ## Stop Rules
