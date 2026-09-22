@@ -32,10 +32,8 @@ import datetime as _datetime
 import hashlib
 import json
 import os
-import select
 import subprocess
 import sys
-import time
 
 from .. import jsonio
 from . import auth_owner
@@ -96,47 +94,44 @@ def start(binary: str, home: str, *, auth_store: str | None = None,
           config_hash: str = "") -> dict:
     if auth_store is None:
         return _daemon_call(binary, home, "start")
-    auth_owner.require_descendant_supervision()
-    auth_owner.verify_runtime_link(home, auth_store)
-    guardian = subprocess.Popen(
-        [sys.executable, "-m", "ihar.codex.auth_owner", "daemon-guardian",
-         auth_store, home, config_hash, binary],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    assert guardian.stdout is not None
-    try:
-        if not select.select([guardian.stdout], [], [], 125)[0]:
-            raise auth_owner.AuthOwnerError("Codex daemon guardian start timed out; owner retained")
-        line = guardian.stdout.readline()
-        if not line:
-            raise auth_owner.AuthOwnerError("Codex daemon guardian exited without a start proof")
-        result = json.loads(line)
-        if not isinstance(result, dict) or "answer" not in result:
-            raise auth_owner.AuthOwnerError(
-                str(result.get("error", "Codex daemon start proof is invalid")))
-        return result["answer"]
-    except (ValueError, AttributeError) as error:
-        raise auth_owner.AuthOwnerError("Codex daemon guardian start proof is invalid") from error
-    finally:
-        guardian.stdout.close()
+    from . import guardian
+    fd = os.environ.get("IHAR_GUARD_FD")
+    if fd is None:
+        raise auth_owner.AuthOwnerError("Codex daemon start requires original guardian")
+    answer = guardian.request(int(fd), "daemon-start",
+                              {"runtime": os.path.abspath(home), "config_hash": config_hash,
+                               "binary": os.path.abspath(binary)})
+    result = answer.get("answer")
+    if not isinstance(result, dict):
+        raise auth_owner.AuthOwnerError("Codex daemon start proof is invalid")
+    return result
 
 
 def stop(binary: str, home: str, *, auth_store: str | None = None) -> dict:
-    owner_id = (auth_owner.daemon_stop_owner_id(home, store=auth_store)
-                if auth_store is not None else None)
-    answer = _daemon_call(binary, home, "stop", timeout=60.0)
-    if owner_id is not None:
-        auth_owner.verify_runtime_link(home, auth_store)
-        deadline = time.monotonic() + 3
-        while True:
-            try:
-                auth_owner.release(owner_id, store=auth_store)
-                break
-            except auth_owner.AuthBusy:
-                if time.monotonic() >= deadline:
-                    raise auth_owner.AuthBusy("Codex daemon did not become quiescent after stop")
-                time.sleep(0.05)
+    if auth_store is None:
+        return _daemon_call(binary, home, "stop", timeout=60.0)
+    from . import guardian
+    reply = guardian.call_owner(auth_store, "daemon-stop",
+                                {"runtime": os.path.abspath(home),
+                                 "binary": os.path.abspath(binary)})
+    answer = reply.get("answer")
+    if not isinstance(answer, dict):
+        raise auth_owner.AuthOwnerError("Codex daemon stop proof is invalid")
+    return answer
+
+
+def restart(binary: str, home: str, config_hash: str, *, auth_store: str | None = None) -> dict:
+    if auth_store is None:
+        stop(binary, home)
+        return start(binary, home)
+    from . import guardian
+    reply = guardian.call_owner(auth_store, "daemon-restart",
+                                {"runtime": os.path.abspath(home),
+                                 "binary": os.path.abspath(binary),
+                                 "config_hash": config_hash})
+    answer = reply.get("answer")
+    if not isinstance(answer, dict):
+        raise auth_owner.AuthOwnerError("Codex daemon restart proof is invalid")
     return answer
 
 
@@ -229,19 +224,36 @@ def reconcile(binary: str, home: str, state: str, config_hash: str,
     """
     answer = status(binary, home)
     if not running(answer):
+        if auth_store is not None:
+            from . import guardian
+            if guardian.owner_record_present(auth_store):
+                return {"action": REFUSE,
+                        "reason": "daemon absence is unproven while Codex auth owner remains",
+                        "status": answer}
         # Nothing is listening, so a record is a leftover rather than a claim.
         clear_record(state)
         return {"action": NOTHING_TO_DO, "reason": "no daemon is running", "status": answer}
 
+    owner_identity = None
     if auth_store is not None:
+        from . import guardian
         try:
-            auth_owner.daemon_owner_id(home, store=auth_store)
+            owner_identity = guardian.daemon_identity(auth_store, home)
         except auth_owner.AuthOwnerError:
             return {"action": REFUSE, "reason": "running daemon has no verified Codex auth owner",
+                    "status": answer}
+        bound = owner_identity["daemon"]
+        if answer.get("pid") != bound["pid"] or answer.get("socketPath") != bound["socket"]:
+            return {"action": REFUSE, "reason": "running daemon identity differs from original owner",
                     "status": answer}
 
     record = read_record(state)
     ours = record is not None and alive(int(record.get("pid", 0) or 0))
+    if owner_identity is not None:
+        bound = owner_identity["daemon"]
+        ours = bool(ours and record["pid"] == bound["pid"]
+                    and record["socket"] == bound["socket"]
+                    and record["config_hash"] == owner_identity["config_hash"])
 
     mismatches = []
     running_version = answer.get("managedCodexVersion") or answer.get("appServerVersion") or ""
@@ -279,9 +291,12 @@ def apply(binary: str, home: str, state: str, config_hash: str, decision: dict,
     """Carry out a `restart`. `none` and `refuse` are the caller's to act on."""
     if decision["action"] != RESTART:
         return decision
-    stop(binary, home, auth_store=auth_store)
+    if auth_store is not None:
+        answer = restart(binary, home, config_hash, auth_store=auth_store)
+    else:
+        stop(binary, home)
+        answer = start(binary, home)
     clear_record(state)
-    answer = start(binary, home, auth_store=auth_store, config_hash=config_hash)
     if not running(answer):
         return {"action": REFUSE, "reason": f"the daemon did not restart: {answer}", "status": answer}
     write_record(state, pid=int(answer.get("pid", 0) or 0),
@@ -402,7 +417,8 @@ def main(argv: list[str]) -> int:
     if args.action == "mark-remote":
         try:
             if args.auth_store is not None:
-                auth_owner.daemon_owner_id(args.home, store=args.auth_store)
+                from . import guardian
+                guardian.daemon_identity(args.auth_store, args.home)
             answer = mark_remote(args.state)
         except (ValueError, auth_owner.AuthOwnerError) as error:
             print(str(error), file=sys.stderr)
@@ -432,10 +448,12 @@ def main(argv: list[str]) -> int:
     if args.action in ("start", "restart"):
         try:
             if args.action == "restart":
-                stop(args.binary, args.home, auth_store=args.auth_store)
+                answer = restart(args.binary, args.home, args.config_hash,
+                                 auth_store=args.auth_store)
                 clear_record(args.state)
-            answer = start(args.binary, args.home, auth_store=args.auth_store,
-                           config_hash=args.config_hash)
+            else:
+                answer = start(args.binary, args.home, auth_store=args.auth_store,
+                               config_hash=args.config_hash)
         except auth_owner.AuthOwnerError as error:
             print(str(error), file=sys.stderr)
             return 3

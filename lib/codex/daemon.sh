@@ -131,18 +131,7 @@ _ihar_codex_remote_start() {
       || ihar_die 3 "cannot start the Codex app-server daemon: ${out:-no output}"
   fi
 
-  CODEX_HOME="$runtime" ihar_python ihar.codex.auth_owner run \
-    "$IHAR_STORE" "$runtime" "$hash" attached -- \
-    "$IHAR_CODEX_BIN" app-server daemon enable-remote-control \
-    >/dev/null || ihar_die 3 "cannot enable Codex Remote Control"
-  CODEX_HOME="$runtime" ihar_python ihar.codex.auth_owner run \
-    "$IHAR_STORE" "$runtime" "$hash" attached -- \
-    "$IHAR_CODEX_BIN" remote-control pair \
-    || ihar_die 3 "cannot create a Codex Remote Control pairing code"
-  ihar_python ihar.codex.daemon mark-remote --binary "$IHAR_CODEX_BIN" \
-    --home "$runtime" --state "$IHAR_STATE" --config-hash "$hash" \
-    --auth-store "$IHAR_STORE" >/dev/null \
-    || ihar_die 3 "cannot record the Codex Remote Control daemon"
+  ihar_die 3 "Codex web attachment credential-write topology cannot be proven; daemon remains under its original guardian"
 }
 
 # ihar_check_daemon — one line for `ihar check`, truthful when there is no daemon.

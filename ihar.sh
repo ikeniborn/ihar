@@ -75,7 +75,7 @@ ihar_main() {
       ihar_python ihar.codex.guardian admit "$IHAR_GUARD_FD" \
         || ihar_die 3 "Codex guardian admission cannot be verified"
     else
-      ihar_python ihar.codex.guardian "$IHAR_STORE" -- "$(readlink -f "$_IHAR_ENTRY")" "$@"
+      ihar_python ihar.codex.guardian supervise "$IHAR_STORE" -- "$(readlink -f "$_IHAR_ENTRY")" "$@"
       return $?
     fi
   fi

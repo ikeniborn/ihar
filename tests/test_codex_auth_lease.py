@@ -801,10 +801,14 @@ class AuthLeaseTests(unittest.TestCase):
                         found.append(target)
                 return found
             for _ in range(50):
-                if not guardian_sockets():
+                if len(guardian_sockets()) == 1:
                     break
                 time.sleep(.02)
-            self.assertEqual(guardian_sockets(), [], "guardian retained child channel after EOF")
+            control = self.store / "auth" / "codex" / ".guardian.sock"
+            control_entry = next(line for line in Path("/proc/net/unix").read_text().splitlines()
+                                 if line.split()[-1] == str(control))
+            self.assertEqual(guardian_sockets(), [f"socket:[{control_entry.split()[6]}]"],
+                             "guardian retained child channel after EOF")
             self.assertIsNone(process.poll(), "guardian stopped supervising live daemon")
             contender = self._guardian("raise SystemExit(23)")
             self.assertEqual(contender.wait(timeout=3), 3)
@@ -902,7 +906,7 @@ except AuthOwnerError:
                 auth_owner._main(["run", str(self.store), str(self.runtime_a), "hash-a",
                                   "foreground", "--", str(binary)])
             from ihar.codex import daemon
-            with self.assertRaisesRegex(auth_owner.AuthOwnerError, "descendant supervision"):
+            with self.assertRaisesRegex(auth_owner.AuthOwnerError, "original guardian"):
                 daemon.start(str(binary), str(self.runtime_a), auth_store=str(self.store),
                              config_hash="hash-a")
         self.assertFalse(marker.exists())
@@ -1098,71 +1102,157 @@ else:
         self.assertIn("direct TTY approval", second.stderr)
         self.assertEqual(canonical.read_text(), "synthetic-old")
 
-    def test_managed_daemon_holds_owner_after_start_command_exits(self) -> None:
+    def test_direct_daemon_start_cannot_create_another_guardian(self) -> None:
         auth_owner.stage(self.store)
         (self.runtime_a / "auth.json").symlink_to(self.store / "auth" / "codex" / "auth.json")
+        marker = self.root / "unguarded-daemon-start"
         binary = self.root / "daemon-codex"
-        binary.write_text("""#!/usr/bin/env python3
-import json, os, signal, socket, subprocess, sys, time
-home = os.environ['CODEX_HOME']
-sock = home + '/app-server-control/app-server-control.sock'
-pidfile = home + '/daemon.pid'
-if sys.argv[1:] == ['app-server', 'daemon', 'start']:
-    child = subprocess.Popen([sys.executable, __file__, 'serve'], start_new_session=True,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(100):
-        if os.path.exists(sock): break
-        time.sleep(.01)
-    print(json.dumps({'status':'started','pid':child.pid,'socketPath':sock,'managedCodexVersion':'0.154.0'}))
-elif sys.argv[1:] == ['app-server', 'daemon', 'stop']:
-    pid = int(open(pidfile).read())
-    os.killpg(pid, signal.SIGTERM)
-    print(json.dumps({'status':'stopped'}))
-elif sys.argv[1:] == ['app-server', 'daemon', 'version']:
-    if os.path.exists(sock):
-        print(json.dumps({'status':'running','pid':int(open(pidfile).read()),'socketPath':sock,'managedCodexVersion':'0.154.0'}))
-    else: print(json.dumps({'status':'absent'}))
-elif sys.argv[1:] == ['--version']:
-    print('codex-cli 0.154.0')
-elif sys.argv[1:] == ['serve']:
-    os.makedirs(os.path.dirname(sock), exist_ok=True)
-    listener = socket.socket(socket.AF_UNIX)
-    listener.bind(sock)
-    open(pidfile,'w').write(str(os.getpid()))
-    def shutdown(*_):
-        listener.close()
-        os.unlink(sock)
-        sys.exit(0)
-    signal.signal(signal.SIGTERM, shutdown)
-    while True: time.sleep(1)
-""")
+        binary.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
         binary.chmod(0o700)
-        env = dict(os.environ, CODEX_HOME=str(self.runtime_a),
-                   PYTHONPATH=str(Path(__file__).resolve().parents[1] / "lib" / "python"))
-        base = [sys.executable, "-m", "ihar.codex.daemon"]
-        common = ["--binary", str(binary), "--home", str(self.runtime_a),
-                  "--state", str(self.root / "state"), "--auth-store", str(self.store)]
-        started = subprocess.run(base + ["start"] + common + ["--config-hash", "aabbccdd"],
-                                 env=env, capture_output=True, text=True, timeout=5)
-        self.assertEqual(started.returncode, 0, started.stderr)
+        from ihar.codex import daemon
+        with self.assertRaisesRegex(auth_owner.AuthOwnerError, "original guardian"):
+            daemon.start(str(binary), str(self.runtime_a), auth_store=str(self.store),
+                         config_hash="aabbccdd")
+        self.assertFalse(marker.exists())
+        self.assertFalse(self.record.exists())
+
+    def test_managed_daemon_start_uses_initiating_guardian(self) -> None:
+        process, _binary, _env = self._start_guarded_review_daemon()
+        record = json.loads(self.record.read_text())
+        self.assertEqual(record["guardian"]["pid"], process.pid)
+        self.assertEqual(record["daemon"]["pid"], int((self.runtime_a / "daemon.pid").read_text()))
+        self.assertIsNone(process.poll(), "original guardian must outlive initiating shell")
+        with self.assertRaises(auth_owner.AuthBusy):
+            auth_owner.acquire(self.runtime_b, "foreground")
+        refused = self._run_ihar("--dry-run", "codex")
+        self.assertEqual(refused.returncode, 3, refused.stderr)
+        self.assertFalse((self.root / "app-server-started").exists())
+
+    def test_slow_daemon_start_waits_for_identity_proof(self) -> None:
+        process, _binary, _env = self._start_guarded_review_daemon("slow-start")
+        self.assertIsNone(process.poll())
+        self.assertIsNotNone(json.loads(self.record.read_text())["daemon"])
+
+    def test_guardian_crash_with_live_daemon_preserves_blocking_record(self) -> None:
+        process, binary, env = self._start_guarded_review_daemon()
+        original = self.record.read_bytes()
+        process.kill()
+        process.wait(timeout=5)
+        self.assertEqual(self.record.read_bytes(), original)
+        contender = self._guardian("raise SystemExit(23)")
+        self.assertEqual(contender.wait(timeout=3), 3)
         self.assertTrue(self.record.exists())
-        with self.assertRaises(auth_owner.AuthBusy):
-            auth_owner.acquire(self.runtime_b, "foreground")
-        attached = subprocess.run(
-            [sys.executable, "-m", "ihar.codex.auth_owner", "run", str(self.store),
-             str(self.runtime_a), "aabbccdd", "attached", "--", "/bin/sleep", "0.3"],
-            env=env, capture_output=True, text=True, timeout=5)
-        self.assertEqual(attached.returncode, 0, attached.stderr)
-        restarted = subprocess.run(base + ["restart"] + common + ["--config-hash", "aabbccdd"],
-                                   env=env, capture_output=True, text=True, timeout=10)
+        stopped = subprocess.run(
+            [sys.executable, "-m", "ihar.codex.daemon", "stop", "--binary", str(binary),
+             "--home", str(self.runtime_a), "--state", str(self.root / "state"),
+             "--auth-store", str(self.store)], env=env, capture_output=True,
+            text=True, timeout=5)
+        self.assertEqual(stopped.returncode, 3, stopped.stderr)
+        self.assertEqual(self.record.read_bytes(), original)
+
+    def test_external_stop_runs_under_original_guardian(self) -> None:
+        process, binary, env = self._start_guarded_review_daemon()
+        from ihar.codex import daemon
+        with mock.patch.dict(os.environ, env):
+            answer = daemon.stop(str(binary), str(self.runtime_a), auth_store=str(self.store))
+        self.assertEqual(answer["status"], "stopped")
+        self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
+        self.assertFalse(self.record.exists())
+
+    def test_external_restart_keeps_original_guardian(self) -> None:
+        process, binary, env = self._start_guarded_review_daemon()
+        first = json.loads(self.record.read_text())
+        command = [sys.executable, "-m", "ihar.codex.daemon", "restart", "--binary",
+                   str(binary), "--home", str(self.runtime_a), "--state",
+                   str(self.root / "state"), "--config-hash", "aabbccdd",
+                   "--auth-store", str(self.store)]
+        restarted = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10)
         self.assertEqual(restarted.returncode, 0, restarted.stderr)
-        with self.assertRaises(auth_owner.AuthBusy):
-            auth_owner.acquire(self.runtime_b, "foreground")
-        stopped = subprocess.run(base + ["stop"] + common, env=env,
-                                 capture_output=True, text=True, timeout=5)
-        self.assertEqual(stopped.returncode, 0, stopped.stderr)
-        next_owner = auth_owner.acquire(self.runtime_b, "foreground")
-        auth_owner.release(next_owner)
+        second = json.loads(self.record.read_text())
+        self.assertEqual(second["guardian"], first["guardian"])
+        self.assertNotEqual(second["daemon"]["pid"], first["daemon"]["pid"])
+        self.assertIsNone(process.poll())
+
+    def test_control_refuses_other_runtime_and_writer_attachment(self) -> None:
+        self._start_guarded_review_daemon()
+        from ihar.codex import guardian
+        before = self.record.read_bytes()
+        with self.assertRaises(auth_owner.AuthOwnerError):
+            guardian.call_owner(self.store, "bind-runtime",
+                                {"runtime": str(self.runtime_a), "config_hash": "other"})
+        with self.assertRaises(auth_owner.AuthOwnerError):
+            guardian.call_owner(self.store, "daemon-stop",
+                                {"runtime": str(self.runtime_b), "binary": str(self.root / "review-codex")})
+        with self.assertRaises(auth_owner.AuthOwnerError):
+            guardian.call_owner(self.store, "daemon-restart",
+                                {"runtime": str(self.runtime_a), "binary": str(self.root / "review-codex"),
+                                 "config_hash": "other"})
+        with self.assertRaises(auth_owner.AuthOwnerError):
+            guardian.call_owner(self.store, "attach",
+                                {"runtime": str(self.runtime_a), "config_hash": "aabbccdd",
+                                 "argv": [str(self.root / "review-codex"), "--remote"]})
+        self.assertEqual(self.record.read_bytes(), before)
+        (self.store / "auth" / "codex" / ".guardian.sock").unlink()
+        with self.assertRaises(auth_owner.AuthOwnerError):
+            guardian.call_owner(self.store, "daemon-stop",
+                                {"runtime": str(self.runtime_a), "binary": str(self.root / "review-codex")})
+
+    def test_reconcile_recognizes_exact_schema_two_daemon(self) -> None:
+        _process, binary, env = self._start_guarded_review_daemon()
+        from ihar.codex import daemon
+        with mock.patch.dict(os.environ, env):
+            decision = daemon.reconcile(str(binary), str(self.runtime_a),
+                                        str(self.root / "state"), "aabbccdd",
+                                        auth_store=str(self.store))
+        self.assertEqual(decision["action"], daemon.NOTHING_TO_DO, decision)
+
+    def test_absent_version_reply_cannot_erase_live_daemon_claim(self) -> None:
+        _process, binary, env = self._start_guarded_review_daemon()
+        from ihar.codex import daemon
+        record_path = self.root / "state" / "daemons" / "codex.json"
+        with mock.patch.dict(os.environ, dict(env, FAKE_DAEMON_MODE="absent-status")):
+            decision = daemon.reconcile(str(binary), str(self.runtime_a),
+                                        str(self.root / "state"), "aabbccdd",
+                                        auth_store=str(self.store))
+        self.assertEqual(decision["action"], daemon.REFUSE, decision)
+        self.assertTrue(record_path.exists())
+
+    def _start_guarded_review_daemon(self, mode: str = "normal",
+                                     *, expect_start: bool = True) -> tuple[subprocess.Popen, Path, dict[str, str]]:
+        _binary, env, _common = self._review_daemon(mode)
+        child = ("import os,sys; from ihar.codex import guardian,daemon; "
+                 "fd=int(os.environ['IHAR_GUARD_FD']); "
+                 f"guardian.request(fd,'bind-runtime',{{'runtime':{str(self.runtime_a)!r},"
+                 "'config_hash':'aabbccdd'}); "
+                 f"answer=daemon.start({str(_binary)!r},{str(self.runtime_a)!r},"
+                 f"auth_store={str(self.store)!r},config_hash='aabbccdd'); "
+                 f"daemon.write_record({str(self.root / 'state')!r},pid=answer['pid'],"
+                 f"socket_path=answer['socketPath'],binary={str(_binary)!r},"
+                 "codex_version='0.154.0',config_hash='aabbccdd'); "
+                 "print(answer['status'], flush=True)")
+        process = subprocess.Popen(
+            [sys.executable, "-m", "ihar.codex.guardian", str(self.store), "--",
+             sys.executable, "-c", child], env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, start_new_session=True)
+        def cleanup() -> None:
+            for name in ("daemon.pid", "detached.pid"):
+                path = self.runtime_a / name
+                if path.exists():
+                    try:
+                        os.killpg(int(path.read_text()), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            process.stdout.close()
+            process.stderr.close()
+        self.addCleanup(cleanup)
+        self._wait_for(self.runtime_a / "daemon.pid")
+        if expect_start:
+            self.assertEqual(process.stdout.readline().strip(), "started")
+            self.assertEqual(json.loads(process.stdout.readline())["initiating_status"], 0)
+        return process, _binary, env
 
     def _review_daemon(self, mode: str) -> tuple[Path, dict[str, str], list[str]]:
         auth_owner.stage(self.store)
@@ -1181,11 +1271,19 @@ if sys.argv[1:] == ['app-server', 'daemon', 'start']:
     for _ in range(200):
         if os.path.exists(sock) and (mode != 'detached' or os.path.exists(detached)): break
         time.sleep(.01)
+    if mode == 'slow-start': time.sleep(6)
     if mode == 'malformed': print('not-json')
     else: print(json.dumps({'status':'started','pid':child.pid,'socketPath':sock}))
 elif sys.argv[1:] == ['app-server', 'daemon', 'stop']:
     os.killpg(int(open(pidfile).read()), signal.SIGTERM)
     print(json.dumps({'status':'stopped'}))
+elif sys.argv[1:] == ['app-server', 'daemon', 'version']:
+    if mode != 'absent-status' and os.path.exists(sock):
+        print(json.dumps({'status':'running','pid':int(open(pidfile).read()),
+                          'socketPath':sock,'managedCodexVersion':'0.154.0'}))
+    else: print(json.dumps({'status':'absent'}))
+elif sys.argv[1:] == ['--version']:
+    print('codex-cli 0.154.0')
 elif sys.argv[1:] == ['serve']:
     os.makedirs(os.path.dirname(sock), exist_ok=True)
     listener = socket.socket(socket.AF_UNIX)
@@ -1222,20 +1320,19 @@ elif sys.argv[1:] == ['descendant']:
         return binary, env, common
 
     def test_malformed_start_response_retains_owner_after_daemon_spawn(self) -> None:
-        _binary, env, common = self._review_daemon("malformed")
-        answer = subprocess.run([sys.executable, "-m", "ihar.codex.daemon", "start"] + common,
-                                env=env, capture_output=True, text=True, timeout=5)
-        self.assertEqual(answer.returncode, 3)
+        process, _binary, _env = self._start_guarded_review_daemon("malformed", expect_start=False)
         self.assertTrue((self.runtime_a / "daemon.pid").exists())
         self.assertTrue(self.record.exists(), "uncertain start must retain owner")
         with self.assertRaises(auth_owner.AuthOwnerError):
             auth_owner.acquire(self.runtime_b, "foreground")
+        os.killpg(int((self.runtime_a / "daemon.pid").read_text()), signal.SIGTERM)
+        self.assertEqual(process.wait(timeout=5), 3)
+        self.assertEqual(json.loads(self.record.read_text())["state"], "blocked")
 
     def test_detached_daemon_descendant_blocks_stop_release(self) -> None:
-        _binary, env, common = self._review_daemon("detached")
-        started = subprocess.run([sys.executable, "-m", "ihar.codex.daemon", "start"] + common,
-                                 env=env, capture_output=True, text=True, timeout=5)
-        self.assertEqual(started.returncode, 0, started.stderr)
+        process, binary, env = self._start_guarded_review_daemon("detached")
+        common = ["--binary", str(binary), "--home", str(self.runtime_a),
+                  "--state", str(self.root / "state"), "--auth-store", str(self.store)]
         self.assertTrue((self.runtime_a / "detached.pid").exists())
         stopped = subprocess.run([sys.executable, "-m", "ihar.codex.daemon", "stop"] + common,
                                  env=env, capture_output=True, text=True, timeout=10)
@@ -1244,16 +1341,8 @@ elif sys.argv[1:] == ['descendant']:
         with self.assertRaises(auth_owner.AuthOwnerError):
             auth_owner.acquire(self.runtime_b, "foreground")
         os.killpg(int((self.runtime_a / "detached.pid").read_text()), signal.SIGTERM)
-        for _ in range(100):
-            if json.loads(self.record.read_text()).get("state") == "quiescent":
-                break
-            time.sleep(0.05)
-        self.assertEqual(json.loads(self.record.read_text()).get("state"), "quiescent")
-        retried = subprocess.run([sys.executable, "-m", "ihar.codex.daemon", "stop"] + common,
-                                 env=env, capture_output=True, text=True, timeout=10)
-        self.assertEqual(retried.returncode, 0, retried.stderr)
-        next_owner = auth_owner.acquire(self.runtime_b, "foreground")
-        auth_owner.release(next_owner)
+        self.assertEqual(process.wait(timeout=5), 3, process.stderr.read())
+        self.assertEqual(json.loads(self.record.read_text())["state"], "blocked")
 
     def test_daemon_refuses_missing_auth_link_before_vendor_start(self) -> None:
         marker = self.root / "started"

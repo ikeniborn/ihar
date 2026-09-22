@@ -26,6 +26,7 @@ from . import auth_owner
 
 _MAX_MESSAGE = 4096
 _FD_ENV = "IHAR_GUARD_FD"
+_REPORT_ENV = "IHAR_GUARD_REPORT_FD"
 _BOOT = (
     "import os,sys; fd=int(sys.argv[1]); "
     "ready=os.read(fd,1); "
@@ -34,9 +35,8 @@ _BOOT = (
 )
 
 
-def request(fd: int, operation: str, fields: dict) -> dict:
-    """Send one bounded request through an inherited, authenticated socket."""
-    if fd < 0 or not isinstance(fields, dict):
+def _exchange(channel: socket.socket, store: Path, operation: str, fields: dict) -> dict:
+    if not isinstance(fields, dict):
         raise auth_owner.AuthOwnerError("Codex guardian descriptor or request is invalid")
     try:
         message = json.dumps({"operation": operation, "fields": fields},
@@ -44,11 +44,10 @@ def request(fd: int, operation: str, fields: dict) -> dict:
         if len(message) > _MAX_MESSAGE:
             raise auth_owner.AuthOwnerError("Codex guardian request is too large")
         with ExitStack() as stack:
-            channel = stack.enter_context(socket.socket(fileno=os.dup(fd)))
             peer = struct.unpack("3i", channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
                                                             struct.calcsize("3i")))
             with ExitStack() as owner_stack:
-                owner = auth_owner._locked_owner(auth_owner._lease_store(None), owner_stack)
+                owner = auth_owner._locked_owner(store, owner_stack)
                 record = auth_owner._read_owner(owner)
                 if (record is None or record.get("schema") != 2
                     or peer[0] != record["guardian"]["pid"] or peer[1] != os.geteuid()
@@ -58,7 +57,8 @@ def request(fd: int, operation: str, fields: dict) -> dict:
             reply, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             stack.enter_context(reply)
             stack.enter_context(receiver)
-            reply.settimeout(5)
+            reply.settimeout({"daemon-start": 125, "daemon-stop": 65,
+                              "daemon-restart": 190}.get(operation, 5))
             rights = array.array("i", [receiver.fileno()])
             channel.sendmsg([message], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
             answer = reply.recv(_MAX_MESSAGE + 1)
@@ -70,6 +70,68 @@ def request(fd: int, operation: str, fields: dict) -> dict:
         return parsed
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
         raise auth_owner.AuthOwnerError("Codex guardian channel cannot be verified") from error
+
+
+def request(fd: int, operation: str, fields: dict) -> dict:
+    """Send one bounded request through an inherited, authenticated socket."""
+    if fd < 0:
+        raise auth_owner.AuthOwnerError("Codex guardian descriptor or request is invalid")
+    try:
+        with socket.socket(fileno=os.dup(fd)) as channel:
+            return _exchange(channel, auth_owner._lease_store(None), operation, fields)
+    except OSError as error:
+        raise auth_owner.AuthOwnerError("Codex guardian channel cannot be verified") from error
+
+
+def call_owner(store: Path, operation: str, fields: dict) -> dict:
+    """Use the original guardian's owner-only control socket, never a new lease."""
+    selected = auth_owner._lease_store(store)
+    with ExitStack() as stack:
+        owner = auth_owner._locked_owner(selected, stack)
+        record = auth_owner._read_owner(owner)
+        control = record.get("control") if isinstance(record, dict) else None
+        if (record is None or record.get("schema") != 2 or control is None
+            or not auth_owner._identity_matches(record["guardian"], auth_owner._process_table())):
+            raise auth_owner.AuthOwnerError("Codex daemon guardian cannot be verified")
+        path = selected / "auth" / "codex" / ".guardian.sock"
+        try:
+            metadata = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            raise auth_owner.AuthOwnerError("Codex daemon guardian socket is missing") from error
+        if (control != {"dev": metadata.st_dev, "ino": metadata.st_ino}
+            or not stat.S_ISSOCK(metadata.st_mode)):
+            raise auth_owner.AuthOwnerError("Codex daemon guardian socket changed")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
+        channel.settimeout(10)
+        try:
+            channel.connect(str(path))
+        except OSError as error:
+            raise auth_owner.AuthOwnerError("Codex daemon guardian socket cannot be reached") from error
+        return _exchange(channel, selected, operation, fields)
+
+
+def daemon_identity(store: Path, runtime: str) -> dict:
+    """Return only a live exact daemon bound to the original schema-two guardian."""
+    selected = auth_owner._lease_store(store)
+    with ExitStack() as stack:
+        owner = auth_owner._locked_owner(selected, stack)
+        record = auth_owner._read_owner(owner)
+        table = auth_owner._process_table()
+        daemon = record.get("daemon") if isinstance(record, dict) else None
+        if (record is None or record.get("schema") != 2
+            or record.get("runtime") != os.path.abspath(runtime)
+            or record.get("state") != "active" or daemon is None
+            or not auth_owner._identity_matches(record["guardian"], table)
+            or not auth_owner._identity_matches(daemon, table)
+            or not auth_owner._daemon_socket_proven(record)):
+            raise auth_owner.AuthOwnerError("Codex daemon original owner cannot be verified")
+        return {"daemon": daemon, "config_hash": record["config_hash"]}
+
+
+def owner_record_present(store: Path) -> bool:
+    with ExitStack() as stack:
+        owner = auth_owner._locked_owner(auth_owner._lease_store(store), stack)
+        return auth_owner._read_owner(owner) is not None
 
 
 def _descendant(pid: int, guardian_pid: int, table: dict[int, dict]) -> bool:
@@ -180,7 +242,82 @@ def _direct_auth_approval(action: str) -> bool:
         return False
 
 
-def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
+def _start_daemon(store: Path, runtime: str, config_hash: str, binary: str,
+                  guardian_pid: int) -> dict:
+    """Start and bind a daemon without creating a second credential owner."""
+    from . import daemon
+
+    auth_owner.verify_runtime_link(runtime, store)
+    answer = daemon._daemon_call(binary, runtime, "start")
+    if not daemon.running(answer):
+        raise auth_owner.AuthOwnerError("Codex daemon start did not prove a running daemon")
+    path = os.path.join(runtime, "app-server-control", "app-server-control.sock")
+    if answer.get("socketPath") != path:
+        raise auth_owner.AuthOwnerError("Codex daemon socket path is invalid")
+    for _ in range(60):
+        if os.path.exists(path):
+            break
+        time.sleep(0.05)
+    table = auth_owner._process_table()
+    identity = _identity(answer.get("pid"), binary, guardian_pid, table)
+    metadata = os.stat(path, follow_symlinks=False)
+    if identity["pgrp"] != identity["pid"] or not stat.S_ISSOCK(metadata.st_mode):
+        raise auth_owner.AuthOwnerError("Codex daemon process or socket is invalid")
+    with ExitStack() as stack:
+        owner = auth_owner._locked_owner(store, stack)
+        record = auth_owner._read_owner(owner)
+        if (record is None or record.get("schema") != 2
+            or record.get("runtime") != runtime or record.get("config_hash") != config_hash
+            or record.get("daemon") is not None):
+            raise auth_owner.AuthOwnerError("Codex daemon owner changed during start")
+        record["daemon"] = dict(identity, socket=path,
+                                socket_dev=metadata.st_dev, socket_ino=metadata.st_ino)
+        record["state"] = "active"
+        auth_owner._write_owner(owner, record)
+    return answer
+
+
+def _stop_daemon(store: Path, runtime: str, binary: str, guardian_pid: int) -> dict:
+    from . import daemon
+
+    answer = daemon._daemon_call(binary, runtime, "stop", timeout=60.0)
+    if answer.get("status") != "stopped":
+        raise auth_owner.AuthOwnerError("Codex daemon stop outcome is unverified")
+    deadline = time.monotonic() + 3
+    while True:
+        auth_owner._reap_children()
+        with ExitStack() as stack:
+            owner = auth_owner._locked_owner(store, stack)
+            record = auth_owner._read_owner(owner)
+            identity = record.get("daemon") if isinstance(record, dict) else None
+            if (record is None or record.get("schema") != 2 or identity is None
+                or record.get("runtime") != runtime or identity["binary"] != binary):
+                raise auth_owner.AuthOwnerError("Codex daemon owner changed during stop")
+            table = auth_owner._process_table()
+            observed = table.get(identity["pid"])
+            if observed is not None and observed["start"] != identity["start"]:
+                raise auth_owner.AuthOwnerError("Codex daemon PID was reused")
+            try:
+                metadata = os.stat(identity["socket"], follow_symlinks=False)
+            except FileNotFoundError:
+                socket_gone = True
+            else:
+                if (metadata.st_dev, metadata.st_ino) != (identity["socket_dev"],
+                                                          identity["socket_ino"]):
+                    raise auth_owner.AuthOwnerError("Codex daemon socket changed")
+                socket_gone = False
+            if (socket_gone and not auth_owner._group_active(identity)
+                and not auth_owner._descendants_active(guardian_pid)):
+                record["daemon"] = None
+                auth_owner._write_owner(owner, record)
+                return answer
+        if time.monotonic() >= deadline:
+            raise auth_owner.AuthBusy("Codex daemon did not become quiescent after stop")
+        time.sleep(0.05)
+
+
+def _handle(store: Path, channel: socket.socket, guardian_pid: int,
+            *, external: bool = False) -> bool:
     control_space = socket.CMSG_SPACE(struct.calcsize("3i")) + socket.CMSG_SPACE(
         array.array("i").itemsize)
     message, ancillary, flags, _address = channel.recvmsg(_MAX_MESSAGE + 1, control_space)
@@ -202,6 +339,7 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
                     os.close(extra)
     if reply_fd is None:
         return True
+    daemon_action = None
     try:
         if (not message or len(message) > _MAX_MESSAGE
             or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
@@ -211,6 +349,8 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
         if not isinstance(payload, dict) or not isinstance(payload.get("fields"), dict):
             raise auth_owner.AuthOwnerError("Codex guardian request is invalid")
         operation, fields = payload.get("operation"), payload["fields"]
+        if external and operation not in ("daemon-stop", "daemon-restart"):
+            raise auth_owner.AuthOwnerError("Codex external guardian operation is invalid")
         auth_action = None
         with ExitStack() as stack:
             owner = auth_owner._locked_owner(store, stack)
@@ -218,8 +358,8 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
             table = auth_owner._process_table()
             if (record is None or record.get("schema") != 2
                 or not auth_owner._identity_matches(record["guardian"], table)
-                or not _descendant(credentials[0], guardian_pid, table)
-                or not auth_owner._identity_matches(record["child"], table)):
+                or (not external and not _descendant(credentials[0], guardian_pid, table))
+                or (not external and not auth_owner._identity_matches(record["child"], table))):
                 raise auth_owner.AuthOwnerError("Codex guardian process identity is invalid")
             child_pid = record["child"]["pid"]
             if operation == "admit" and not fields:
@@ -230,7 +370,9 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
                     or not os.path.isabs(runtime) or not isinstance(config_hash, str)
                     or len(config_hash) > 256):
                     raise auth_owner.AuthOwnerError("Codex runtime binding is invalid")
-                if record["runtime"] is not None and record["runtime"] != os.path.abspath(runtime):
+                if (record["runtime"] is not None and record["runtime"] != os.path.abspath(runtime)
+                    or record["config_hash"] is not None
+                    and record["config_hash"] != config_hash):
                     raise auth_owner.AuthOwnerError("Codex runtime owner changed")
                 record["runtime"] = os.path.abspath(runtime)
                 record["config_hash"] = config_hash
@@ -281,12 +423,43 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
                     or record["auth_caller"]["pid"] != credentials[0]):
                     raise auth_owner.AuthOwnerError("Codex authentication stage changed")
                 auth_action = "finish" if operation == "auth-finish" else "abort"
+            elif operation == "daemon-start" and set(fields) == {"runtime", "config_hash", "binary"}:
+                if (external or record.get("daemon") is not None
+                    or fields["runtime"] != record["runtime"]
+                    or fields["config_hash"] != record["config_hash"]
+                    or not isinstance(fields["binary"], str)
+                    or not os.path.isabs(fields["binary"])):
+                    raise auth_owner.AuthOwnerError("Codex daemon start owner is invalid")
+                daemon_action = "start"
+            elif (operation in ("daemon-stop", "daemon-restart") and external
+                  and set(fields) == ({"runtime", "binary"} if operation == "daemon-stop"
+                                      else {"runtime", "binary", "config_hash"})):
+                daemon = record.get("daemon")
+                if (daemon is None or fields["runtime"] != record["runtime"]
+                    or fields["binary"] != daemon["binary"]
+                    or (operation == "daemon-restart"
+                        and fields["config_hash"] != record["config_hash"])
+                    or not auth_owner._identity_matches(daemon, table)
+                    or not auth_owner._daemon_socket_proven(record)):
+                    raise auth_owner.AuthOwnerError("Codex daemon stop identity is invalid")
+                daemon_action = "stop" if operation == "daemon-stop" else "restart"
             else:
                 raise auth_owner.AuthOwnerError("Codex guardian operation is invalid")
-            if auth_action is None:
+            if auth_action is None and daemon_action is None:
                 auth_owner._write_owner(owner, record)
         answer = {"ok": True, "state": record["state"]}
-        if auth_action == "stage":
+        if daemon_action == "start":
+            answer["answer"] = _start_daemon(store, fields["runtime"],
+                                             fields["config_hash"], fields["binary"],
+                                             guardian_pid)
+        elif daemon_action in ("stop", "restart"):
+            answer["answer"] = _stop_daemon(store, fields["runtime"], fields["binary"],
+                                            guardian_pid)
+            if daemon_action == "restart":
+                answer["answer"] = _start_daemon(store, fields["runtime"],
+                                                 fields["config_hash"], fields["binary"],
+                                                 guardian_pid)
+        elif auth_action == "stage":
             staged = auth_owner.stage(store)
             existing = (store / "auth" / "codex" / "auth.json").exists()
             verb = fields["verb"]
@@ -329,7 +502,15 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
             staged = Path(fields["stage"])
             _cleanup_auth_stage(store, staged, retain_changed=True)
             _clear_auth_stage(store, staged)
-    except (auth_owner.AuthOwnerError, OSError, ValueError, TypeError, KeyError):
+    except (auth_owner.AuthOwnerError, OSError, ValueError, TypeError, KeyError,
+            subprocess.SubprocessError):
+        if daemon_action is not None:
+            with ExitStack() as stack:
+                owner = auth_owner._locked_owner(store, stack)
+                record = auth_owner._read_owner(owner)
+                if record is not None and record.get("schema") == 2:
+                    record["state"] = "blocked"
+                    auth_owner._write_owner(owner, record)
         answer = {"ok": False}
     try:
         with socket.socket(fileno=reply_fd) as reply:
@@ -361,6 +542,8 @@ def _release_when_quiescent(store: Path, child: subprocess.Popen) -> bool:
         if (auth_owner._group_active(record["child"])
             or auth_owner._descendants_active(os.getpid())):
             return False
+        if record["state"] == "blocked":
+            raise auth_owner.AuthOwnerError("Codex daemon outcome remains unverified")
         if record.get("auth_stage") is not None:
             record["state"] = "blocked"
             auth_owner._write_owner(owner, record)
@@ -383,6 +566,14 @@ def _release_when_quiescent(store: Path, child: subprocess.Popen) -> bool:
             auth_owner.verify_runtime_link(record["runtime"], store)
         if auth_owner._external_consumer_present(store, table):
             raise auth_owner.AuthBusy("external Codex consumer may own the shared login")
+        control = record.get("control")
+        if control is not None:
+            path = store / "auth" / "codex" / ".guardian.sock"
+            metadata = os.stat(path, follow_symlinks=False)
+            if (not stat.S_ISSOCK(metadata.st_mode)
+                or control != {"dev": metadata.st_dev, "ino": metadata.st_ino}):
+                raise auth_owner.AuthOwnerError("Codex daemon guardian socket changed")
+            path.unlink()
         os.unlink(auth_owner._OWNER_RECORD, dir_fd=owner)
         os.fsync(owner)
         return True
@@ -415,10 +606,22 @@ def run(store: Path, argv: list[str]) -> int:
         sockets.enter_context(server)
         sockets.enter_context(client)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        control_path = selected / "auth" / "codex" / ".guardian.sock"
+        listener = sockets.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
+        listener.bind(str(control_path))
+        os.chmod(control_path, 0o600)
+        listener.listen(8)
+        metadata = os.stat(control_path, follow_symlinks=False)
+        with ExitStack() as stack:
+            owner = auth_owner._locked_owner(selected, stack)
+            record = auth_owner._read_owner(owner)
+            record["control"] = {"dev": metadata.st_dev, "ino": metadata.st_ino}
+            auth_owner._write_owner(owner, record)
         gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
         try:
             environment = dict(os.environ, IHAR_STORE=str(selected),
                                **{_FD_ENV: str(client.fileno())})
+            environment.pop(_REPORT_ENV, None)
             child = subprocess.Popen([sys.executable, "-c", _BOOT, str(gate_read), *argv],
                                      env=environment, pass_fds=(client.fileno(), gate_read),
                                      start_new_session=True)
@@ -456,19 +659,32 @@ def run(store: Path, argv: list[str]) -> int:
                         with ExitStack() as stack:
                             owner = auth_owner._locked_owner(selected, stack)
                             record = auth_owner._read_owner(owner)
-                        if record and record.get("daemon") and auth_owner.owner_is_active(
-                                {"daemon": record["daemon"]}):
-                            print(json.dumps({"initiating_status": status}), flush=True)
+                        if record and (record.get("state") == "blocked"
+                                       or record.get("daemon") and auth_owner.owner_is_active(
+                                           {"daemon": record["daemon"]})):
+                            report_fd = os.environ.get(_REPORT_ENV)
+                            if report_fd is not None:
+                                result = 128 - status if status < 0 else status
+                                os.write(int(report_fd), f"{result}\n".encode("ascii"))
+                                os.close(int(report_fd))
+                            else:
+                                print(json.dumps({"initiating_status": status}), flush=True)
                             reported = True
                             descriptor = os.open(os.devnull, os.O_WRONLY)
                             os.dup2(descriptor, sys.stdout.fileno())
+                            os.dup2(descriptor, sys.stderr.fileno())
                             os.close(descriptor)
-                readable, _, _ = select.select([server] if channel_open else [], [], [],
-                                               .05 if channel_open else .2)
-                if readable:
+                readable, _, _ = select.select(([server] if channel_open else []) + [listener],
+                                               [], [], .05 if channel_open else .2)
+                if server in readable:
                     channel_open = _handle(selected, server, os.getpid())
                     if not channel_open:
                         server.close()
+                if listener in readable:
+                    connection, _ = listener.accept()
+                    with connection:
+                        connection.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+                        _handle(selected, connection, os.getpid(), external=True)
         finally:
             for number, handler in previous_handlers.items():
                 signal.signal(number, handler)
@@ -534,7 +750,32 @@ def _run_auth_vendor(fd: int, command: list[str], environment: dict[str, str]) -
     return 128 - status if status < 0 else status
 
 
+def _supervise(store: str, command: list[str]) -> int:
+    """Return the initiating result while the original owner keeps a daemon alive."""
+    read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    try:
+        environment = dict(os.environ, **{_REPORT_ENV: str(write_fd)})
+        process = subprocess.Popen([sys.executable, "-m", "ihar.codex.guardian",
+                                    store, "--", *command], env=environment,
+                                   pass_fds=(write_fd,))
+        os.close(write_fd)
+        write_fd = -1
+        report = os.read(read_fd, 64)
+        if report:
+            try:
+                return int(report.strip())
+            except ValueError as error:
+                raise auth_owner.AuthOwnerError("Codex guardian result is invalid") from error
+        return process.wait()
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
 def _main(arguments: list[str]) -> int:
+    if len(arguments) >= 4 and arguments[0] == "supervise" and arguments[2] == "--":
+        return _supervise(arguments[1], arguments[3:])
     if len(arguments) == 2 and arguments[0] == "admit":
         request(int(arguments[1]), "admit", {})
         return 0

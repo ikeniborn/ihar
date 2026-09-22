@@ -63,45 +63,86 @@ assert_contains "LAN uses app-server listen" "$lan" \
 assert_contains "LAN keeps websocket auth arguments" "$lan" \
   "--ws-auth capability-token --ws-token-file /tmp/token"
 
-# Actual Codex web launch: start managed daemon, enable hosted remote control, print
-# a pairing code, then attach the TUI over the daemon's Unix WebSocket endpoint.
+# Actual Codex web launch: prove a real managed daemon PID/socket, then refuse
+# credential-capable remote setup until its write topology is independently proven.
 FAKE="$IHAR_TEST_TMP/fake-codex"
 LOG="$IHAR_TEST_TMP/codex.calls"
 cat > "$FAKE" <<'EOF'
-#!/usr/bin/env bash
-set -uo pipefail
-printf '%s\n' "$*" >> "$IHAR_FAKE_LOG"
-if [[ "${1:-}" == "--version" ]]; then
-  printf 'codex-cli 0.154.0\n'
-elif [[ "${1:-} ${2:-} ${3:-}" == "app-server daemon version" ]]; then
-  printf '{"status":"absent"}\n'
-  exit 1
-elif [[ "${1:-} ${2:-} ${3:-}" == "app-server daemon start" ]]; then
-  printf '{"status":"started","pid":%s,"socketPath":"%s/app-server-control/app-server-control.sock","managedCodexVersion":"0.154.0"}\n' "$$" "$CODEX_HOME"
-elif [[ "${1:-} ${2:-} ${3:-}" == "app-server daemon enable-remote-control" ]]; then
-  printf '{"status":"running"}\n'
-elif [[ "${1:-} ${2:-}" == "remote-control pair" ]]; then
-  printf 'PAIR-CODE\n'
-fi
+#!/usr/bin/env python3
+import json, os, signal, socket, subprocess, sys, time
+home = os.environ["CODEX_HOME"]
+path = home + "/app-server-control/app-server-control.sock"
+pidfile = home + "/fake-daemon.pid"
+with open(os.environ["IHAR_FAKE_LOG"], "a", encoding="utf-8") as log:
+    log.write(" ".join(sys.argv[1:]) + "\n")
+if sys.argv[1:] == ["--version"]:
+    print("codex-cli 0.154.0")
+elif sys.argv[1:] == ["app-server", "daemon", "start"]:
+    child = subprocess.Popen([sys.executable, __file__, "serve"], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    for _ in range(100):
+        if os.path.exists(path):
+            break
+        time.sleep(.01)
+    print(json.dumps({"status": "started", "pid": child.pid, "socketPath": path,
+                      "managedCodexVersion": "0.154.0"}))
+elif sys.argv[1:] == ["app-server", "daemon", "stop"]:
+    os.killpg(int(open(pidfile, encoding="utf-8").read()), signal.SIGTERM)
+    print(json.dumps({"status": "stopped"}))
+elif sys.argv[1:] == ["app-server", "daemon", "version"]:
+    if os.path.exists(path):
+        print(json.dumps({"status": "running", "pid": int(open(pidfile).read()),
+                          "socketPath": path, "managedCodexVersion": "0.154.0"}))
+    else:
+        print(json.dumps({"status": "absent"}))
+        sys.exit(1)
+elif sys.argv[1:] == ["serve"]:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(path)
+    listener.listen()
+    with open(pidfile, "w", encoding="utf-8") as output:
+        output.write(str(os.getpid()))
+    def shutdown(*_):
+        listener.close()
+        os.unlink(path)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, shutdown)
+    while True:
+        time.sleep(1)
 EOF
 chmod +x "$FAKE"
 
+actual_status=0
 actual="$(cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
-  IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_LOG="$LOG" "$ROOT/ihar.sh" codex --web 2>&1)"
+  IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_LOG="$LOG" "$ROOT/ihar.sh" codex --web 2>&1)" || actual_status=$?
 calls="$(cat "$LOG")"
 assert_contains "Codex web starts the managed daemon" "$calls" \
   "app-server daemon start"
-assert_contains "Codex web enables remote control" "$calls" \
-  "app-server daemon enable-remote-control"
-assert_contains "Codex web creates a pairing code" "$calls" "remote-control pair"
-assert_contains "the pairing code reaches the operator" "$actual" "PAIR-CODE"
-assert_contains "the TUI attaches over the control socket" "$calls" \
-  "--remote unix://"
+assert_eq "unproved Codex web attachment fails closed" "3" "$actual_status"
+assert_contains "web refusal names credential-write proof" "$actual" "credential-write topology"
+assert_eq "web does not start another credential writer" "0" \
+  "$(grep -Ec 'enable-remote-control|remote-control pair|--remote unix://' "$LOG")"
 
 record="$(find "$IHAR_STATE_ROOT" -path '*/daemons/codex.json' -print -quit)"
 assert_exit "the managed daemon is recorded" 0 test -f "$record"
-assert_eq "the record marks remote control enabled" "True" \
+assert_eq "the record does not claim remote control" "False" \
   "$(python3 -c "import json; print(json.load(open('$record'))['remote_control'])")"
+daemon_home="$(python3 -c "import json; print(json.load(open('$record'))['socket'].rsplit('/app-server-control/', 1)[0])")"
+daemon_pid="$(python3 -c "import json; print(json.load(open('$record'))['pid'])")"
+assert_exit "fake daemon PID remains live" 0 kill -0 "$daemon_pid"
+assert_exit "fake daemon socket remains live" 0 test -S "$daemon_home/app-server-control/app-server-control.sock"
+stop_status=0
+stop_out="$(PYTHONPATH="$ROOT/lib/python" python3 -m ihar.codex.daemon stop --binary "$FAKE" --home "$daemon_home" \
+  --state "$(dirname "$(dirname "$record")")" --auth-store "$IHAR_STORE" 2>&1)" || stop_status=$?
+assert_eq "web fixture stop is accepted" "0" "$stop_status"
+[[ "$stop_status" == 0 ]] || printf '%s\n' "$stop_out"
+for _ in {1..100}; do
+  [[ ! -e "$IHAR_STORE/auth/codex/.owner.json" ]] && break
+  sleep 0.05
+done
+assert_exit "web fixture daemon stops through owner" 1 test -e "$IHAR_STORE/auth/codex/.owner.json"
 
 # The daemon lock covers the whole remote setup, not just record writes. Replacing
 # the worker with a critical-section probe makes overlap observable without mocking
