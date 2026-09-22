@@ -26,6 +26,7 @@
     "tests/test_jsonio.py",
     "tests/test_lifecycle.sh",
     "tests/test_lockfile.sh",
+    "tests/test_lockfile_pin_state.py",
     "tests/test_locks.sh",
     "tests/test_mask_engine.py",
     "tests/test_mcp.sh",
