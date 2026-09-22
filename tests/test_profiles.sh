@@ -471,13 +471,26 @@ for vendor in claude codex; do
   ihar_render_all "$vendor" "$expected_render"
   mkdir -p "$CHECK_STATE/r/$expected_hash/$vendor"
   cp -R "$expected_render/." "$CHECK_STATE/r/$expected_hash/$vendor/"
+  if [[ "$vendor" == codex ]]; then
+    # The copied render has configuration only; a real published Codex runtime
+    # also has the declared link to the private shared credential owner.
+    mkdir -p "$IHAR_STORE/auth/codex"
+    chmod 700 "$IHAR_STORE/auth" "$IHAR_STORE/auth/codex"
+    printf 'synthetic profile credential\n' > "$IHAR_STORE/auth/codex/auth.json"
+    chmod 600 "$IHAR_STORE/auth/codex/auth.json"
+    ln -s "$IHAR_STORE/auth/codex/auth.json" \
+      "$CHECK_STATE/r/$expected_hash/codex/auth.json"
+  fi
 done
 mkdir -p "$CHECK_STATE/r/ffffffff/claude" "$CHECK_STATE/r/ffffffff/codex"
 printf 'wrong newest\n' > "$CHECK_STATE/r/ffffffff/claude/settings.json"
 printf 'wrong newest\n' > "$CHECK_STATE/r/ffffffff/codex/config.toml"
 touch "$CHECK_STATE/r/ffffffff"
 exact_diff="$(ihar --profile protected check --diff)"
-assert_eq "diff uses exact desired runtime and real gateway inputs" "no differences" "$exact_diff"
+assert_eq "diff uses exact desired runtime and real gateway inputs" "no differences" \
+  "$(tail -n 1 <<<"$exact_diff")"
+assert_contains "clean Codex fixture has verified mutable link" "$exact_diff" \
+  "codex mutable-link: valid; auth-owner: no recorded owner"
 combined_status=0
 combined_output="$(IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
   IHAR_TEST_FAIL_VENDOR=claude IHAR_CLAUDE_BIN="$VENDOR_STUB" \
