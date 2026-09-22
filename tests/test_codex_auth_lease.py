@@ -136,6 +136,7 @@ class AuthLeaseTests(unittest.TestCase):
             auth_owner.acquire(self.runtime_b, "foreground")
         auth_owner.detach(attached)
         stop_group()
+        auth_owner.mark_daemon_quiescent(first)
         auth_owner.release(first)
         second = auth_owner.acquire(self.runtime_b, "foreground")
         auth_owner.release(second)
@@ -338,6 +339,97 @@ elif sys.argv[1:] == ['serve']:
         stopped = subprocess.run(base + ["stop"] + common, env=env,
                                  capture_output=True, text=True, timeout=5)
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        next_owner = auth_owner.acquire(self.runtime_b, "foreground")
+        auth_owner.release(next_owner)
+
+    def _review_daemon(self, mode: str) -> tuple[Path, dict[str, str], list[str]]:
+        auth_owner.stage(self.store)
+        (self.runtime_a / "auth.json").symlink_to(self.store / "auth" / "codex" / "auth.json")
+        binary = self.root / "review-codex"
+        binary.write_text("""#!/usr/bin/env python3
+import json, os, signal, socket, subprocess, sys, time
+home = os.environ['CODEX_HOME']
+sock = home + '/app-server-control/app-server-control.sock'
+pidfile = home + '/daemon.pid'
+detached = home + '/detached.pid'
+mode = os.environ['FAKE_DAEMON_MODE']
+if sys.argv[1:] == ['app-server', 'daemon', 'start']:
+    child = subprocess.Popen([sys.executable, __file__, 'serve'], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(200):
+        if os.path.exists(sock) and (mode != 'detached' or os.path.exists(detached)): break
+        time.sleep(.01)
+    if mode == 'malformed': print('not-json')
+    else: print(json.dumps({'status':'started','pid':child.pid,'socketPath':sock}))
+elif sys.argv[1:] == ['app-server', 'daemon', 'stop']:
+    os.killpg(int(open(pidfile).read()), signal.SIGTERM)
+    print(json.dumps({'status':'stopped'}))
+elif sys.argv[1:] == ['serve']:
+    os.makedirs(os.path.dirname(sock), exist_ok=True)
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(sock)
+    open(pidfile,'w').write(str(os.getpid()))
+    if mode == 'detached':
+        child = subprocess.Popen([sys.executable, __file__, 'descendant'],
+                                 start_new_session=True, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        open(detached,'w').write(str(child.pid))
+    def shutdown(*_):
+        listener.close()
+        os.unlink(sock)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, shutdown)
+    while True: time.sleep(1)
+elif sys.argv[1:] == ['descendant']:
+    time.sleep(30)
+""")
+        binary.chmod(0o700)
+        def cleanup() -> None:
+            for name in ("daemon.pid", "detached.pid"):
+                path = self.runtime_a / name
+                if path.exists():
+                    try:
+                        os.killpg(int(path.read_text()), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+        self.addCleanup(cleanup)
+        env = dict(os.environ, CODEX_HOME=str(self.runtime_a), FAKE_DAEMON_MODE=mode,
+                   PYTHONPATH=str(Path(__file__).resolve().parents[1] / "lib" / "python"))
+        common = ["--binary", str(binary), "--home", str(self.runtime_a),
+                  "--state", str(self.root / "state"), "--auth-store", str(self.store)]
+        return binary, env, common
+
+    def test_malformed_start_response_retains_owner_after_daemon_spawn(self) -> None:
+        _binary, env, common = self._review_daemon("malformed")
+        answer = subprocess.run([sys.executable, "-m", "ihar.codex.daemon", "start"] + common,
+                                env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(answer.returncode, 3)
+        self.assertTrue((self.runtime_a / "daemon.pid").exists())
+        self.assertTrue(self.record.exists(), "uncertain start must retain owner")
+        with self.assertRaises(auth_owner.AuthOwnerError):
+            auth_owner.acquire(self.runtime_b, "foreground")
+
+    def test_detached_daemon_descendant_blocks_stop_release(self) -> None:
+        _binary, env, common = self._review_daemon("detached")
+        started = subprocess.run([sys.executable, "-m", "ihar.codex.daemon", "start"] + common,
+                                 env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertTrue((self.runtime_a / "detached.pid").exists())
+        stopped = subprocess.run([sys.executable, "-m", "ihar.codex.daemon", "stop"] + common,
+                                 env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(stopped.returncode, 3, "detached child still owns credential")
+        self.assertTrue(self.record.exists())
+        with self.assertRaises(auth_owner.AuthOwnerError):
+            auth_owner.acquire(self.runtime_b, "foreground")
+        os.killpg(int((self.runtime_a / "detached.pid").read_text()), signal.SIGTERM)
+        for _ in range(100):
+            if json.loads(self.record.read_text()).get("state") == "quiescent":
+                break
+            time.sleep(0.05)
+        self.assertEqual(json.loads(self.record.read_text()).get("state"), "quiescent")
+        retried = subprocess.run([sys.executable, "-m", "ihar.codex.daemon", "stop"] + common,
+                                 env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
         next_owner = auth_owner.acquire(self.runtime_b, "foreground")
         auth_owner.release(next_owner)
 

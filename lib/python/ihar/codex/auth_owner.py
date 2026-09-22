@@ -1,7 +1,6 @@
-"""Protected, one-use Codex login staging and credential publication.
+"""Protected Codex credential publication and supervised vendor ownership.
 
-The caller must hold the exclusive Codex auth-owner lease and prove vendor
-quiescence before calling ``publish``. This module does not launch a vendor.
+Publication needs the exclusive auth-owner lease and proven vendor quiescence.
 """
 
 from __future__ import annotations
@@ -357,6 +356,19 @@ def daemon_owner_id(runtime: str | os.PathLike[str], *,
         return record["id"]
 
 
+def daemon_stop_owner_id(runtime: str | os.PathLike[str], *,
+                         store: str | os.PathLike[str] | None = None) -> str:
+    """Allow a bounded stop retry after daemon exit while retaining the lease."""
+    with ExitStack() as stack:
+        owner = _locked_owner(_lease_store(store), stack)
+        record = _read_owner(owner)
+        if (record is None or record.get("runtime") != os.path.abspath(runtime)
+            or record.get("mode") != "daemon" or not record.get("daemon")
+            or (record.get("state") != "quiescent" and not owner_identity_proven(record))):
+            raise AuthOwnerError("Codex daemon auth owner cannot be verified")
+        return record["id"]
+
+
 def bind_daemon(owner_id: str, pid: int, socket: str | os.PathLike[str],
                 binary: str | os.PathLike[str], *,
                 store: str | os.PathLike[str] | None = None) -> None:
@@ -378,8 +390,28 @@ def bind_daemon(owner_id: str, pid: int, socket: str | os.PathLike[str],
     _update_owner(owner_id, update, store=store)
 
 
+def mark_daemon_quiescent(owner_id: str, *,
+                          store: str | os.PathLike[str] | None = None) -> None:
+    """Only the live guardian may certify daemon and descendant exit."""
+    def update(record: dict, owner: int) -> None:
+        guardian = record.get("guardian")
+        if (not guardian or guardian["pid"] != os.getpid()
+            or not _identity_matches(guardian, _process_table())
+            or not record.get("daemon")):
+            raise AuthOwnerError("Codex daemon guardian cannot be verified")
+        _reap_children()
+        if (_group_active(record["daemon"])
+            or _descendants_active(os.getpid())):
+            raise AuthBusy("Codex daemon descendants are still active")
+        record["state"] = "quiescent"
+        _write_owner(owner, record)
+    _update_owner(owner_id, update, store=store)
+
+
 def release(owner_id: str, *, store: str | os.PathLike[str] | None = None) -> None:
     def update(record: dict, owner: int) -> None:
+        if record.get("daemon") and record.get("state") != "quiescent":
+            raise AuthBusy("Codex daemon quiescence has not been verified")
         if record.get("attached_guardian"):
             raise AuthBusy("Codex attached client is unresolved")
         if record.get("child") and owner_is_active(dict(record, guardian=None, daemon=None)):
@@ -445,6 +477,61 @@ def _reap_children() -> None:
             return
         if pid == 0:
             return
+
+
+def _daemon_guardian(arguments: list[str]) -> int:
+    """Start a managed daemon, answer once, then remain its subreaper."""
+    if len(arguments) != 4:
+        raise AuthOwnerError("Codex daemon guardian invocation is invalid")
+    store_name, runtime, config_hash, binary = arguments
+    store = _lease_store(store_name)
+    owner_id = None
+    bound = False
+    try:
+        require_descendant_supervision()
+        verify_runtime_link(runtime, store)
+        owner_id = acquire(runtime, "daemon", store=store, config_hash=config_hash)
+        from . import daemon
+        answer = daemon._daemon_call(binary, runtime, "start")
+        if not daemon.running(answer):
+            raise AuthOwnerError("Codex daemon start did not prove a running daemon")
+        socket_path = answer.get("socketPath", "")
+        for _ in range(60):
+            if os.path.exists(socket_path):
+                break
+            time.sleep(0.05)
+        bind_daemon(owner_id, int(answer.get("pid", 0) or 0), socket_path,
+                    binary, store=store)
+        verify_runtime_link(runtime, store)
+        bound = True
+        print(json.dumps({"answer": answer}), flush=True)
+    except (AuthOwnerError, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(json.dumps({"error": str(error)}), flush=True)
+    finally:
+        # The caller's captured pipe must close while the guardian keeps running.
+        sys.stdout.flush()
+        descriptor = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(descriptor, sys.stdout.fileno())
+        os.close(descriptor)
+    if owner_id is None:
+        return 3
+    if not bound:
+        # Unknown start outcome is never a release proof, even after child exit.
+        while True:
+            _reap_children()
+            if not _descendants_active(os.getpid()):
+                return 3
+            time.sleep(0.05)
+    while True:
+        _reap_children()
+        try:
+            mark_daemon_quiescent(owner_id, store=store)
+        except AuthBusy:
+            time.sleep(0.05)
+        except AuthOwnerError:
+            return 3
+        else:
+            return 0
 
 
 def _run_vendor(owner_id: str, command: list[str], *, store: Path,
@@ -548,6 +635,8 @@ def _logout_canonical(staged: Path, store: Path) -> None:
 
 
 def _main(arguments: list[str]) -> int:
+    if arguments and arguments[0] == "daemon-guardian":
+        return _daemon_guardian(arguments[1:])
     if len(arguments) < 6 or arguments[0] not in ("run", "auth") or "--" not in arguments:
         raise AuthOwnerError("Codex auth owner invocation is invalid")
     action, store_name, runtime_name = arguments[:3]

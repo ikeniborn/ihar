@@ -32,6 +32,7 @@ import datetime as _datetime
 import hashlib
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -93,42 +94,49 @@ def status(binary: str, home: str) -> dict:
 
 def start(binary: str, home: str, *, auth_store: str | None = None,
           config_hash: str = "") -> dict:
-    owner_id = None
-    if auth_store is not None:
-        auth_owner.require_descendant_supervision()
-        auth_owner.verify_runtime_link(home, auth_store)
-        owner_id = auth_owner.acquire(home, "daemon", store=auth_store,
-                                      config_hash=config_hash)
-    answer = _daemon_call(binary, home, "start")
-    if owner_id is not None:
-        if not running(answer):
-            auth_owner.release(owner_id, store=auth_store)
-        else:
-            socket_path = answer.get("socketPath", "")
-            for _ in range(60):
-                if os.path.exists(socket_path):
-                    break
-                time.sleep(0.05)
-            auth_owner.bind_daemon(owner_id, int(answer.get("pid", 0) or 0),
-                                   socket_path, binary, store=auth_store)
-            auth_owner.verify_runtime_link(home, auth_store)
-    return answer
+    if auth_store is None:
+        return _daemon_call(binary, home, "start")
+    auth_owner.require_descendant_supervision()
+    auth_owner.verify_runtime_link(home, auth_store)
+    guardian = subprocess.Popen(
+        [sys.executable, "-m", "ihar.codex.auth_owner", "daemon-guardian",
+         auth_store, home, config_hash, binary],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    assert guardian.stdout is not None
+    try:
+        if not select.select([guardian.stdout], [], [], 125)[0]:
+            raise auth_owner.AuthOwnerError("Codex daemon guardian start timed out; owner retained")
+        line = guardian.stdout.readline()
+        if not line:
+            raise auth_owner.AuthOwnerError("Codex daemon guardian exited without a start proof")
+        result = json.loads(line)
+        if not isinstance(result, dict) or "answer" not in result:
+            raise auth_owner.AuthOwnerError(
+                str(result.get("error", "Codex daemon start proof is invalid")))
+        return result["answer"]
+    except (ValueError, AttributeError) as error:
+        raise auth_owner.AuthOwnerError("Codex daemon guardian start proof is invalid") from error
+    finally:
+        guardian.stdout.close()
 
 
 def stop(binary: str, home: str, *, auth_store: str | None = None) -> dict:
-    owner_id = (auth_owner.daemon_owner_id(home, store=auth_store)
+    owner_id = (auth_owner.daemon_stop_owner_id(home, store=auth_store)
                 if auth_store is not None else None)
     answer = _daemon_call(binary, home, "stop", timeout=60.0)
     if owner_id is not None:
         auth_owner.verify_runtime_link(home, auth_store)
-        for _ in range(60):
+        deadline = time.monotonic() + 3
+        while True:
             try:
                 auth_owner.release(owner_id, store=auth_store)
                 break
             except auth_owner.AuthBusy:
+                if time.monotonic() >= deadline:
+                    raise auth_owner.AuthBusy("Codex daemon did not become quiescent after stop")
                 time.sleep(0.05)
-        else:
-            raise auth_owner.AuthBusy("Codex daemon did not become quiescent after stop")
     return answer
 
 
