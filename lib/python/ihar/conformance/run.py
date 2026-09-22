@@ -312,7 +312,34 @@ def _prepare_codex_hooks(binary: str, home: str, workdir: str) -> tuple[bool, st
     return code == 0, "Codex did not trust the staged conformance hooks"
 
 
-_LAST_TURN: dict[str, bool] = {}
+_LAST_TURN: dict[str, object] = {}
+
+# Phrases the vendors use, matched only to classify. Nothing from the text is stored or
+# printed: the record keeps one word from REASONS and the status that goes with it.
+_ENVIRONMENT_PHRASES = (
+    ("usage limit", "vendor-quota-exhausted"),
+    ("quota", "vendor-quota-exhausted"),
+    ("rate limit", "vendor-quota-exhausted"),
+    ("not logged in", "vendor-unauthenticated"),
+    ("please log in", "vendor-unauthenticated"),
+    ("login required", "vendor-unauthenticated"),
+    ("unauthorized", "vendor-unauthenticated"),
+    ("401", "vendor-unauthenticated"),
+    ("could not connect", "vendor-unreachable"),
+    ("connection refused", "vendor-unreachable"),
+    ("name or service not known", "vendor-unreachable"),
+)
+
+
+def _environment_reason(text: str, returncode: int) -> str:
+    """One word when the environment stopped the turn, empty when it did not."""
+    if returncode == 0:
+        return ""
+    lowered = (text or "").lower()
+    for phrase, reason in _ENVIRONMENT_PHRASES:
+        if phrase in lowered:
+            return reason
+    return ""
 
 
 def _vendor_turn(
@@ -354,6 +381,12 @@ def _vendor_turn(
     # One bit, not the text: did this binary reject the argv we built? Without it a
     # harness that passes a flag the pinned vendor removed looks exactly like a policy
     # that did not hold, which is what happened with `--ask-for-approval`.
+    # An environment that stopped the turn is not a policy that failed. A quota, a
+    # missing login and an unreachable endpoint say nothing about whether this vendor
+    # honours a hook decision, and recording them as failures both hides the real state
+    # and blocks an install that has nothing wrong with it.
+    _LAST_TURN["environment"] = _environment_reason(
+        (result.stdout or "") + (result.stderr or ""), result.returncode)
     _LAST_TURN["rejected_argv"] = bool(
         result.returncode != 0
         and ("unexpected argument" in (result.stderr or "")
@@ -388,6 +421,9 @@ def _configure_mcp(home: str, vendor: str, marker: str) -> str | None:
 # not dynamic, and it is the difference between "failed" and "failed because the binary
 # rejected our argv" — which is what two sessions of looking at authentication cost.
 REASONS = (
+    "vendor-quota-exhausted",
+    "vendor-unauthenticated",
+    "vendor-unreachable",
     "vendor-rejected-argv",
     "vendor-exited-nonzero",
     "hook-never-fired",
@@ -780,13 +816,19 @@ def run(
             record["cases"][name] = entry
         for name in sorted(LIVE_CASES):
             rejected = False
+            environment = ""
             try:
                 status, detail = _run_live_case(vendor, binary, home, workdir, name)
-                rejected = _LAST_TURN.get("rejected_argv", False)
+                rejected = bool(_LAST_TURN.get("rejected_argv", False))
+                environment = str(_LAST_TURN.get("environment") or "")
             except Exception:                      # noqa: BLE001
                 status, detail = "failed", "the case raised"
+            if status == "failed" and environment:
+                # Unmeasured, not failed: nothing here says the vendor mishandled a hook.
+                status, reason = "unmeasured", environment
+            else:
+                reason = _reason_for(status, detail, rejected)
             entry = {"status": status, "detail": f"{name}: {status}"}
-            reason = _reason_for(status, detail, rejected)
             if reason:
                 entry["reason"] = reason
             record["cases"][name] = entry
@@ -848,15 +890,17 @@ def main(argv: list[str]) -> int:
               file=sys.stderr)
         return 3
 
-    failed = sorted(name for name in REQUIRED_CASES[vendor]
-                    if record["cases"][name]["status"] == "failed")
+    unproven = sorted(name for name in REQUIRED_CASES[vendor]
+                      if record["cases"][name]["status"] != "passed")
+    failed = unproven
     if "--json" in options:
         print(json.dumps(record, indent=2, sort_keys=True))
     else:
         for name in failed:
             # One word from a closed set, never a sentence and never vendor output.
-            reason = record["cases"][name].get("reason")
-            print(f"failed {name}" + (f" ({reason})" if reason else ""))
+            case = record["cases"][name]
+            reason = case.get("reason")
+            print(f"{case['status']} {name}" + (f" ({reason})" if reason else ""))
     return 1 if failed else 0
 
 

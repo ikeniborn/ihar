@@ -818,13 +818,19 @@ KINDS: dict[str, dict[str, Any]] = {
                 "type": dict,
                 "values": {
                     "type": dict,
-                    "fields": {"status": {"type": str, "enum": ("passed", "failed", "skipped")}},
+                    "fields": {"status": {"type": str, "enum": (
+                        # `unmeasured` is not a softer `failed`: it means the case never
+                        # ran, so it proves nothing either way and can never satisfy an
+                        # enforced profile.
+                        "passed", "failed", "skipped", "unmeasured")}},
                     # `reason` is a word from a closed set, never a sentence: §14 keeps
                     # dynamic text out of a persisted record, and "failed" alone cost two
                     # sessions of looking at the wrong cause.
                     "optional": {
                         "detail": {"type": str},
                         "reason": {"type": str, "enum": (
+                            "vendor-quota-exhausted", "vendor-unauthenticated",
+                            "vendor-unreachable",
                             "vendor-rejected-argv", "vendor-exited-nonzero",
                             "hook-never-fired", "sentinel-missing",
                             "decision-not-recorded", "timeout", "case-raised",
