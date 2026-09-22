@@ -16,6 +16,9 @@ from ihar.jsonio import check
 from ihar.mask.engine import Masker
 
 MAX_BYTES = 8192
+# The transcript export is pointed at, never inlined, so this budget bounds the file on
+# disk and the masking work, not the package. LLD section 20 owns its measurement.
+TRANSCRIPT_BYTES = 2_000_000
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -78,6 +81,31 @@ def _bound(package: dict) -> None:
             raise ValueError("handoff identity and git state exceed 8192 bytes")
 
 
+def _render_transcript(source: dict, messages: list[dict], masker: Masker) -> str:
+    """Render the source session as Markdown, masked by the engine of step 4."""
+    lines = [f"# Handoff transcript: {source['vendor']} / {source['vendor_session_id']}", ""]
+    for message in messages:
+        stamp = f" — {message['at']}" if message.get("at") else ""
+        lines.extend([f"## {message.get('role', 'unknown')}{stamp}", "", message.get("text", ""), ""])
+    return masker.mask("\n".join(lines).rstrip() + "\n")[0]
+
+
+def _write_transcript(source: dict, messages: list[dict], masker: Masker,
+                      budget: int, path: Path) -> dict:
+    """Write the masked transcript within its byte budget, oldest messages dropped first."""
+    kept = list(messages)
+    truncated = False
+    while kept:
+        data = _render_transcript(source, kept, masker).encode()
+        if len(data) <= budget:
+            _atomic(path, data)
+            return {"mode": "transcript", "file": str(path), "messages": len(messages),
+                    "bytes": len(data), "truncated": truncated}
+        kept.pop(0)
+        truncated = True
+    raise ValueError(f"no transcript message fits {budget} bytes")
+
+
 def render_markdown(package: dict) -> str:
     lines = ["# ihar handoff", "", f"From: {package['source_vendor']} / {package['source_session_id']}",
              f"To: {package['target_vendor']}", f"Project: {package['project']}",
@@ -90,6 +118,14 @@ def render_markdown(package: dict) -> str:
             lines.extend([f"## {heading}", "", *[f"- {value}" for value in values], ""])
     if package.get("summary"):
         lines.extend(["## Summary", "", package["summary"], ""])
+    history = package.get("history") or {}
+    if history.get("file"):
+        note = "oldest messages were dropped to fit the budget" if history["truncated"] \
+            else "complete"
+        lines.extend(["## History", "",
+                      f"The source transcript is at {history['file']}"
+                      f" ({history['messages']} messages, {note}).",
+                      "Read that file if this package is not enough; it is not repeated here.", ""])
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -107,7 +143,9 @@ def _atomic(path: Path, data: bytes) -> None:
 
 
 def build_package(source: dict, target_vendor: str, cwd: str | Path, state: str | Path,
-                  token: str, masking_level: str, context: dict, ledger: dict | None = None) -> dict:
+                  token: str, masking_level: str, context: dict, ledger: dict | None = None,
+                  history_mode: str = "summary", transcript: list | None = None,
+                  transcript_bytes: int | None = None) -> dict:
     cwd = Path(cwd)
     state = Path(state)
     git_state, files = _git_state(cwd)
@@ -123,6 +161,8 @@ def build_package(source: dict, target_vendor: str, cwd: str | Path, state: str 
         "decisions_heuristic": list(context.get("decisions_heuristic") or []),
         "recent_messages": list(context.get("recent_messages") or []),
         "masked": False, "masking_level": masking_level, "bytes": 0,
+        "history": {"mode": "summary", "file": None, "messages": 0,
+                    "bytes": 0, "truncated": False},
     }
     if ledger is None and (cwd / ".iwiki.toml").is_file():
         branch = git_state["branch"] or ""
@@ -133,12 +173,24 @@ def build_package(source: dict, target_vendor: str, cwd: str | Path, state: str 
         package["ledger"] = ledger
     if context.get("summary"):
         package["summary"] = context["summary"]
-    package = _mask(package, Masker(masking_level))
+    masker = Masker(masking_level)
+    package = _mask(package, masker)
     package["masked"] = True
+    directory = state / "handoff"
+    # A transcript is a convenience on top of a package that already stands on its own, so a
+    # render or masking failure degrades the mode instead of shipping an unmasked file or
+    # aborting the switch. The package's own sanitisation above stays fail-closed.
+    if history_mode == "transcript" and transcript:
+        try:
+            package["history"] = _write_transcript(
+                source, transcript, masker, transcript_bytes or TRANSCRIPT_BYTES,
+                directory / f"{source['ihar_id']}-transcript.md")
+        except Exception as error:  # noqa: BLE001 - the mode degrades whatever the cause
+            print(f"warning: the handoff transcript was not written ({error}); "
+                  "the package falls back to summary mode", file=sys.stderr)
     _bound(package)
     check("handoff", package)
     markdown = render_markdown(package).encode()
-    directory = state / "handoff"
     _atomic(directory / f"{source['ihar_id']}.json", _encoded(package))
     _atomic(directory / f"{source['ihar_id']}.md", markdown)
     _atomic(directory / "pending" / f"{token}.md", markdown)
@@ -150,11 +202,14 @@ def main(argv=None) -> int:
     parser.add_argument("--target", required=True, choices=("claude", "codex"))
     parser.add_argument("--cwd", required=True); parser.add_argument("--state", required=True)
     parser.add_argument("--token", required=True); parser.add_argument("--masking-level", required=True)
+    parser.add_argument("--history", choices=("summary", "transcript"), default="summary")
     args = parser.parse_args(argv)
     payload = json.load(sys.stdin)
+    budget = int(os.environ.get("IHAR_HANDOFF_TRANSCRIPT_BYTES") or TRANSCRIPT_BYTES)
     package = build_package(payload["source"], args.target, args.cwd, args.state,
                             args.token, args.masking_level, payload.get("context") or {},
-                            payload.get("ledger"))
+                            payload.get("ledger"), args.history,
+                            payload.get("transcript"), budget)
     print(json.dumps(package, sort_keys=True))
     return 0
 

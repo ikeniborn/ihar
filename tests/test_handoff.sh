@@ -46,6 +46,7 @@ assert_exit "first pending package is consumed" 1 test -f "$state/handoff/pendin
 assert_exit "second pending package is consumed" 1 test -f "$state/handoff/pending/$two.md"
 
 source "$ROOT/lib/handoff/handoff.sh"
+ihar_warn() { printf 'warning: %s\n' "$*" >&2; }
 IHAR_STATE="$state"
 carrier_id="$(python3 -m ihar.ids)"
 IHAR_LAUNCH_ID="$carrier_id"
@@ -123,5 +124,43 @@ linked="$(python3 -m ihar.sessions.index show "$state/sessions.jsonl" "$source_i
 assert_contains "switch links source to target" "$linked" "\"handoff_to\": \"$expected_target\""
 linked="$(python3 -m ihar.sessions.index show "$state/sessions.jsonl" "$expected_target")"
 assert_contains "switch links target back to source" "$linked" "\"handoff_from\": \"$source_id\""
+
+package="$(cat "$state/handoff/$source_id.json")"
+assert_contains "switch defaults to summary history" "$package" '"mode":"summary"'
+assert_exit "summary mode writes no transcript export" 1 \
+  test -f "$state/handoff/$source_id-transcript.md"
+
+# An unknown --history value is a usage error, not a silent fallback to summary: a user who
+# asked for the transcript and got a summary would never learn the history did not travel.
+out="$(cd "$project" && IHAR_LAUNCH_ID=missing "$ROOT/ihar.sh" switch --to codex --history all 2>&1 || true)"
+assert_contains "an unknown history mode is refused" "$out" "--history must be summary or transcript"
+
+# transcript mode reads the source session through the adapter and points at the export.
+ihar_adapter() {
+  if [[ "$2" == get_session ]]; then
+    printf '%s\n' '[{"role":"user","text":"first question","at":"2026-09-21T10:00:00Z"},{"role":"assistant","text":"first answer","at":"2026-09-21T10:01:00Z"}]'
+  else
+    printf '%s\n' '{"open_items":[],"decisions":[],"decisions_heuristic":[],"recent_messages":[]}'
+  fi
+}
+IHAR_FLAG_HISTORY=transcript
+ihar_cmd_switch
+assert_exit "transcript mode writes the export" 0 test -f "$state/handoff/$source_id-transcript.md"
+package="$(cat "$state/handoff/$source_id.json")"
+assert_contains "transcript mode is recorded" "$package" '"mode":"transcript"'
+assert_contains "the package points at the export" \
+  "$(cat "$state/handoff/pending/$expected_target.md")" "$source_id-transcript.md"
+assert_contains "the export carries the conversation" \
+  "$(cat "$state/handoff/$source_id-transcript.md")" "first answer"
+
+# An unreadable source transcript degrades the mode; it never aborts the switch.
+rm -f "$state/handoff/$source_id-transcript.md"
+ihar_adapter() { [[ "$2" == get_session ]] && return 1; printf '%s\n' '{"open_items":[],"decisions":[],"decisions_heuristic":[],"recent_messages":[]}'; }
+launched_vendor=""
+ihar_cmd_switch
+assert_eq "an unreadable transcript still switches" codex "$launched_vendor"
+package="$(cat "$state/handoff/$source_id.json")"
+assert_contains "an unreadable transcript degrades to summary" "$package" '"mode":"summary"'
+assert_exit "a degraded switch writes no export" 1 test -f "$state/handoff/$source_id-transcript.md"
 
 finish

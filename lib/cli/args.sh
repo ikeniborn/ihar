@@ -26,6 +26,7 @@ IHAR_FLAG_CONFORMANCE=false
 IHAR_FLAG_DIFF=false
 IHAR_FLAG_MIGRATE_STORE=false
 IHAR_FLAG_TO=""
+IHAR_FLAG_HISTORY=""
 IHAR_FLAG_MICROVM=false
 IHAR_FLAG_ACP=false
 IHAR_SUBCOMMAND=""
@@ -132,6 +133,8 @@ ihar_args_parse() {
       case "$1" in
         --to) _ihar_needs_value "$1" "${2:-}"; IHAR_FLAG_TO="$2"; shift 2; continue ;;
         --to=*) IHAR_FLAG_TO="${1#*=}"; shift; continue ;;
+        --history) _ihar_needs_value "$1" "${2:-}"; IHAR_FLAG_HISTORY="$2"; shift 2; continue ;;
+        --history=*) IHAR_FLAG_HISTORY="${1#*=}"; shift; continue ;;
       esac
     fi
 

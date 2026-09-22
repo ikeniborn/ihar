@@ -50,6 +50,16 @@
 # accepted: fork | local | off
 # IHAR_DISTILLER=fork
 
+# How much of the source conversation a switch carries. `transcript` writes a masked
+# export beside the package and points at it; those files are kept indefinitely.
+# accepted: summary | transcript
+# IHAR_HANDOFF_HISTORY=summary
+
+# Byte budget for that export. Oldest messages are dropped first and the package
+# records that it was truncated.
+# accepted: an integer
+# IHAR_HANDOFF_TRANSCRIPT_BYTES=2000000
+
 # Conversation language for the agents.
 # accepted: a language name
 # IHAR_CHAT_LANG=unset

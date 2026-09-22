@@ -59,6 +59,11 @@ def render_text(result: dict) -> str:
             f"asset        {asset['requirement']} {asset['presence']} "
             f"{asset['source']} -> {asset['target']}"
         )
+    handoff = result["handoff"]
+    lines.append(
+        f"handoff      {handoff['exports']} transcript export(s), {handoff['bytes']} bytes, "
+        "kept indefinitely"
+    )
     lines.append(f"mcp          {'strict' if result['mcp']['strict'] else 'not enforced'}")
     for vendor in ("claude", "codex"):
         lines.extend(f"             {vendor}: {note}" for note in result["mcp"]["notes"][vendor])
@@ -277,6 +282,7 @@ def _collect(target: str) -> None:
             "instances": json.loads(os.environ["_IHAR_CHECK_GATEWAY_INSTANCES"]),
         },
         "network": _network_status(),
+        "handoff": _handoff_exports(),
         "vendors": vendors,
         "assets": assets,
         "mcp": {
@@ -289,6 +295,24 @@ def _collect(target: str) -> None:
         "known_gaps": _split_lines("_IHAR_CHECK_KNOWN_GAPS"),
     }
     jsonio.write("check-result", target, result)
+
+
+def _handoff_exports() -> dict:
+    """Size the transcript exports, which are kept indefinitely by decision (LLD 11.2).
+
+    Nothing removes these files, so the growth is reported rather than left for a user to
+    discover. Read-only and fail-soft: an unreadable state root reports zero, never aborts.
+    """
+    directory = os.path.join(os.environ.get("IHAR_STATE", ""), "handoff")
+    total = count = 0
+    try:
+        for name in os.listdir(directory):
+            if name.endswith("-transcript.md"):
+                count += 1
+                total += os.stat(os.path.join(directory, name)).st_size
+    except OSError:
+        pass
+    return {"exports": count, "bytes": total}
 
 
 def _network_status() -> dict:

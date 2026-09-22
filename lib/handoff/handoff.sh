@@ -5,7 +5,10 @@ ihar_cmd_switch() {
   [[ "$IHAR_FLAG_TO" == claude || "$IHAR_FLAG_TO" == codex ]] \
     || ihar_die 2 "switch needs --to claude or --to codex"
   [[ -z "${IHAR_SUBCOMMAND:-}" && ${#IHAR_ARGS[@]} -eq 0 ]] \
-    || ihar_die 2 "switch accepts only --to claude or --to codex"
+    || ihar_die 2 "switch accepts only --to <vendor> and --history <mode>"
+  local history="${IHAR_FLAG_HISTORY:-${IHAR_HANDOFF_HISTORY:-summary}}"
+  [[ "$history" == summary || "$history" == transcript ]] \
+    || ihar_die 2 "--history must be summary or transcript"
   [[ -n "${IHAR_LAUNCH_ID:-}" ]] || ihar_die 2 "switch must run inside an ihar session"
   ihar_state_setup "$IHAR_PROJECT_ROOT" >/dev/null
   local source
@@ -37,10 +40,17 @@ ihar_cmd_switch() {
   if [[ -n "$summary" ]]; then
     context="$(printf '%s\n%s' "$context" "$summary" | ihar_python -c 'import json,sys; c=json.loads(sys.stdin.readline()); c["summary"]=sys.stdin.read(); print(json.dumps(c))')"
   fi
-  payload="$(printf '%s\n%s\n' "$source" "$context" | ihar_python -c 'import json,sys; print(json.dumps({"source":json.loads(sys.stdin.readline()),"context":json.loads(sys.stdin.readline())}))')"
+  local transcript="[]"
+  if [[ "$history" == transcript ]]; then
+    transcript="$(ihar_adapter "$source_vendor" get_session "$source_session")" || {
+      ihar_warn "the source transcript could not be read; the package falls back to summary mode"
+      transcript="[]"
+    }
+  fi
+  payload="$(printf '%s\n%s\n%s\n' "$source" "$context" "$transcript" | ihar_python -c 'import json,sys; print(json.dumps({"source":json.loads(sys.stdin.readline()),"context":json.loads(sys.stdin.readline()),"transcript":json.loads(sys.stdin.readline())}))')"
   printf '%s' "$payload" | ihar_python ihar.handoff.build --target "$IHAR_FLAG_TO" \
     --cwd "$IHAR_PROJECT_ROOT" --state "$IHAR_STATE" --token "$target_id" \
-    --masking-level "${IHAR_GATEWAY_MASKING_LEVEL:-off}" >/dev/null \
+    --masking-level "${IHAR_GATEWAY_MASKING_LEVEL:-off}" --history "$history" >/dev/null \
     || ihar_die 3 "cannot build and sanitise the handoff package"
   ihar_python ihar.sessions.index handoff "$IHAR_STATE/sessions.jsonl" "$IHAR_LAUNCH_ID" \
     "$target_id" "$IHAR_FLAG_TO" "$source_profile" "$(basename "$IHAR_PROJECT_ROOT")" "$IHAR_PROJECT_ROOT" \

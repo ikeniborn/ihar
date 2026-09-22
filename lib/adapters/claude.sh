@@ -106,3 +106,10 @@ adapter_claude_export_context() {
   local session="$1"
   ihar_python ihar.handoff.export claude "$IHAR_STATE/st/claude" "$session"
 }
+
+# stdout: JSON array of every user and assistant message, oldest first. Exit 1 when the
+# transcript cannot be read; the caller degrades the handoff to summary mode.
+adapter_claude_get_session() {
+  local session="$1"
+  ihar_python ihar.handoff.export claude "$IHAR_STATE/st/claude" "$session" --transcript
+}

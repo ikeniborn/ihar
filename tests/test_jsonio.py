@@ -105,6 +105,7 @@ CHECK_RESULT = {
         "active": False,
         "verified": False,
     },
+    "handoff": {"exports": 2, "bytes": 4096},
     "vendors": {
         "claude": {"receipt": "verified", "hooks": [{"id": "security-pretool", "trust": "configured", **HOOK_DETAIL_EMPTY}], "conformance": "proven", "capabilities": ["fork", "remote-control"]},
         "codex": {"receipt": "missing receipt", "hooks": [{"id": "security-pretool", "trust": "trusted", "trusted_hash": "sha256:" + "a" * 64, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": "sha256:" + "a" * 64}], "conformance": "unproven", "capabilities": ["archive", "fork"]},

@@ -34,6 +34,12 @@ KEYS = [
     ("IHAR_DISTILLER", "fork", "fork | local | off",
      "How a handoff summary is produced. `fork` asks the source agent on a fork of\n"
      "# its own session, so the transcript is never mutated."),
+    ("IHAR_HANDOFF_HISTORY", "summary", "summary | transcript",
+     "How much of the source conversation a switch carries. `transcript` writes a masked\n"
+     "# export beside the package and points at it; those files are kept indefinitely."),
+    ("IHAR_HANDOFF_TRANSCRIPT_BYTES", "2000000", "an integer",
+     "Byte budget for that export. Oldest messages are dropped first and the package\n"
+     "# records that it was truncated."),
     ("IHAR_CHAT_LANG", "unset", "a language name", "Conversation language for the agents."),
     ("IHAR_DOC_LANG", "unset", "a language name", "Documentation language for the agents."),
     ("IHAR_PROXY_URL", "unset", "a URL", "Corporate egress proxy, used by installs only."),

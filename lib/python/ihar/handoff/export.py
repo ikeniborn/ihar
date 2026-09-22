@@ -18,9 +18,34 @@ def _text(value):
     return ""
 
 
+def _candidates(home: Path, session_id: str) -> list[Path]:
+    return [path for path in home.rglob("*.jsonl") if session_id in path.name]
+
+
+def export_transcript(vendor: str, home: str | Path, session_id: str) -> list[dict]:
+    """Every user and assistant message of one session, oldest first (LLD 11.2 step 6).
+
+    Unlike `export_context`, nothing is dropped here: the byte budget belongs to the
+    builder, which is where the truncation is recorded and reported to the reader.
+    """
+    messages = []
+    for path in _candidates(Path(home), session_id)[:1]:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            message = item.get("message") or item.get("payload") or item
+            role = message.get("role") if isinstance(message, dict) else None
+            text = _text(message)
+            if role in ("user", "assistant") and text:
+                messages.append({"role": role, "text": text, "at": item.get("timestamp") or ""})
+    return messages
+
+
 def export_context(vendor: str, home: str | Path, session_id: str) -> dict:
     home = Path(home)
-    candidates = [path for path in home.rglob("*.jsonl") if session_id in path.name]
+    candidates = _candidates(home, session_id)
     messages = []
     open_items = []
     decisions = []
@@ -52,8 +77,11 @@ def export_context(vendor: str, home: str | Path, session_id: str) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(); parser.add_argument("vendor", choices=("claude", "codex"))
     parser.add_argument("home"); parser.add_argument("session_id")
+    parser.add_argument("--transcript", action="store_true",
+                        help="print the whole session instead of the bounded context")
     args = parser.parse_args(argv)
-    print(json.dumps(export_context(args.vendor, args.home, args.session_id), sort_keys=True))
+    reader = export_transcript if args.transcript else export_context
+    print(json.dumps(reader(args.vendor, args.home, args.session_id), sort_keys=True))
     return 0
 
 
