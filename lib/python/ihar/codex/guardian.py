@@ -650,7 +650,8 @@ def _poll_attachments(store: Path, attachments: dict[tuple[int, str], dict]) -> 
 
 def _handle(store: Path, channel: socket.socket, guardian_pid: int,
             *, external: bool = False,
-            attachments: dict[tuple[int, str], dict] | None = None) -> bool:
+            attachments: dict[tuple[int, str], dict] | None = None,
+            guest_resources: dict[str, int | None] | None = None) -> bool:
     control_space = socket.CMSG_SPACE(struct.calcsize("3i")) + socket.CMSG_SPACE(
         array.array("i").itemsize * 5)
     message, ancillary, flags, _address = channel.recvmsg(_MAX_MESSAGE + 1, control_space)
@@ -675,6 +676,8 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
         return True
     daemon_action = None
     guest_action = False
+    close_guest_image = False
+    guest_ack = None
     try:
         if (not message or len(message) > _MAX_MESSAGE
             or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
@@ -747,23 +750,57 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                 if any(not isinstance(fields[name], str) or not os.path.isabs(fields[name])
                        for name in fields):
                     raise auth_owner.AuthOwnerError("Codex guest bundle paths are invalid")
-                auth_owner.register_guarded_guest_bundle(
-                    fields["bundle"], fields["image"], fields["seed"], owner, record)
+                if guest_resources is None or guest_resources.get("image_fd") is not None:
+                    raise auth_owner.AuthOwnerError("Codex guest image owner is invalid")
+                image_fd = os.open(fields["image"], auth_owner._FILE_FLAGS)
+                try:
+                    auth_owner.register_guarded_guest_bundle(
+                        fields["bundle"], fields["image"], fields["seed"], owner, record,
+                        image_fd)
+                except BaseException:
+                    os.close(image_fd)
+                    raise
+                guest_resources["image_fd"] = image_fd
             elif operation == "guest-starting" and not fields:
-                auth_owner.mark_guarded_guest_starting(record)
+                auth_owner.mark_guarded_guest_starting(
+                    record, guest_resources.get("image_fd") if guest_resources else None)
             elif operation == "guest-bind-vm" and set(fields) == {"pid", "binary"}:
                 if not isinstance(fields["binary"], str):
                     raise auth_owner.AuthOwnerError("Codex guest VM binding is invalid")
                 identity = _identity(fields["pid"], fields["binary"], guardian_pid, table)
-                auth_owner.bind_guarded_guest_vm(identity, record)
+                auth_owner.bind_guarded_guest_vm(
+                    identity, record,
+                    guest_resources.get("image_fd") if guest_resources else None)
             elif operation == "guest-quiescent" and not fields:
-                auth_owner.mark_guarded_guest_quiescent(record)
+                auth_owner.mark_guarded_guest_quiescent(
+                    record, guest_resources.get("image_fd") if guest_resources else None)
+            elif operation == "guest-extract" and set(fields) == {"bundle"}:
+                if (guest_resources is None or guest_resources.get("image_fd") is None
+                    or not isinstance(fields["bundle"], str)
+                    or not os.path.isabs(fields["bundle"])):
+                    raise auth_owner.AuthOwnerError("Codex guest extraction owner is invalid")
+                auth_owner.extract_guarded_guest(
+                    guest_resources["image_fd"], fields["bundle"], record)
             elif operation == "guest-publish" and set(fields) == {"bundle"}:
                 if not isinstance(fields["bundle"], str) or not os.path.isabs(fields["bundle"]):
                     raise auth_owner.AuthOwnerError("Codex guest bundle path is invalid")
-                auth_owner.publish_guarded_guest(fields["bundle"], store, owner, record)
+                guest_ack = auth_owner.publish_guarded_guest(
+                    fields["bundle"], store, owner, record,
+                    guest_resources.get("image_fd") if guest_resources else None)
+            elif operation == "guest-ack" and set(fields) == {"bundle", "ack"}:
+                if (not isinstance(fields["bundle"], str)
+                    or not os.path.isabs(fields["bundle"])
+                    or not isinstance(fields["ack"], str)):
+                    raise auth_owner.AuthOwnerError("Codex guest bundle path is invalid")
+                auth_owner.acknowledge_guarded_guest(
+                    fields["bundle"], owner, record, fields["ack"],
+                    guest_resources.get("image_fd") if guest_resources else None)
+                close_guest_image = True
             elif operation == "guest-abort" and not fields:
-                auth_owner.abort_guarded_guest_prelaunch(owner, record)
+                auth_owner.abort_guarded_guest_prelaunch(
+                    owner, record,
+                    guest_resources.get("image_fd") if guest_resources else None)
+                close_guest_image = True
             elif operation == "release" and set(fields) <= {"guest_reconciled"}:
                 if credentials[0] != child_pid:
                     raise auth_owner.AuthOwnerError("Codex release caller is invalid")
@@ -842,7 +879,14 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                 raise auth_owner.AuthOwnerError("Codex guardian operation is invalid")
             if auth_action is None and daemon_action is None:
                 auth_owner._write_owner(owner, record)
+        if close_guest_image and guest_resources is not None:
+            image_fd = guest_resources.get("image_fd")
+            if image_fd is not None:
+                os.close(image_fd)
+                guest_resources["image_fd"] = None
         answer = {"ok": True, "state": record["state"]}
+        if guest_ack is not None:
+            answer["ack"] = guest_ack
         if daemon_action == "start":
             answer["answer"] = _start_daemon(store, fields["runtime"],
                                              fields["config_hash"], fields["binary"],
@@ -1077,6 +1121,7 @@ def run(store: Path, argv: list[str]) -> int:
             channel_open = True
             pending_control: dict[socket.socket, float] = {}
             attachments: dict[tuple[int, str], dict] = {}
+            guest_resources: dict[str, int | None] = {"image_fd": None}
             while True:
                 _poll_attachments(selected, attachments)
                 if status is None:
@@ -1116,7 +1161,8 @@ def run(store: Path, argv: list[str]) -> int:
                     [], [], timeout)
                 if server in readable:
                     channel_open = _handle(selected, server, os.getpid(),
-                                           attachments=attachments)
+                                           attachments=attachments,
+                                           guest_resources=guest_resources)
                     if not channel_open:
                         server.close()
                 for connection in list(pending_control):
@@ -1125,7 +1171,8 @@ def run(store: Path, argv: list[str]) -> int:
                     del pending_control[connection]
                     try:
                         _handle(selected, connection, os.getpid(), external=True,
-                                attachments=attachments)
+                                attachments=attachments,
+                                guest_resources=guest_resources)
                     finally:
                         connection.close()
                 if listener in readable:
@@ -1142,6 +1189,9 @@ def run(store: Path, argv: list[str]) -> int:
                             pending_control[connection] = (time.monotonic()
                                                            + _CONTROL_CLIENT_TTL)
         finally:
+            image_fd = guest_resources.get("image_fd")
+            if image_fd is not None:
+                os.close(image_fd)
             for connection in pending_control:
                 connection.close()
             for number, handler in previous_handlers.items():
@@ -1254,8 +1304,18 @@ def _main(arguments: list[str]) -> int:
             request(int(arguments[1]), action,
                     {"pid": int(arguments[2]), "binary": arguments[3]})
             return 0
-        if action == "guest-publish" and len(arguments) == 3:
-            request(int(arguments[1]), action, {"bundle": arguments[2]})
+        if action in ("guest-extract", "guest-publish") and len(arguments) == 3:
+            answer = request(int(arguments[1]), action, {"bundle": arguments[2]})
+            if action == "guest-publish":
+                acknowledgment = answer.get("ack")
+                if not isinstance(acknowledgment, str) or len(acknowledgment) != 64:
+                    raise auth_owner.AuthOwnerError(
+                        "Codex guest publication acknowledgment is invalid")
+                print(acknowledgment)
+            return 0
+        if action == "guest-ack" and len(arguments) == 4:
+            request(int(arguments[1]), action,
+                    {"bundle": arguments[2], "ack": arguments[3]})
             return 0
         raise auth_owner.AuthOwnerError("Codex guest guardian invocation is invalid")
     if len(arguments) >= 6 and arguments[0] == "attach" and arguments[4] == "--":

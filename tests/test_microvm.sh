@@ -243,6 +243,11 @@ guardian_call="$(
 assert_eq "guest bundle registration uses the inherited guardian channel" \
   "ihar.codex.guardian guest-register 42 /private/bundle /private/state.ext4 /private/seed.json" \
   "$guardian_call"
+guest_return_flow="$(sed -n '/ihar_codex_guest_owner quiescent/,/_ihar_microvm_cleanup/p' "$ROOT/lib/sandbox/microvm.sh")"
+assert_contains "guest extraction stays inside the inherited guardian" \
+  "$guest_return_flow" 'ihar_codex_guest_owner extract "$guest_auth_bundle"'
+assert_contains "guest publication requires a second authenticated acknowledgment" \
+  "$guest_return_flow" 'ihar_codex_guest_owner ack "$guest_auth_bundle" "$guest_publish_ack"'
 
 # --- host-side deny-by-default policy -------------------------------------------------
 

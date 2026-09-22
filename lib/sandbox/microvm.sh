@@ -1213,6 +1213,7 @@ ihar_microvm_launch() {
   local rootfs="$session/rootfs.ext4" workspace="$session/workspace.ext4"
   local policy="$session/policy.ext4" state_img="$session/state.ext4"
   local state_seed="$session/state-seed" guest_auth_bundle="$session/guest-auth"
+  local guest_publish_ack
   cp --sparse=always "$IHAR_STORE/bin/rootfs.ext4" "$rootfs" \
     || ihar_die 3 "cannot copy the microVM rootfs"
   local rootfs_base_sha256
@@ -1365,9 +1366,11 @@ ihar_microvm_launch() {
   pid=""
   ihar_codex_guest_owner quiescent \
     || ihar_die 3 "Codex guest quiescence cannot be verified; credential bundle retained"
-  _ihar_microvm_extract_guest_auth "$state_img" "$guest_auth_bundle" \
+  ihar_codex_guest_owner extract "$guest_auth_bundle" \
     || ihar_die 3 "Codex guest credential cannot be extracted; state image retained"
-  ihar_codex_guest_owner publish "$guest_auth_bundle" \
+  guest_publish_ack="$(ihar_codex_guest_owner publish "$guest_auth_bundle")" \
     || ihar_die 3 "Codex guest credential cannot be reconciled; bundle retained"
+  ihar_codex_guest_owner ack "$guest_auth_bundle" "$guest_publish_ack" \
+    || ihar_die 3 "Codex guest credential acknowledgment cannot be verified; bundle retained"
   _ihar_microvm_cleanup; trap - EXIT INT TERM; return "$status"
 }

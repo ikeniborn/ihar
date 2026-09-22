@@ -70,9 +70,15 @@ def mark_guest_quiescent(_owner: None, *, store: Path) -> None:
                     auth_owner.mark_guarded_guest_quiescent(record))
 
 
-def publish_guest(bundle: Path, _baseline: dict, store: Path, _owner: None) -> None:
+def publish_guest(bundle: Path, _baseline: dict, store: Path, _owner: None) -> str:
+    return _update_guarded(store, lambda descriptor, record:
+                           auth_owner.publish_guarded_guest(bundle, store, descriptor, record))
+
+
+def acknowledge_guest(bundle: Path, store: Path, acknowledgment: str) -> None:
     _update_guarded(store, lambda descriptor, record:
-                    auth_owner.publish_guarded_guest(bundle, store, descriptor, record))
+                    auth_owner.acknowledge_guarded_guest(
+                        bundle, descriptor, record, acknowledgment))
 
 
 def release(_owner: None, *, store: Path) -> None:
@@ -166,14 +172,18 @@ class GuestAuthTests(unittest.TestCase):
 
     def test_unchanged_guest_is_noop_and_owner_can_release(self) -> None:
         self.quiesce()
-        publish_guest(self.bundle, self.original_baseline, self.store, self.owner_id)
+        acknowledgment = publish_guest(
+            self.bundle, self.original_baseline, self.store, self.owner_id)
+        acknowledge_guest(self.bundle, self.store, acknowledgment)
         self.assertEqual(self.canonical.read_text(), "synthetic-old")
         release(self.owner_id, store=self.store)
 
     def test_changed_guest_is_published_with_private_recovery(self) -> None:
         self.guest_candidate.write_text("synthetic-refresh", encoding="utf-8")
         self.quiesce()
-        publish_guest(self.bundle, self.original_baseline, self.store, self.owner_id)
+        acknowledgment = publish_guest(
+            self.bundle, self.original_baseline, self.store, self.owner_id)
+        acknowledge_guest(self.bundle, self.store, acknowledgment)
         self.assertEqual(self.canonical.read_text(), "synthetic-refresh")
         recovered = list((self.canonical.parent / "recovery").glob("*/auth.json"))
         self.assertEqual(len(recovered), 1)
@@ -188,8 +198,46 @@ class GuestAuthTests(unittest.TestCase):
         replacement.chmod(0o600)
         os.replace(replacement, self.guest_candidate)
         self.quiesce()
-        publish_guest(self.bundle, self.original_baseline, self.store, self.owner_id)
+        acknowledgment = publish_guest(
+            self.bundle, self.original_baseline, self.store, self.owner_id)
+        acknowledge_guest(self.bundle, self.store, acknowledgment)
         self.assertEqual(self.canonical.read_text(), "synthetic-atomic-refresh")
+
+    def test_ack_rejects_candidate_replaced_after_publication(self) -> None:
+        self.guest_candidate.write_text("synthetic-refresh", encoding="utf-8")
+        self.quiesce()
+        acknowledgment = publish_guest(
+            self.bundle, self.original_baseline, self.store, self.owner_id)
+        replacement = self.bundle / ".auth-next"
+        replacement.write_text("synthetic-refresh", encoding="utf-8")
+        replacement.chmod(0o600)
+        os.replace(replacement, self.guest_candidate)
+        with self.assertRaisesRegex(AuthOwnerError, "publication changed"):
+            acknowledge_guest(self.bundle, self.store, acknowledgment)
+        with self.assertRaises(AuthOwnerError):
+            release(self.owner_id, store=self.store)
+
+    def test_ack_requires_token_delivered_by_publish_response(self) -> None:
+        self.quiesce()
+        publish_guest(self.bundle, self.original_baseline, self.store, self.owner_id)
+        with self.assertRaisesRegex(AuthOwnerError, "acknowledgment is invalid"):
+            acknowledge_guest(self.bundle, self.store, "0" * 64)
+        with self.assertRaises(AuthOwnerError):
+            release(self.owner_id, store=self.store)
+
+    def test_ack_rejects_canonical_replaced_after_publication(self) -> None:
+        self.guest_candidate.write_text("synthetic-refresh", encoding="utf-8")
+        self.quiesce()
+        acknowledgment = publish_guest(
+            self.bundle, self.original_baseline, self.store, self.owner_id)
+        replacement = self.canonical.parent / ".auth-next"
+        replacement.write_text("synthetic-refresh", encoding="utf-8")
+        replacement.chmod(0o600)
+        os.replace(replacement, self.canonical)
+        with self.assertRaisesRegex(AuthOwnerError, "publication changed"):
+            acknowledge_guest(self.bundle, self.store, acknowledgment)
+        with self.assertRaises(AuthOwnerError):
+            release(self.owner_id, store=self.store)
 
     def test_world_readable_guest_candidate_is_rejected(self) -> None:
         self.guest_candidate.chmod(0o644)
@@ -407,7 +455,8 @@ guardian.request(fd, 'guest-bind-vm', {{'pid': process.pid, 'binary': {sleep!r}}
 process.terminate()
 process.wait()
 guardian.request(fd, 'guest-quiescent', {{}})
-guardian.request(fd, 'guest-publish', {{'bundle': {str(bundle)!r}}})
+published = guardian.request(fd, 'guest-publish', {{'bundle': {str(bundle)!r}}})
+guardian.request(fd, 'guest-ack', {{'bundle': {str(bundle)!r}, 'ack': published['ack']}})
 """
         environment = dict(
             os.environ,
@@ -421,6 +470,121 @@ guardian.request(fd, 'guest-publish', {{'bundle': {str(bundle)!r}}})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(canonical.read_text(encoding="utf-8"), "synthetic-channel-refresh")
         self.assertFalse((canonical.parent / ".owner.json").exists())
+
+    def test_lost_publish_response_retains_owner_and_blocks_contender(self) -> None:
+        channel_root = self.root / "lost-response"
+        channel_store = channel_root / "store"
+        channel_store.mkdir(parents=True, mode=0o700)
+        canonical = channel_store / "auth" / "codex" / "auth.json"
+        canonical.parent.mkdir(parents=True, mode=0o700)
+        canonical.parent.parent.chmod(0o700)
+        canonical.write_text("synthetic-lost-old", encoding="utf-8")
+        canonical.chmod(0o600)
+        bundle = channel_root / "bundle"
+        bundle.mkdir(mode=0o700)
+        image = bundle / "state.ext4"
+        image.write_bytes(b"synthetic-lost-image")
+        seed = bundle / "seed.json"
+        seed.write_text("synthetic-lost-old", encoding="utf-8")
+        seed.chmod(0o600)
+        candidate = bundle / "auth.json"
+        candidate.write_text("synthetic-lost-refresh", encoding="utf-8")
+        candidate.chmod(0o600)
+        sleep = shutil.which("sleep")
+        self.assertIsNotNone(sleep)
+        script = f"""import array, json, os, socket, subprocess, time
+from pathlib import Path
+from ihar.codex import guardian
+fd = int(os.environ['IHAR_GUARD_FD'])
+guardian.request(fd, 'guest-register-bundle', {{'bundle': {str(bundle)!r}, 'image': {str(image)!r}, 'seed': {str(seed)!r}}})
+guardian.request(fd, 'guest-starting', {{}})
+process = subprocess.Popen([{sleep!r}, '60'], start_new_session=True)
+guardian.request(fd, 'guest-bind-vm', {{'pid': process.pid, 'binary': {sleep!r}}})
+process.terminate(); process.wait()
+guardian.request(fd, 'guest-quiescent', {{}})
+channel = socket.socket(fileno=os.dup(fd))
+reply, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+reply.close()
+message = json.dumps({{'operation': 'guest-publish', 'fields': {{'bundle': {str(bundle)!r}}}}}, separators=(',', ':')).encode('ascii')
+rights = array.array('i', [receiver.fileno()])
+channel.sendmsg([message], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
+receiver.close(); channel.close()
+owner = Path({str(canonical.parent / '.owner.json')!r})
+for _ in range(100):
+    record = json.loads(owner.read_text(encoding='utf-8'))
+    if record['guest_bundle']['state'] == 'published-pending': break
+    time.sleep(.01)
+else: raise SystemExit(4)
+"""
+        environment = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "lib", "python"))
+        result = subprocess.run(
+            [sys.executable, "-m", "ihar.codex.guardian", str(channel_store), "--", sys.executable, "-c", script],
+            capture_output=True, text=True, env=environment, timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertNotIn("synthetic-lost-refresh", result.stdout + result.stderr)
+        record = json.loads((canonical.parent / ".owner.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["guest_bundle"]["state"], "published-pending")
+        self.assertFalse(record["guest_reconciled"])
+        self.assertTrue(candidate.is_file())
+        contender = subprocess.run(
+            [sys.executable, "-m", "ihar.codex.guardian", str(channel_store), "--", sys.executable, "-c", "raise SystemExit(0)"],
+            capture_output=True, text=True, env=environment, timeout=5, check=False,
+        )
+        self.assertEqual(contender.returncode, 3)
+
+    def test_guardian_extract_uses_registered_image_fd_across_path_swap(self) -> None:
+        if not shutil.which("debugfs") or not shutil.which("mkfs.ext4"):
+            self.skipTest("ext4 tools unavailable")
+        channel_root = self.root / "image-fd"
+        channel_store = channel_root / "store"
+        channel_store.mkdir(parents=True, mode=0o700)
+        canonical = channel_store / "auth" / "codex" / "auth.json"
+        canonical.parent.mkdir(parents=True, mode=0o700)
+        canonical.parent.parent.chmod(0o700)
+        canonical.write_text("synthetic-fd-old", encoding="utf-8")
+        canonical.chmod(0o600)
+        bundle = channel_root / "bundle"
+        bundle.mkdir(mode=0o700)
+        seed = bundle / "seed.json"
+        seed.write_text("synthetic-fd-old", encoding="utf-8")
+        seed.chmod(0o600)
+        def make_image(path: Path, value: str) -> None:
+            source = channel_root / (path.stem + "-root") / ".ihar-guest-codex-home"
+            source.mkdir(parents=True)
+            (source / "auth.json").write_text(value, encoding="utf-8")
+            subprocess.run(["truncate", "-s", "16M", path], check=True)
+            subprocess.run(["mkfs.ext4", "-q", "-d", source.parent, path], check=True)
+        image = bundle / "state.ext4"
+        substitute = bundle / "substitute.ext4"
+        make_image(image, "synthetic-registered-refresh")
+        make_image(substitute, "synthetic-substitute-secret")
+        sleep = shutil.which("sleep")
+        self.assertIsNotNone(sleep)
+        parked = bundle / "registered.ext4"
+        script = f"""import os, subprocess
+from ihar.codex import guardian
+fd = int(os.environ['IHAR_GUARD_FD'])
+guardian.request(fd, 'guest-register-bundle', {{'bundle': {str(bundle)!r}, 'image': {str(image)!r}, 'seed': {str(seed)!r}}})
+guardian.request(fd, 'guest-starting', {{}})
+process = subprocess.Popen([{sleep!r}, '60'], start_new_session=True)
+guardian.request(fd, 'guest-bind-vm', {{'pid': process.pid, 'binary': {sleep!r}}})
+process.terminate(); process.wait()
+guardian.request(fd, 'guest-quiescent', {{}})
+os.rename({str(image)!r}, {str(parked)!r}); os.rename({str(substitute)!r}, {str(image)!r})
+guardian.request(fd, 'guest-extract', {{'bundle': {str(bundle)!r}}})
+os.rename({str(image)!r}, {str(substitute)!r}); os.rename({str(parked)!r}, {str(image)!r})
+published = guardian.request(fd, 'guest-publish', {{'bundle': {str(bundle)!r}}})
+guardian.request(fd, 'guest-ack', {{'bundle': {str(bundle)!r}, 'ack': published['ack']}})
+"""
+        environment = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "lib", "python"))
+        result = subprocess.run(
+            [sys.executable, "-m", "ihar.codex.guardian", str(channel_store), "--", sys.executable, "-c", script],
+            capture_output=True, text=True, env=environment, timeout=15, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(canonical.read_text(encoding="utf-8"), "synthetic-registered-refresh")
+        self.assertNotIn("synthetic-substitute-secret", result.stdout + result.stderr)
 
     def test_guest_acquire_cli_is_not_an_owner_id_capability(self) -> None:
         legacy = self.root / "legacy"
