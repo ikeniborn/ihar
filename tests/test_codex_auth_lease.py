@@ -6,6 +6,8 @@ from __future__ import annotations
 import array
 import json
 import os
+import pty
+import select
 import shutil
 import signal
 import socket as socket_module
@@ -69,7 +71,8 @@ class AuthLeaseTests(unittest.TestCase):
 
     def _run_ihar(self, *arguments: str, guard_fd: str | None = None,
                   legacy_guard_fd: str | None = None,
-                  binary_source: str | None = None) -> subprocess.CompletedProcess:
+                  binary_source: str | None = None,
+                  tty_reply: str | None = None) -> subprocess.CompletedProcess:
         root = Path(__file__).resolve().parents[1]
         project = self.root / "project"
         project.mkdir(exist_ok=True)
@@ -91,8 +94,38 @@ class AuthLeaseTests(unittest.TestCase):
             environment["IHAR_GUARD_FD"] = guard_fd
         if legacy_guard_fd is not None:
             environment["IHAR_CODEX_GUARD_FD"] = legacy_guard_fd
-        return subprocess.run([str(root / "ihar.sh"), *arguments], cwd=project,
-                              env=environment, capture_output=True, text=True, timeout=15)
+        command = [str(root / "ihar.sh"), *arguments]
+        if tty_reply is None:
+            return subprocess.run(command, cwd=project, env=environment,
+                                  capture_output=True, text=True, timeout=15)
+        pid, master = pty.fork()
+        if pid == 0:
+            os.chdir(project)
+            os.execvpe(command[0], command, environment)
+        output = bytearray()
+        sent = False
+        deadline = time.monotonic() + 15
+        try:
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select([master], [], [], .05)
+                if readable:
+                    try:
+                        output.extend(os.read(master, 4096))
+                    except OSError:
+                        pass
+                if not sent and (b"Type replace to continue:" in output
+                                 or b"Type logout to continue:" in output):
+                    os.write(master, (tty_reply + "\n").encode())
+                    sent = True
+                ended, status = os.waitpid(pid, os.WNOHANG)
+                if ended:
+                    return subprocess.CompletedProcess(command, os.waitstatus_to_exitcode(status),
+                                                       output.decode(errors="replace"), "")
+            os.killpg(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            raise subprocess.TimeoutExpired(command, 15)
+        finally:
+            os.close(master)
 
     def test_busy_owner_blocks_preflight_for_codex_entrypoints(self) -> None:
         first = self._guardian("import time; time.sleep(5)")
@@ -128,7 +161,126 @@ class AuthLeaseTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("/auth/codex/staging/", observed.read_text())
         self.assertEqual(canonical.read_text(), "synthetic-credential")
+        self.assertFalse(Path(observed.read_text().strip()).exists())
         self.assertFalse(self.record.exists())
+
+    def test_failed_guarded_login_moves_candidate_out_of_stage(self) -> None:
+        observed = self.root / "failed-login-stage"
+        source = ("#!/bin/sh\n"
+                  f"case \"$1\" in login) printf 'synthetic-candidate' > \"$CODEX_HOME/auth.json\"; "
+                  f"printf '%s\\n' \"$CODEX_HOME\" > {str(observed)!r}; exit 19 ;; esac\n")
+        result = self._run_ihar("codex", "--", "login", binary_source=source)
+        self.assertEqual(result.returncode, 19, result.stderr)
+        self.assertFalse(Path(observed.read_text().strip()).exists())
+        self.assertFalse((self.store / "auth" / "codex" / "auth.json").exists())
+        recovery = list((self.store / "auth" / "codex" / "recovery").glob("*/auth.json"))
+        self.assertEqual(len(recovery), 1)
+        self.assertEqual(recovery[0].read_text(), "synthetic-candidate")
+
+    def test_failed_login_status_removes_unchanged_private_copy(self) -> None:
+        auth_owner.stage(self.store)
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.write_text("synthetic-old")
+        observed = self.root / "failed-status-stage"
+        source = ("#!/bin/sh\n"
+                  f"case \"$1 $2\" in 'login status') "
+                  f"printf '%s\\n' \"$CODEX_HOME\" > {str(observed)!r}; exit 19 ;; esac\n")
+        result = self._run_ihar("codex", "--", "login", "status", binary_source=source)
+        self.assertEqual(result.returncode, 19, result.stderr)
+        self.assertFalse(Path(observed.read_text().strip()).exists())
+        self.assertEqual(canonical.read_text(), "synthetic-old")
+        self.assertFalse(self.record.exists())
+
+    def test_unsafe_failed_auth_stage_blocks_cleanup_and_owner_release(self) -> None:
+        outside = self.root / "outside-auth"
+        outside.write_text("synthetic-outside")
+        observed = self.root / "unsafe-stage"
+        source = ("#!/bin/sh\n"
+                  f"case \"$1\" in login) ln -s {str(outside)!r} \"$CODEX_HOME/auth.json\"; "
+                  f"printf '%s\\n' \"$CODEX_HOME\" > {str(observed)!r}; exit 19 ;; esac\n")
+        result = self._run_ihar("codex", "--", "login", binary_source=source)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertTrue(Path(observed.read_text().strip()).is_dir())
+        self.assertEqual(outside.read_text(), "synthetic-outside")
+        self.assertEqual(json.loads(self.record.read_text())["state"], "blocked")
+
+    def test_denied_reauthentication_leaves_no_private_stage(self) -> None:
+        auth_owner.stage(self.store)
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.write_text("synthetic-old")
+        marker = self.root / "relogin-vendor-started"
+        source = f"#!/bin/sh\ncase \"$1\" in login) touch {str(marker)!r} ;; esac\n"
+        before = set((self.store / "auth" / "codex" / "staging").iterdir())
+        result = self._run_ihar("codex", "--", "login", binary_source=source)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(canonical.read_text(), "synthetic-old")
+        self.assertEqual(set((self.store / "auth" / "codex" / "staging").iterdir()), before)
+
+    def test_guarded_reauthentication_requires_exact_tty_approval(self) -> None:
+        auth_owner.stage(self.store)
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.write_text("synthetic-old")
+        marker = self.root / "relogin-started"
+        source = f"#!/bin/sh\ncase \"$1\" in login) touch {str(marker)!r} ;; esac\n"
+        before = set((self.store / "auth" / "codex" / "staging").iterdir())
+        result = self._run_ihar("codex", "--", "login", binary_source=source,
+                                tty_reply="not-replace")
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("Type replace to continue:", result.stdout)
+        self.assertFalse(marker.exists())
+        self.assertEqual(canonical.read_text(), "synthetic-old")
+        self.assertEqual(set((self.store / "auth" / "codex" / "staging").iterdir()), before)
+
+    def test_guarded_reauthentication_publishes_after_tty_approval(self) -> None:
+        auth_owner.stage(self.store)
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.write_text("synthetic-old")
+        observed = self.root / "relogin-stage"
+        source = ("#!/bin/sh\n"
+                  f"case \"$1\" in login) printf 'synthetic-new' > \"$CODEX_HOME/auth.json\"; "
+                  f"printf '%s\\n' \"$CODEX_HOME\" > {str(observed)!r} ;; esac\n")
+        result = self._run_ihar("codex", "--", "login", binary_source=source,
+                                tty_reply="replace")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(canonical.read_text(), "synthetic-new")
+        self.assertFalse(Path(observed.read_text().strip()).exists())
+        recovery = list((self.store / "auth" / "codex" / "recovery").glob("*/auth.json"))
+        self.assertEqual([path.read_text() for path in recovery], ["synthetic-old"])
+        self.assertFalse(self.record.exists())
+
+    def test_guarded_logout_removes_canonical_after_tty_approval(self) -> None:
+        auth_owner.stage(self.store)
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.write_text("synthetic-old")
+        observed = self.root / "logout-stage"
+        source = ("#!/bin/sh\n"
+                  f"case \"$1\" in logout) test -f \"$CODEX_HOME/auth.json\" || exit 87; "
+                  f"rm \"$CODEX_HOME/auth.json\"; "
+                  f"printf '%s\\n' \"$CODEX_HOME\" > {str(observed)!r} ;; esac\n")
+        result = self._run_ihar("codex", "--", "logout", binary_source=source,
+                                tty_reply="logout")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(canonical.exists())
+        self.assertFalse(Path(observed.read_text().strip()).exists())
+        recovery = list((self.store / "auth" / "codex" / "recovery").glob("*/auth.json"))
+        self.assertEqual([path.read_text() for path in recovery], ["synthetic-old"])
+        self.assertFalse(self.record.exists())
+
+    def test_guarded_logout_requires_exact_tty_approval(self) -> None:
+        auth_owner.stage(self.store)
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.write_text("synthetic-old")
+        marker = self.root / "logout-started"
+        source = f"#!/bin/sh\ncase \"$1\" in logout) touch {str(marker)!r} ;; esac\n"
+        before = set((self.store / "auth" / "codex" / "staging").iterdir())
+        result = self._run_ihar("codex", "--", "logout", binary_source=source,
+                                tty_reply="not-logout")
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("Type logout to continue:", result.stdout)
+        self.assertFalse(marker.exists())
+        self.assertEqual(canonical.read_text(), "synthetic-old")
+        self.assertEqual(set((self.store / "auth" / "codex" / "staging").iterdir()), before)
 
     def test_guarded_direct_cli_uses_preflight_owner_until_vendor_exit(self) -> None:
         observed = self.root / "direct-cli-observed"

@@ -10,12 +10,14 @@ import array
 import json
 import os
 import select
+import shutil
 import signal
 import socket
 import stat
 import struct
 import subprocess
 import sys
+import time
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -85,6 +87,97 @@ def _identity(pid: int, binary: str | None, guardian_pid: int,
     if pid <= 0 or not _descendant(pid, guardian_pid, table):
         raise auth_owner.AuthOwnerError("Codex guarded process ancestry cannot be verified")
     return auth_owner._identity_for(pid, binary)
+
+
+def _cleanup_auth_stage(store: Path, staged: Path, *, used: bool = False,
+                        retain_changed: bool = False) -> bool:
+    """Remove a verified private stage, or retain an uncertain candidate for recovery."""
+    token = staged.name
+    if (staged.parent != store / "auth" / "codex" / "staging"
+        or len(token) != 32 or any(char not in "0123456789abcdef" for char in token)
+        or not shutil.rmtree.avoids_symlink_attacks):
+        raise auth_owner.AuthOwnerError("Codex auth stage cleanup is unsafe")
+    with ExitStack() as stack:
+        root, _auth, owner = auth_owner._owner_directories(store, stack, create=False)
+        stages = auth_owner._private_directory(owner, "staging", stack, create=False)
+        stage = auth_owner._private_directory(stages, token, stack, create=False)
+        marker_name = ".ihar-used" if used else ".ihar-stage"
+        marker_fd = os.open(marker_name, auth_owner._FILE_FLAGS, dir_fd=stage)
+        stack.callback(os.close, marker_fd)
+        marker_stat = os.fstat(marker_fd)
+        if (not stat.S_ISREG(marker_stat.st_mode) or marker_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(marker_stat.st_mode) != 0o600 or marker_stat.st_size > 4096):
+            raise auth_owner.AuthOwnerError("Codex auth stage marker is unsafe")
+        marker = json.loads(os.read(marker_fd, 4097))
+        if (not isinstance(marker, dict) or marker.get("schema") != 1
+            or marker.get("token") != token
+            or marker.get("store") != [os.fstat(root).st_dev, os.fstat(root).st_ino]
+            or marker.get("stage") != [os.fstat(stage).st_dev, os.fstat(stage).st_ino]
+            or "baseline" not in marker):
+            raise auth_owner.AuthOwnerError("Codex auth stage provenance is invalid")
+        changed = False
+        if retain_changed:
+            if marker["baseline"] != auth_owner._canonical_identity(owner):
+                raise auth_owner.AuthOwnerError("Codex credential owner changed during auth cleanup")
+            try:
+                candidate = os.open("auth.json", auth_owner._FILE_FLAGS, dir_fd=stage)
+            except FileNotFoundError:
+                pass
+            else:
+                stack.callback(os.close, candidate)
+                identity = auth_owner._identity(candidate)
+                baseline = marker["baseline"]
+                changed = (baseline is None or identity["sha256"] != baseline["sha256"]
+                           or identity["size"] != baseline["size"])
+        if changed:
+            recovery = auth_owner._private_directory(owner, "recovery", stack, create=True)
+            try:
+                os.stat(token, dir_fd=recovery, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise auth_owner.AuthOwnerError("Codex auth recovery stage already exists")
+            os.rename(token, token, src_dir_fd=stages, dst_dir_fd=recovery)
+            os.fsync(recovery)
+        else:
+            shutil.rmtree(token, dir_fd=stages)
+        os.fsync(stages)
+        return changed
+
+
+def _clear_auth_stage(store: Path, staged: Path) -> None:
+    with ExitStack() as stack:
+        owner = auth_owner._locked_owner(store, stack)
+        record = auth_owner._read_owner(owner)
+        if record is None or record.get("auth_stage") != str(staged):
+            raise auth_owner.AuthOwnerError("Codex authentication owner changed")
+        for key in ("auth_stage", "auth_verb", "auth_caller"):
+            record.pop(key, None)
+        auth_owner._write_owner(owner, record)
+
+
+def _direct_auth_approval(action: str) -> bool:
+    prompt = ("Logging out removes the shared Codex login. Type logout to continue: "
+              if action == "logout" else
+              "Replacing the shared Codex login may invalidate the old token remotely. "
+              "Type replace to continue: ")
+    try:
+        descriptor = os.open("/dev/tty", os.O_RDWR | os.O_CLOEXEC)
+        try:
+            pending = memoryview(prompt.encode("ascii"))
+            while pending:
+                pending = pending[os.write(descriptor, pending):]
+            answer = bytearray()
+            while len(answer) < 32:
+                part = os.read(descriptor, 1)
+                if not part or part == b"\n":
+                    break
+                answer.extend(part)
+            return answer.strip() == action.encode("ascii")
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return False
 
 
 def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
@@ -181,13 +274,13 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
                     or record.get("auth_stage") is not None):
                     raise auth_owner.AuthOwnerError("Codex authentication verb is invalid")
                 auth_action = "stage"
-            elif operation == "auth-finish" and set(fields) == {"stage", "verb"}:
+            elif operation in ("auth-finish", "auth-abort") and set(fields) == {"stage", "verb"}:
                 if (record.get("auth_stage") != fields["stage"]
                     or record.get("auth_verb") != fields["verb"]
                     or not auth_owner._identity_matches(record.get("auth_caller", {}), table)
                     or record["auth_caller"]["pid"] != credentials[0]):
                     raise auth_owner.AuthOwnerError("Codex authentication stage changed")
-                auth_action = "finish"
+                auth_action = "finish" if operation == "auth-finish" else "abort"
             else:
                 raise auth_owner.AuthOwnerError("Codex guardian operation is invalid")
             if auth_action is None:
@@ -197,14 +290,6 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
             staged = auth_owner.stage(store)
             existing = (store / "auth" / "codex" / "auth.json").exists()
             verb = fields["verb"]
-            if verb == "logout" and not existing:
-                raise auth_owner.AuthOwnerError("Codex shared login is already absent")
-            if existing and verb != "status" and not auth_owner._direct_approval(
-                    "logout" if verb == "logout" else "replace"):
-                raise auth_owner.ApprovalRequired(
-                    "existing Codex credential needs direct TTY approval")
-            if existing and verb in ("status", "logout"):
-                auth_owner._seed_stage_from_canonical(staged, store)
             with ExitStack() as stack:
                 owner = auth_owner._locked_owner(store, stack)
                 record = auth_owner._read_owner(owner)
@@ -214,6 +299,19 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
                 record["auth_verb"] = verb
                 record["auth_caller"] = auth_owner._identity_for(credentials[0])
                 auth_owner._write_owner(owner, record)
+            try:
+                if verb == "logout" and not existing:
+                    raise auth_owner.AuthOwnerError("Codex shared login is already absent")
+                if existing and verb != "status" and not _direct_auth_approval(
+                        "logout" if verb == "logout" else "replace"):
+                    raise auth_owner.ApprovalRequired(
+                        "existing Codex credential needs direct TTY approval")
+                if existing and verb in ("status", "logout"):
+                    auth_owner._seed_stage_from_canonical(staged, store)
+            except (auth_owner.AuthOwnerError, OSError):
+                _cleanup_auth_stage(store, staged, retain_changed=True)
+                _clear_auth_stage(store, staged)
+                raise
             answer.update(stage=str(staged))
         elif auth_action == "finish":
             verb = fields["verb"]
@@ -222,14 +320,15 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int) -> bool:
                 auth_owner.publish(staged, store, approve_existing=True)
             elif verb == "logout":
                 auth_owner._logout_canonical(staged, store)
-            with ExitStack() as stack:
-                owner = auth_owner._locked_owner(store, stack)
-                record = auth_owner._read_owner(owner)
-                if record is None or record.get("auth_stage") != str(staged):
-                    raise auth_owner.AuthOwnerError("Codex authentication owner changed")
-                for key in ("auth_stage", "auth_verb", "auth_caller"):
-                    record.pop(key, None)
-                auth_owner._write_owner(owner, record)
+            changed = _cleanup_auth_stage(store, staged, used=verb == "login",
+                                          retain_changed=verb == "status")
+            if changed:
+                raise auth_owner.AuthOwnerError("Codex login status changed staged credentials")
+            _clear_auth_stage(store, staged)
+        elif auth_action == "abort":
+            staged = Path(fields["stage"])
+            _cleanup_auth_stage(store, staged, retain_changed=True)
+            _clear_auth_stage(store, staged)
     except (auth_owner.AuthOwnerError, OSError, ValueError, TypeError, KeyError):
         answer = {"ok": False}
     try:
@@ -262,6 +361,10 @@ def _release_when_quiescent(store: Path, child: subprocess.Popen) -> bool:
         if (auth_owner._group_active(record["child"])
             or auth_owner._descendants_active(os.getpid())):
             return False
+        if record.get("auth_stage") is not None:
+            record["state"] = "blocked"
+            auth_owner._write_owner(owner, record)
+            raise auth_owner.AuthOwnerError("Codex auth stage cleanup remains unverified")
         if record["guest"] is not None and not record["guest_reconciled"]:
             record["state"] = "blocked"
             auth_owner._write_owner(owner, record)
@@ -371,6 +474,46 @@ def run(store: Path, argv: list[str]) -> int:
                 signal.signal(number, handler)
 
 
+def _run_auth_vendor(fd: int, command: list[str], environment: dict[str, str]) -> int:
+    auth_owner.require_descendant_supervision()
+    process = subprocess.Popen(command, env=environment, close_fds=True, start_new_session=True)
+    try:
+        try:
+            request(fd, "bind-child", {"pid": process.pid, "binary": command[0]})
+        except auth_owner.AuthOwnerError:
+            try:
+                process.wait(timeout=0.05)
+            except subprocess.TimeoutExpired:
+                pass
+            if auth_owner._group_active({"pgrp": process.pid}):
+                raise
+        def forward(number: int, _frame: object) -> None:
+            try:
+                os.killpg(process.pid, number)
+            except ProcessLookupError:
+                pass
+        previous = {number: signal.signal(number, forward) for number in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            status = process.wait()
+            while True:
+                auth_owner._reap_children()
+                if not (auth_owner._group_active({"pgrp": process.pid})
+                        or auth_owner._descendants_active(os.getpid())):
+                    break
+                time.sleep(0.05)
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
+        return 128 - status if status < 0 else status
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+
 def _main(arguments: list[str]) -> int:
     if len(arguments) == 2 and arguments[0] == "admit":
         request(int(arguments[1]), "admit", {})
@@ -397,10 +540,16 @@ def _main(arguments: list[str]) -> int:
         environment = dict(os.environ, CODEX_HOME=stage)
         environment.pop(_FD_ENV, None)
         environment.pop("PYTHONPATH", None)
-        status = subprocess.call(command, env=environment, close_fds=True)
+        try:
+            status = _run_auth_vendor(fd, command, environment)
+        except (auth_owner.AuthOwnerError, OSError, subprocess.SubprocessError):
+            request(fd, "auth-abort", {"stage": stage, "verb": verb})
+            raise
         if status == 0:
             request(fd, "auth-finish", {"stage": stage, "verb": verb})
-        return 128 - status if status < 0 else status
+        else:
+            request(fd, "auth-abort", {"stage": stage, "verb": verb})
+        return status
     if len(arguments) < 3 or arguments[1] != "--":
         raise auth_owner.AuthOwnerError("Codex guardian invocation is invalid")
     return run(Path(arguments[0]), arguments[2:])
