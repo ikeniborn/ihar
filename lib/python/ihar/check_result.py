@@ -452,6 +452,10 @@ def _auth_diff(runtime: str, store: str) -> int:
         return 0
     try:
         auth_owner.verify_runtime_link(runtime, store)
+    except (auth_owner.AuthOwnerError, OSError, ValueError, AttributeError, KeyError, TypeError):
+        print("codex mutable-link: unverified; auth-owner: unverified")
+        return 0
+    try:
         with ExitStack() as stack:
             _root, _auth, owner = auth_owner._owner_directories(
                 auth_owner._lease_store(store), stack, create=False
@@ -469,7 +473,7 @@ def _auth_diff(runtime: str, store: str) -> int:
             status = "quiescence unverified"
         print(f"codex mutable-link: valid; auth-owner: {status}")
     except (auth_owner.AuthOwnerError, OSError, ValueError, AttributeError, KeyError, TypeError):
-        print("codex mutable-link: unverified; auth-owner: unverified")
+        print("codex mutable-link: valid; auth-owner: unverified")
     return 0
 
 

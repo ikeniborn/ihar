@@ -374,6 +374,7 @@ assert_eq "auth diagnostic preserves materialized bytes" 'synthetic-credential-d
 
 auth_categories="$(python3 - "$IHAR_TEST_TMP/auth-owner-categories" <<'PY'
 import io
+import json
 import os
 import sys
 from contextlib import ExitStack, redirect_stdout
@@ -421,8 +422,17 @@ with ExitStack() as stack:
     _root, _auth, owner = auth_owner._owner_directories(store, stack, create=False)
     auth_owner._write_owner(owner, record)
 report("blocked")
+owner_path = store / "auth" / "codex" / ".owner.json"
+owner_path.write_text(json.dumps({
+    "schema": 2, "state": "blocked", "id": "malformed-owner-id",
+    "path": str(root / "private-owner-path"), "secret": "malformed-secret-value",
+}), encoding="utf-8")
+owner_path.chmod(0o600)
+report("malformed")
 record["state"] = "active"
-record["guardian"] = {"pid": 99999999, "start": "synthetic", "binary": "/no-such-binary"}
+record["guardian"] = {
+    "pid": 99999999, "start": "synthetic", "binary": "/no-such-binary", "pgrp": 99999999,
+}
 with ExitStack() as stack:
     _root, _auth, owner = auth_owner._owner_directories(store, stack, create=False)
     auth_owner._write_owner(owner, record)
@@ -437,9 +447,13 @@ assert_contains "active lease has busy category" "$auth_categories" \
   "busy=codex mutable-link: valid; auth-owner: busy"
 assert_contains "blocked guardian has a bounded blocked category" "$auth_categories" \
   "blocked=codex mutable-link: valid; auth-owner: blocked"
+assert_contains "malformed blocked record is unverified" "$auth_categories" \
+  "malformed=codex mutable-link: valid; auth-owner: unverified"
 assert_contains "unproven lease has unverified category" "$auth_categories" \
   "unverified=codex mutable-link: valid; auth-owner: unverified"
-for withheld in synthetic-token-not-for-output synthetic-owner-id "$IHAR_TEST_TMP/auth-owner-categories"; do
+for withheld in synthetic-token-not-for-output synthetic-owner-id malformed-owner-id \
+  malformed-secret-value "$IHAR_TEST_TMP/auth-owner-categories/private-owner-path" \
+  "$IHAR_TEST_TMP/auth-owner-categories"; do
   assert_exit "auth diagnostic withholds synthetic payload and metadata" 1 \
     grep -F -- "$withheld" <<<"$auth_categories"
 done

@@ -122,6 +122,133 @@ def _identity_matches(identity: dict, table: dict[int, dict]) -> bool:
                      or identity.get("binary") in item["argv"]))
 
 
+def _owner_record_identity_valid(identity: object) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    required = {"pid", "start", "binary", "pgrp"}
+    allowed = required | {
+        "socket", "socket_dev", "socket_ino", "client_state",
+        "client_state_dev", "client_state_ino", "descendants",
+    }
+    if not required <= set(identity) or set(identity) - allowed:
+        return False
+    if (not isinstance(identity["pid"], int) or isinstance(identity["pid"], bool)
+        or identity["pid"] <= 0
+        or not isinstance(identity["pgrp"], int) or isinstance(identity["pgrp"], bool)
+        or identity["pgrp"] <= 0
+        or not isinstance(identity["start"], str) or not identity["start"]
+        or not isinstance(identity["binary"], str) or not identity["binary"]):
+        return False
+    for name in ("socket", "client_state"):
+        if name in identity and (not isinstance(identity[name], str) or not identity[name]):
+            return False
+    for name in ("socket_dev", "socket_ino", "client_state_dev", "client_state_ino"):
+        if name in identity and (not isinstance(identity[name], int)
+                                 or isinstance(identity[name], bool)
+                                 or identity[name] < 0):
+            return False
+    descendants = identity.get("descendants", [])
+    return (isinstance(descendants, list) and len(descendants) <= 128
+            and all(_owner_record_identity_valid(item) for item in descendants))
+
+
+def _owner_record_file_identity_valid(identity: object) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    integers = {"dev", "ino", "size", "mtime_ns", "ctime_ns"}
+    if set(identity) != integers | {"sha256"}:
+        return False
+    if any(not isinstance(identity[name], int) or isinstance(identity[name], bool)
+           or identity[name] < 0 for name in integers):
+        return False
+    digest = identity["sha256"]
+    return (isinstance(digest, str) and len(digest) == 64
+            and all(character in "0123456789abcdef" for character in digest))
+
+
+def _owner_record_pair_valid(value: object) -> bool:
+    return (isinstance(value, list) and len(value) == 2
+            and all(isinstance(item, int) and not isinstance(item, bool) and item >= 0
+                    for item in value))
+
+
+def _owner_record_guest_valid(guest: object) -> bool:
+    if not isinstance(guest, dict):
+        return False
+    required = {"bundle", "identity", "image", "image_identity", "baseline", "vm", "state"}
+    allowed = required | {"candidate", "published", "ack_sha256"}
+    if not required <= set(guest) or set(guest) - allowed:
+        return False
+    if (not isinstance(guest["bundle"], str) or not os.path.isabs(guest["bundle"])
+        or not isinstance(guest["image"], str) or not os.path.isabs(guest["image"])
+        or not _owner_record_pair_valid(guest["identity"])
+        or not _owner_record_pair_valid(guest["image_identity"])
+        or not _owner_record_file_identity_valid(guest["baseline"])
+        or not isinstance(guest["state"], str)
+        or guest["state"] not in {
+            "registered", "starting", "running", "quiescent", "published-pending", "returned"
+        }
+        or (guest["vm"] is not None and not _owner_record_identity_valid(guest["vm"]))):
+        return False
+    if guest["state"] in {"running", "quiescent", "published-pending", "returned"} \
+            and guest["vm"] is None:
+        return False
+    if guest["state"] in {"published-pending", "returned"}:
+        acknowledgment = guest.get("ack_sha256")
+        return (_owner_record_file_identity_valid(guest.get("candidate"))
+                and _owner_record_file_identity_valid(guest.get("published"))
+                and isinstance(acknowledgment, str) and len(acknowledgment) == 64
+                and all(character in "0123456789abcdef" for character in acknowledgment))
+    return not ({"candidate", "published", "ack_sha256"} & set(guest))
+
+
+def validate_guardian_owner_record(record: object) -> None:
+    """Validate the bounded schema-two record before any state is trusted."""
+    if not isinstance(record, dict) or record.get("schema") != 2:
+        raise AuthOwnerError("Codex guardian owner record is invalid")
+    required = {
+        "schema", "state", "guardian", "child", "children", "daemon", "guest",
+        "guest_bundle", "guest_reconciled", "runtime", "config_hash",
+    }
+    allowed = required | {"control", "auth_stage", "auth_verb", "auth_caller"}
+    if not required <= set(record) or set(record) - allowed:
+        raise AuthOwnerError("Codex guardian owner record is invalid")
+    if (not isinstance(record["state"], str)
+        or record["state"] not in {"pending", "active", "quiescing", "blocked"}
+        or not _owner_record_identity_valid(record["guardian"])
+        or (record["child"] is not None and not _owner_record_identity_valid(record["child"]))
+        or not isinstance(record["children"], list) or len(record["children"]) > 32
+        or not all(_owner_record_identity_valid(item) for item in record["children"])
+        or (record["daemon"] is not None and not _owner_record_identity_valid(record["daemon"]))
+        or (record["guest"] is not None and not _owner_record_identity_valid(record["guest"]))
+        or (record["guest_bundle"] is not None
+            and not _owner_record_guest_valid(record["guest_bundle"]))
+        or not isinstance(record["guest_reconciled"], bool)
+        or (record["runtime"] is not None
+            and (not isinstance(record["runtime"], str)
+                 or not os.path.isabs(record["runtime"])))
+        or (record["config_hash"] is not None
+            and (not isinstance(record["config_hash"], str)
+                 or len(record["config_hash"]) > 256))):
+        raise AuthOwnerError("Codex guardian owner record is invalid")
+    control = record.get("control")
+    if (control is not None
+        and (not isinstance(control, dict) or set(control) != {"dev", "ino"}
+             or any(not isinstance(control[name], int) or isinstance(control[name], bool)
+                    or control[name] < 0 for name in control))):
+        raise AuthOwnerError("Codex guardian owner record is invalid")
+    auth_fields = {name for name in ("auth_stage", "auth_verb", "auth_caller") if name in record}
+    if auth_fields and auth_fields != {"auth_stage", "auth_verb", "auth_caller"}:
+        raise AuthOwnerError("Codex guardian owner record is invalid")
+    if auth_fields and (
+        not isinstance(record["auth_stage"], str) or not os.path.isabs(record["auth_stage"])
+        or not isinstance(record["auth_verb"], str)
+        or record["auth_verb"] not in {"login", "status", "logout"}
+        or not _owner_record_identity_valid(record["auth_caller"])
+    ):
+        raise AuthOwnerError("Codex guardian owner record is invalid")
+
+
 def owner_identity_proven(record: dict) -> bool:
     """A live guardian, child, or daemon must match start identity and binary."""
     table = _process_table()
@@ -270,6 +397,8 @@ def _read_owner(owner: int) -> dict | None:
         record = json.loads(os.read(descriptor, 8193))
         if not isinstance(record, dict) or record.get("schema") not in (1, 2):
             raise AuthOwnerError("Codex auth owner record is invalid")
+        if record["schema"] == 2:
+            validate_guardian_owner_record(record)
         return record
     except (ValueError, OSError) as error:
         raise AuthOwnerError("Codex auth owner record cannot be verified") from error
@@ -278,6 +407,8 @@ def _read_owner(owner: int) -> dict | None:
 
 
 def _write_owner(owner: int, record: dict) -> None:
+    if record.get("schema") == 2:
+        validate_guardian_owner_record(record)
     temporary = f".owner-{secrets.token_hex(8)}"
     descriptor = os.open(temporary, _CREATE_FLAGS, 0o600, dir_fd=owner)
     try:

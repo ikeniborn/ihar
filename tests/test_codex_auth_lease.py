@@ -71,6 +71,23 @@ class AuthLeaseTests(unittest.TestCase):
             time.sleep(.02)
         self.fail(f"timed out waiting for {path.name}")
 
+    def _schema_two_record(self, **updates) -> dict:
+        record = {
+            "schema": 2,
+            "state": "pending",
+            "guardian": auth_owner._identity_for(os.getpid()),
+            "child": None,
+            "children": [],
+            "daemon": None,
+            "guest": None,
+            "guest_bundle": None,
+            "guest_reconciled": False,
+            "runtime": None,
+            "config_hash": None,
+        }
+        record.update(updates)
+        return record
+
     def _run_ihar(self, *arguments: str, guard_fd: str | None = None,
                   legacy_guard_fd: str | None = None,
                   binary_source: str | None = None,
@@ -816,16 +833,14 @@ class AuthLeaseTests(unittest.TestCase):
         self.addCleanup(listener.close)
         metadata = socket_path.stat()
         absent_pid = 2147483647
-        record = {"schema": 2, "state": "active", "guardian": auth_owner._identity_for(os.getpid()),
-                  "child": {"pid": absent_pid, "start": "absent", "binary": "/bin/false",
-                            "pgrp": absent_pid},
-                  "children": [], "daemon": {"pid": absent_pid, "start": "absent",
-                                                  "binary": "/bin/false", "pgrp": absent_pid,
-                                                  "socket": str(socket_path),
-                                                  "socket_dev": metadata.st_dev,
-                                                  "socket_ino": metadata.st_ino + 1},
-                  "guest": None, "guest_reconciled": False, "runtime": None,
-                  "config_hash": None}
+        record = self._schema_two_record(
+            state="active",
+            child={"pid": absent_pid, "start": "absent", "binary": "/bin/false",
+                   "pgrp": absent_pid},
+            daemon={"pid": absent_pid, "start": "absent", "binary": "/bin/false",
+                    "pgrp": absent_pid, "socket": str(socket_path),
+                    "socket_dev": metadata.st_dev, "socket_ino": metadata.st_ino + 1},
+        )
         self.record.write_text(json.dumps(record))
         self.record.chmod(0o600)
         with self.assertRaises(auth_owner.AuthOwnerError):
@@ -839,10 +854,12 @@ class AuthLeaseTests(unittest.TestCase):
         listener.bind(str(socket_path))
         self.addCleanup(listener.close)
         metadata = socket_path.stat()
-        record = {"schema": 2, "state": "active", "guardian": auth_owner._identity_for(os.getpid()),
-                  "runtime": str(self.runtime_a), "config_hash": "", "child": None,
-                  "daemon": {"socket": str(socket_path), "socket_dev": metadata.st_dev,
-                             "socket_ino": metadata.st_ino}}
+        guardian = auth_owner._identity_for(os.getpid())
+        record = self._schema_two_record(
+            state="active", guardian=guardian, runtime=str(self.runtime_a), config_hash="",
+            daemon=dict(guardian, socket=str(socket_path), socket_dev=metadata.st_dev,
+                        socket_ino=metadata.st_ino),
+        )
         self.record.write_text(json.dumps(record))
         self.record.chmod(0o600)
         original = self.record.read_bytes()
@@ -855,9 +872,7 @@ class AuthLeaseTests(unittest.TestCase):
 
     def test_legacy_release_cannot_delete_pending_schema_two_record(self) -> None:
         auth_owner.stage(self.store)
-        self.record.write_text(json.dumps({"schema": 2, "state": "pending",
-                                           "guardian": auth_owner._identity_for(os.getpid()),
-                                           "child": None, "daemon": None}))
+        self.record.write_text(json.dumps(self._schema_two_record()))
         self.record.chmod(0o600)
         original = self.record.read_bytes()
         with self.assertRaises(auth_owner.AuthOwnerError):
@@ -868,11 +883,11 @@ class AuthLeaseTests(unittest.TestCase):
         from ihar.codex import guardian
         auth_owner.stage(self.store)
         absent_pid = 2147483647
-        self.record.write_text(json.dumps({"schema": 2, "state": "active",
-                                           "guardian": auth_owner._identity_for(os.getpid()),
-                                           "child": {"pid": absent_pid, "start": "old-start",
-                                                     "binary": "/bin/false", "pgrp": absent_pid},
-                                           "guest": None, "daemon": None, "runtime": None}))
+        self.record.write_text(json.dumps(self._schema_two_record(
+            state="active",
+            child={"pid": absent_pid, "start": "old-start",
+                   "binary": "/bin/false", "pgrp": absent_pid},
+        )))
         self.record.chmod(0o600)
         original = self.record.read_bytes()
         table = auth_owner._process_table()
@@ -886,9 +901,9 @@ class AuthLeaseTests(unittest.TestCase):
 
     def test_schema_two_pid_reuse_keeps_original_record(self) -> None:
         auth_owner.stage(self.store)
-        record = {"schema": 2, "state": "pending",
-                  "guardian": dict(auth_owner._identity_for(os.getpid()), start="reused-pid"),
-                  "child": None}
+        record = self._schema_two_record(
+            guardian=dict(auth_owner._identity_for(os.getpid()), start="reused-pid"),
+        )
         self.record.write_text(json.dumps(record))
         self.record.chmod(0o600)
         original = self.record.read_bytes()
