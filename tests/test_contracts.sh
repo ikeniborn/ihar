@@ -370,6 +370,65 @@ assert_exit "auth diagnostic never prints credential bytes" 1 \
 assert_eq "auth diagnostic preserves materialized bytes" 'synthetic-credential-do-not-print' \
   "$(cat "$DIAGNOSTIC_ROOT/runtime/auth.json")"
 
+auth_categories="$(python3 - "$IHAR_TEST_TMP/auth-owner-categories" <<'PY'
+import io
+import os
+import sys
+from contextlib import ExitStack, redirect_stdout
+from pathlib import Path
+
+from ihar.check_result import _auth_diff
+from ihar.codex import auth_owner
+
+root = Path(sys.argv[1])
+store = root / "store"
+runtime = root / "runtime"
+runtime.mkdir(parents=True)
+store.mkdir()
+with ExitStack() as stack:
+    auth_owner._owner_directories(store, stack, create=True)
+canonical = store / "auth" / "codex" / "auth.json"
+canonical.write_text("synthetic-token-not-for-output", encoding="utf-8")
+canonical.chmod(0o600)
+
+def report(label):
+    captured = io.StringIO()
+    with redirect_stdout(captured):
+        assert _auth_diff(str(runtime), str(store)) == 0
+    print(f"{label}={captured.getvalue().strip()}")
+
+report("missing")
+(runtime / "auth.json").symlink_to(canonical)
+report("valid")
+record = {
+    "schema": 1, "id": "synthetic-owner-id", "runtime": str(runtime),
+    "mode": "foreground", "guardian": auth_owner._identity_for(os.getpid()),
+    "child": None, "daemon": None, "attached_guardian": None, "state": "active",
+}
+with ExitStack() as stack:
+    _root, _auth, owner = auth_owner._owner_directories(store, stack, create=False)
+    auth_owner._write_owner(owner, record)
+report("busy")
+record["guardian"] = {"pid": 99999999, "start": "synthetic", "binary": "/no-such-binary"}
+with ExitStack() as stack:
+    _root, _auth, owner = auth_owner._owner_directories(store, stack, create=False)
+    auth_owner._write_owner(owner, record)
+report("unverified")
+PY
+)"
+assert_contains "missing auth link has bounded category" "$auth_categories" \
+  "missing=codex mutable-link: missing; auth-owner: unverified"
+assert_contains "valid auth link names recorded-owner scope" "$auth_categories" \
+  "valid=codex mutable-link: valid; auth-owner: no recorded owner"
+assert_contains "active lease has busy category" "$auth_categories" \
+  "busy=codex mutable-link: valid; auth-owner: busy"
+assert_contains "unproven lease has unverified category" "$auth_categories" \
+  "unverified=codex mutable-link: valid; auth-owner: unverified"
+for withheld in synthetic-token-not-for-output synthetic-owner-id "$IHAR_TEST_TMP/auth-owner-categories"; do
+  assert_exit "auth diagnostic withholds synthetic payload and metadata" 1 \
+    grep -F -- "$withheld" <<<"$auth_categories"
+done
+
 # A selected generation is visible even when no rendered file differs. The
 # effective MCP identity is already an input to that generation's hash.
 _test_generation_diagnostic() (
@@ -388,5 +447,56 @@ assert_contains "check diff names selected Codex generation" "$generation_output
   "codex selected runtime generation abcdef12"
 assert_contains "check diff says MCP identity is in selection" "$generation_output" \
   "effective-mcp-identity"
+
+# Codex embeds MCP tables in config.toml. Once the existing file comparator has
+# found drift, diagnostic classification must distinguish those tables from an
+# unrelated managed setting without displaying either field's value.
+CONFIG_DIAGNOSTIC_ROOT="$IHAR_TEST_TMP/config-diagnostics"
+mkdir -p "$CONFIG_DIAGNOSTIC_ROOT"
+printf '%s\n' '[mcp_servers.example]' 'url = "https://mcp.example/expected"' \
+  '[sandbox]' 'mode = "safe"' > "$CONFIG_DIAGNOSTIC_ROOT/desired.toml"
+printf '%s\n' '[mcp_servers.example]' 'url = "https://mcp.example/changed"' \
+  '[sandbox]' 'mode = "safe"' > "$CONFIG_DIAGNOSTIC_ROOT/mcp-drift.toml"
+printf '%s\n' '[mcp_servers.example]' 'url = "https://mcp.example/expected"' \
+  '[sandbox]' 'mode = "changed"' > "$CONFIG_DIAGNOSTIC_ROOT/setting-drift.toml"
+assert_eq "Codex MCP table drift has its own bounded category" "mcp-render-drift" \
+  "$(python3 -m ihar.check_result config-diff-category \
+    "$CONFIG_DIAGNOSTIC_ROOT/desired.toml" "$CONFIG_DIAGNOSTIC_ROOT/mcp-drift.toml")"
+assert_eq "Codex non-MCP config drift stays managed-setting drift" "managed-setting-drift" \
+  "$(python3 -m ihar.check_result config-diff-category \
+    "$CONFIG_DIAGNOSTIC_ROOT/desired.toml" "$CONFIG_DIAGNOSTIC_ROOT/setting-drift.toml")"
+_test_codex_config_diff() (
+  source "$ROOT/lib/state/runtime.sh"
+  source "$ROOT/lib/cli/check.sh"
+  ihar_python() { python3 -m "$1" "${@:2}"; }
+  ihar_profile_resolve() { IHAR_PROFILE_GATEWAY=off; }
+  _ihar_project_state() { printf '%s\n' "$CONFIG_DIAGNOSTIC_ROOT/state"; }
+  ihar_render_all() {
+    mkdir -p "$2"
+    [[ "$1" != codex ]] || cp "$CONFIG_DIAGNOSTIC_ROOT/desired.toml" "$2/config.toml"
+  }
+  _ihar_check_runtime() {
+    printf '%s/r/abcdef12/%s\n' "$CONFIG_DIAGNOSTIC_ROOT/state" "$1"
+  }
+  IHAR_FLAG_PROFILE=standard
+  ihar_check_diff
+)
+mkdir -p "$CONFIG_DIAGNOSTIC_ROOT/state/r/abcdef12/codex"
+cp "$CONFIG_DIAGNOSTIC_ROOT/mcp-drift.toml" \
+  "$CONFIG_DIAGNOSTIC_ROOT/state/r/abcdef12/codex/config.toml"
+codex_mcp_diff="$(_test_codex_config_diff)"
+assert_contains "check diff categorizes Codex MCP drift" "$codex_mcp_diff" "mcp-render-drift"
+assert_exit "check diff does not print Codex MCP endpoint" 1 \
+  grep -F 'https://mcp.example/changed' <<<"$codex_mcp_diff"
+cp "$CONFIG_DIAGNOSTIC_ROOT/setting-drift.toml" \
+  "$CONFIG_DIAGNOSTIC_ROOT/state/r/abcdef12/codex/config.toml"
+codex_setting_diff="$(_test_codex_config_diff)"
+assert_contains "check diff categorizes Codex managed setting drift" \
+  "$codex_setting_diff" "managed-setting-drift"
+mv "$CONFIG_DIAGNOSTIC_ROOT/state/r/abcdef12/codex/config.toml" \
+  "$CONFIG_DIAGNOSTIC_ROOT/state/r/abcdef12/codex/config.saved.toml"
+codex_missing_config_diff="$(_test_codex_config_diff)"
+assert_contains "missing Codex config does not guess a managed or MCP cause" \
+  "$codex_missing_config_diff" "rendered-config-missing"
 
 finish

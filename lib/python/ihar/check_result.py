@@ -468,6 +468,42 @@ def _auth_diff(runtime: str, store: str) -> int:
     return 0
 
 
+def _config_diff_category(desired_path: str, active_path: str) -> int:
+    """Classify an already-detected Codex config mismatch without printing values."""
+    try:
+        with open(desired_path, "rb") as handle:
+            desired = tomllib.load(handle)
+        with open(active_path, "rb") as handle:
+            active = tomllib.load(handle)
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        print("rendered-config-drift")
+        return 0
+
+    def managed_without_mcp(config: dict) -> dict:
+        managed = {key: value for key, value in config.items() if key != "mcp_servers"}
+        hooks = managed.get("hooks")
+        if isinstance(hooks, dict):
+            hooks = {key: value for key, value in hooks.items() if key != "state"}
+            if hooks:
+                managed["hooks"] = hooks
+            else:
+                managed.pop("hooks")
+        return managed
+
+    mcp_changed = desired.get("mcp_servers") != active.get("mcp_servers")
+    managed_changed = managed_without_mcp(desired) != managed_without_mcp(active)
+    if mcp_changed and managed_changed:
+        category = "mcp-render-drift+managed-setting-drift"
+    elif mcp_changed:
+        category = "mcp-render-drift"
+    elif managed_changed:
+        category = "managed-setting-drift"
+    else:
+        category = "rendered-config-drift"
+    print(category)
+    return 0
+
+
 def main(argv: list[str]) -> int:
     try:
         if len(argv) == 2 and argv[0] in ("text", "json"):
@@ -481,6 +517,8 @@ def main(argv: list[str]) -> int:
             return _receipt(argv[1:])
         if len(argv) == 3 and argv[0] == "auth-diff":
             return _auth_diff(argv[1], argv[2])
+        if len(argv) == 3 and argv[0] == "config-diff-category":
+            return _config_diff_category(argv[1], argv[2])
         if len(argv) == 2 and argv[0] == "validate-receipt":
             jsonio.read("install-receipt", argv[1])
             return 0

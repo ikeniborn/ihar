@@ -2,8 +2,8 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 20 (ACP promotion is an executable gate; the condition is measured, not recalled) |
-| Date | 2026-09-21 |
+| Status | revision 21 (shared Codex auth and effective MCP runtime diagnostics) |
+| Date | 2026-09-22 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
 | Verified against | Claude Code 2.1.274, Codex CLI 0.154.0 (`--help`, `app-server generate-json-schema`, binary strings), iclaude and icodex checkouts on this machine |
@@ -860,7 +860,7 @@ In order, each fail-closed: hook integrity and, for Codex, trust state through `
 
 `ihar check` collects one closed schema-1 object and both renderers consume that same validated object. It contains the profile and guarantee, masking floor/effective level/engine/dropped names, per-vendor receipt state, closed per-hook trust facts, conformance state, capabilities, asset diagnostics, MCP notes, the handoff export count and bytes, and known gaps. Per-vendor receipt state comes from the same `ihar_receipt_binary_status` helper used by launch and is exactly `verified`, `mismatched`, or `missing receipt`.
 
-`ihar check --diff` reports each selected runtime generation. The selection includes effective MCP identity and uses the same hash input as launch; the diff does not calculate a second identity. Rendered-file differences are categorized as effective-MCP or managed-setting drift. Claude settings use the same field-path comparator as reuse, so a string `theme` is ignored while managed or unknown changes name only a field path. For an existing selected Codex runtime, the diagnostic reports mutable-link and auth-owner/lease categories without displaying credential bytes, environment values, or owner metadata. A materialized `auth.json` is reported as preserved and requiring user-approved recovery; the check never repairs it.
+`ihar check --diff` reports each selected runtime generation. The selection includes effective MCP identity and uses the same hash input as launch; the diff does not calculate a second identity. Once the existing file comparison finds a difference, diagnostic classification examines the desired and active Codex `config.toml` MCP tables to distinguish `mcp-render-drift` from `managed-setting-drift`; a missing file is `rendered-config-missing`, while a malformed or purely textual mismatch is `rendered-config-drift`, never a guessed MCP cause. Claude's separate MCP file is identified directly. Claude settings use the same field-path comparator as reuse, so a string `theme` is ignored while managed or unknown changes name only a field path. For an existing selected Codex runtime, the diagnostic reports mutable-link and auth-owner/lease categories without displaying credential bytes, environment values, or owner metadata. A materialized `auth.json` is reported as preserved and requiring user-approved recovery; the check never repairs it.
 
 Gateway and network status are structured rather than prose claims. Each discovered explicit gateway instance carries `{key, mode, port, pid, consumers, healthy, metrics}`. `key` is the 12-hex instance identity; `port` and `pid` are nullable observed integers; `consumers` is the count of live consumer records; `healthy` is the live local protocol-probe result. `metrics` carries `state: available|unavailable` and `masked`, `refused`, `relayed`, `uptime_seconds`. Available metrics require every non-negative integer; unavailable metrics require every counter to be `null`, so check never invents zeroes or claims opaque counters are known. Collection is read-only and fail-soft per instance.
 
@@ -1023,6 +1023,7 @@ With `--migrate-store`, eligible legacy content is copied into that same store s
 | Session status record | §13.2 | `$IHAR_STATE/status/<vendor>-<session>.json` |
 | Profile definition | §12.1 | `manifests/profiles/*.json` |
 | Daemon record | §5.5 | `$IHAR_STATE/daemons/codex.json` |
+| Codex auth-owner record | §4.3, §5.5 | `$IHAR_STORE/auth/codex/.owner.json` |
 | Conformance record | §6.6 | `$IHAR_STORE/verification/*.json` |
 | Home marker | §4.1 | `$IHAR_STATE/home.json` |
 | Release lockfile | §14.1 | `.ihar-lockfile.json` |

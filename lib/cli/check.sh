@@ -99,7 +99,7 @@ _ihar_check_file_matches() { # <desired> <active> <relative>
 # ihar_check_diff — compare temporary desired renders with active homes.
 ihar_check_diff() (
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
-  local temp="" state vendor desired active file relative difference found=false gateway_key port auth_diagnostic
+  local temp="" state vendor desired active file relative difference category found=false gateway_key port auth_diagnostic
   trap '[[ -z "$temp" ]] || rm -rf -- "$temp"' EXIT
   temp="$(mktemp -d "${TMPDIR:-/tmp}/ihar-check-diff-XXXXXX")" || return 1
   state="$(_ihar_project_state)"
@@ -130,12 +130,21 @@ ihar_check_diff() (
     while IFS= read -r -d '' file; do
       relative="${file#"$desired"/}"
       if [[ -z "$active" || ! -f "$active/$relative" ]]; then
+        category=managed-setting-drift
+        if [[ "$relative" == mcp/ihar.json ]]; then
+          category=effective-mcp-identity
+        elif [[ "$vendor" == codex && "$relative" == config.toml ]]; then
+          category=rendered-config-missing
+        fi
         printf '%s %s missing from selected runtime (%s)\n' "$vendor" "$relative" \
-          "$([[ "$relative" == mcp/ihar.json ]] && printf effective-mcp-identity || printf managed-setting-drift)"
+          "$category"
         found=true
       elif ! difference="$(_ihar_check_file_matches "$file" "$active/$relative" "$relative")"; then
         if [[ "$relative" == settings.json ]]; then
           printf '%s %s managed-setting-drift at %s\n' "$vendor" "$relative" "${difference:-root}"
+        elif [[ "$vendor" == codex && "$relative" == config.toml ]]; then
+          category="$(ihar_python ihar.check_result config-diff-category "$file" "$active/$relative")" || return
+          printf '%s %s differs from selected runtime (%s)\n' "$vendor" "$relative" "$category"
         else
           printf '%s %s differs from selected runtime (%s)\n' "$vendor" "$relative" \
             "$([[ "$relative" == mcp/ihar.json ]] && printf effective-mcp-identity || printf managed-setting-drift)"
