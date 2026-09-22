@@ -11,6 +11,7 @@ import hashlib
 import http.client
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -31,6 +32,45 @@ def check(label, condition):
     else:
         FAIL += 1
         print(f"FAIL {label}")
+
+
+def reap(state_root: Path, timeout=15.0):
+    """Leave no supervisor or vendor child behind.
+
+    A tab's child is a detached process group with its own `sleep`; a test that only
+    sends SIGTERM and moves on leaves processes whose command lines mention a temporary
+    state root. The runtime-state migration of another test then scans for consumers,
+    finds one, and refuses fail-closed — which is how this suite produced an occasional
+    failure in `tests/test_state.sh` that never reproduced on its own.
+    """
+    pids = []
+    for record in (state_root / "console" / "s").glob("*.json"):
+        try:
+            pid = int(json.loads(record.read_text(encoding="utf-8")).get("pid") or 0)
+        except (OSError, ValueError):
+            continue
+        if pid:
+            pids.append(pid)
+    for pid in pids:
+        for target in (lambda: os.killpg(os.getpgid(pid), signal.SIGTERM),
+                       lambda: os.kill(pid, signal.SIGTERM)):
+            try:
+                target()
+                break
+            except OSError:
+                continue
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        alive = [pid for pid in pids if Path(f"/proc/{pid}").exists()]
+        if not alive:
+            return
+        time.sleep(0.2)
+    for pid in pids:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(0.5)
 
 
 def fake_root(tmp: Path) -> Path:
@@ -497,17 +537,12 @@ def main():
 
         broker.terminate()
         broker.wait(timeout=10)
-        # A supervisor outlives its broker: that is why it exists.
+        # A supervisor outlives its broker: that is why it exists. Asserted before the
+        # reaping, because the reaping is what makes the next test's quiescence check
+        # honest rather than a race against this one's leftovers.
         alive = chat_record and Path(f"/proc/{chat_record['pid']}").exists()
         check("the supervisor survives the broker", bool(alive))
-        for record in (state_root / "console" / "s").glob("*.json"):
-            try:
-                pid = int(json.loads(record.read_text(encoding="utf-8")).get("pid") or 0)
-            except ValueError:
-                continue
-            if pid:
-                subprocess.run(["kill", "-TERM", str(pid)], check=False)
-        time.sleep(1.0)
+        reap(state_root)
 
     print(f"PASS={PASS} FAIL={FAIL}")
     return 1 if FAIL else 0

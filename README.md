@@ -38,6 +38,15 @@ A profile is a set of guarantees, and `ihar check` prints the text of the one in
 A profile that enforces something and cannot prove it aborts the launch. There is no mode
 where a guarantee degrades silently.
 
+The masking behind `protected` is two layers: tuned patterns for the things that have a
+shape — addresses, keys, cards, addresses of machines — and a named-entity engine on top
+for the things that do not, like a person or a place. It reads both English and Russian,
+picking the language from the script the text is written in rather than from a setting,
+and `ihar check` prints which engine and which languages are actually in force. Installing
+ihar fetches that engine with its two language models, about 380 MB in the store; a machine
+that cannot install it keeps working on the patterns alone and says so instead of implying
+more.
+
 ## Install
 
 Everything installs under your own user. Installation never uses `sudo`. An `isolated`
