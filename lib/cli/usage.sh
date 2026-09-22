@@ -20,6 +20,7 @@ commands
                         the managed Codex app-server daemon
   sessions list | resume <id> | name <id> <title>
                         canonical sessions across both vendors
+  console <action>      start, status, stop or restart the multi-session console
   switch --to <vendor>  carry this session into the other vendor
                         --history summary|transcript selects how much travels
   web <vendor>          start the vendor's native remote surface

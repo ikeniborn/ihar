@@ -64,6 +64,17 @@ def render_text(result: dict) -> str:
         f"handoff      {handoff['exports']} transcript export(s), {handoff['bytes']} bytes, "
         "kept indefinitely"
     )
+    console = result["console"]
+    lines.append(
+        f"console      {console['state']}"
+        + (f" on port {console['port']}" if console["port"] else "")
+        + f"; {console['live_sessions']} live tab(s); token "
+        + ("present" if console["token_present"] else "absent")
+    )
+    lines.append(
+        f"             reach {', '.join(console['reach']) or 'no project state'}"
+        " (one token starts launches in each)"
+    )
     lines.append(f"mcp          {'strict' if result['mcp']['strict'] else 'not enforced'}")
     for vendor in ("claude", "codex"):
         lines.extend(f"             {vendor}: {note}" for note in result["mcp"]["notes"][vendor])
@@ -283,6 +294,7 @@ def _collect(target: str) -> None:
         },
         "network": _network_status(),
         "handoff": _handoff_exports(),
+        "console": _console_status(),
         "vendors": vendors,
         "assets": assets,
         "mcp": {
@@ -313,6 +325,50 @@ def _handoff_exports() -> dict:
     except OSError:
         pass
     return {"exports": count, "bytes": total}
+
+
+def _console_status() -> dict:
+    """Report the console broker and, plainly, how far its token reaches (LLD 13.2).
+
+    One token starts launches in every project state under the state root, which is
+    wider than any single launch was before R9. The reach is therefore printed rather
+    than implied. Read-only and fail-soft.
+    """
+    root = os.environ.get("IHAR_STATE_ROOT", "")
+    directory = os.path.join(root, "console")
+    state, port, live = "stopped", None, 0
+    try:
+        with open(os.path.join(directory, "daemon.json"), encoding="utf-8") as stream:
+            record = json.load(stream)
+        pid = int(record.get("pid") or 0)
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        record = {}
+    else:
+        state, port = "running", record.get("port")
+    if state == "running":
+        sessions = os.path.join(directory, "s")
+        try:
+            for name in os.listdir(sessions):
+                if not name.endswith(".json"):
+                    continue
+                with open(os.path.join(sessions, name), encoding="utf-8") as stream:
+                    session = json.load(stream)
+                if session.get("exit_code") is None:
+                    live += 1
+        except (OSError, ValueError):
+            pass
+    reach = []
+    try:
+        for name in sorted(os.listdir(root)):
+            if len(name) == 8 and all(char in "0123456789abcdef" for char in name) \
+                    and os.path.isfile(os.path.join(root, name, "home.json")):
+                reach.append(name)
+    except OSError:
+        pass
+    return {"state": state, "port": port, "live_sessions": live,
+            "token_present": os.path.isfile(os.path.join(directory, "token")),
+            "reach": reach}
 
 
 def _network_status() -> dict:

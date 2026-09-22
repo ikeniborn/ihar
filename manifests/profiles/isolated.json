@@ -1,5 +1,6 @@
 {
   "acp": "refuse",
+  "console": "refuse",
   "env_passthrough": [],
   "gateway": "explicit",
   "guarantee": "Machine egress: deny by default at the guest boundary; only the gateway, allowlisted MCP endpoints and profile-listed hosts are reachable. This is the only profile whose claim covers arbitrary tool traffic.",

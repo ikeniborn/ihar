@@ -102,6 +102,7 @@ ln -s "$ROOT/skills" "$ACP_TEST_ROOT/skills"
 cat > "$ACP_TEST_ROOT/manifests/profiles/receipt-acp.json" <<'JSON'
 {
   "acp": "allow",
+  "console": "allow",
   "env_passthrough": [],
   "gateway": "off",
   "guarantee": "Receipt-order test profile.",
