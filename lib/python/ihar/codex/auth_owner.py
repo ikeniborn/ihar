@@ -321,6 +321,10 @@ def acquire(runtime: str | os.PathLike[str], mode: str, *,
                   "guardian": _identity_for(guardian_pid or os.getpid()), "child": None, "daemon": None,
                   "attached_guardian": None,
                   "state": "active"}
+        if mode == "guest":
+            record["guest_baseline"] = _canonical_identity(owner)
+            if record["guest_baseline"] is None:
+                raise AuthOwnerError("Codex shared credential is absent")
         _write_owner(owner, record)
         return owner_id
 
@@ -652,6 +656,18 @@ def _main(arguments: list[str]) -> int:
         if action == "guest-register" and len(arguments) == 6:
             store, owner_id, bundle, image, seed = arguments[1:]
             register_guest_bundle(bundle, image, store, owner_id, seed)
+            return 0
+        if action == "guest-abort" and len(arguments) == 3:
+            store, owner_id = arguments[1:]
+            abort_guest_prelaunch(owner_id, store=store)
+            return 0
+        if action == "guest-starting" and len(arguments) == 3:
+            store, owner_id = arguments[1:]
+            mark_guest_starting(owner_id, store=store)
+            return 0
+        if action == "guest-commit-candidate" and len(arguments) == 3:
+            bundle, temporary = arguments[1:]
+            commit_guest_candidate(temporary, bundle)
             return 0
         if action == "guest-bind-vm" and len(arguments) == 5:
             store, owner_id, pid, binary = arguments[1:]
@@ -1097,6 +1113,35 @@ def _guest_directory_identity(path: Path) -> list[int]:
         return [metadata.st_dev, metadata.st_ino]
 
 
+def commit_guest_candidate(temporary: str | os.PathLike[str],
+                           bundle: str | os.PathLike[str]) -> None:
+    """Durably link an extracted guest file without replacing recovery bytes."""
+    bundle_path = Path(os.path.abspath(bundle))
+    temporary_path = Path(os.path.abspath(temporary))
+    if (temporary_path.parent != bundle_path
+        or not temporary_path.name.startswith(".auth-return-")):
+        raise AuthOwnerError("Codex guest candidate does not belong to bundle")
+    try:
+        with ExitStack() as stack:
+            _guest_directory_identity(bundle_path)
+            directory = _open_store(bundle_path, stack)
+            candidate = os.open(temporary_path.name, _FILE_FLAGS, dir_fd=directory)
+            stack.callback(os.close, candidate)
+            if stat.S_IMODE(os.fstat(candidate).st_mode) != 0o600:
+                raise AuthOwnerError("Codex guest candidate must be private")
+            before = _identity(candidate)
+            os.fsync(candidate)
+            if _identity(candidate) != before:
+                raise AuthOwnerError("Codex guest candidate changed during sync")
+            os.link(temporary_path.name, "auth.json", src_dir_fd=directory,
+                    dst_dir_fd=directory, follow_symlinks=False)
+            os.fsync(directory)
+            os.unlink(temporary_path.name, dir_fd=directory)
+            os.fsync(directory)
+    except OSError as error:
+        raise AuthOwnerError("Codex guest candidate durability unproven; bundle retained") from error
+
+
 def _guest_record(record: dict, bundle: Path | None = None) -> dict:
     guest = record.get("guest")
     if record.get("mode") != "guest" or not isinstance(guest, dict):
@@ -1134,6 +1179,8 @@ def register_guest_bundle(bundle: str | os.PathLike[str], image: str | os.PathLi
         baseline = _canonical_identity(owner)
         if baseline is None:
             raise AuthOwnerError("Codex shared credential is absent")
+        if baseline != record.get("guest_baseline"):
+            raise AuthOwnerError("Codex credential owner changed before guest registration")
         seed_path = Path(os.path.abspath(seed))
         _guest_directory_identity(seed_path.parent)
         if _guest_file_identity(seed_path)["sha256"] != baseline["sha256"]:
@@ -1146,6 +1193,35 @@ def register_guest_bundle(bundle: str | os.PathLike[str], image: str | os.PathLi
         }
         _write_owner(owner, record)
         return baseline
+
+
+def abort_guest_prelaunch(owner_id: str, *,
+                          store: str | os.PathLike[str] | None = None) -> None:
+    """Release only a guardian whose guest could not have produced new bytes."""
+    def update(record: dict, owner: int) -> None:
+        _guest_guardian(record)
+        guest = record.get("guest")
+        if (record.get("mode") != "guest"
+            or (guest is not None and (guest.get("state") != "registered" or guest.get("vm") is not None))):
+            raise AuthOwnerError("Codex guest start is ambiguous; owner retained")
+        if _canonical_identity(owner) != record.get("guest_baseline"):
+            raise AuthOwnerError("Codex credential owner changed before guest abort")
+        _guard_no_pending(owner)
+        os.unlink(_OWNER_RECORD, dir_fd=owner)
+        os.fsync(owner)
+    _update_owner(owner_id, update, store=store)
+
+
+def mark_guest_starting(owner_id: str, *,
+                        store: str | os.PathLike[str] | None = None) -> None:
+    def update(record: dict, owner: int) -> None:
+        _guest_guardian(record)
+        guest = _guest_record(record)
+        if guest["state"] != "registered":
+            raise AuthOwnerError("Codex guest start state is invalid")
+        guest["state"] = "starting"
+        _write_owner(owner, record)
+    _update_owner(owner_id, update, store=store)
 
 
 def bundle_identity_matches(bundle: str | os.PathLike[str], owner_id: str, *,
@@ -1167,7 +1243,7 @@ def bind_guest_vm(owner_id: str, pid: int, binary: str | os.PathLike[str], *,
     def update(record: dict, owner: int) -> None:
         _guest_guardian(record)
         guest = _guest_record(record)
-        if guest["state"] != "registered":
+        if guest["state"] not in ("registered", "starting"):
             raise AuthOwnerError("Codex guest VM is already bound")
         identity = _identity_for(pid, binary)
         if identity["pgrp"] != pid:

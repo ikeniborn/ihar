@@ -1136,7 +1136,7 @@ _ihar_microvm_extract_guest_auth() { # <state-image> <private-bundle>
     return 1
   fi
   chmod 600 "$temporary" || return 1
-  mv -f -- "$temporary" "$bundle/auth.json"
+  ihar_python ihar.codex.auth_owner guest-commit-candidate "$bundle" "$temporary"
 }
 
 _ihar_microvm_image_auth_matches() { # <state-image> <seed-auth> <private-bundle>
@@ -1198,6 +1198,19 @@ ihar_microvm_launch() {
     || ihar_die 3 "Codex guest credential owner is unavailable"
   umask "$old_umask"
   IFS= read -r guest_owner_id < "$session/guest-owner-id"
+  local guest_vm_started=false early_cleanup_done=false
+  _ihar_microvm_early_cleanup() {
+    [[ "$early_cleanup_done" != true ]] || return 0
+    early_cleanup_done=true
+    if [[ "$guest_vm_started" != true ]]; then
+      ihar_codex_guest_owner abort "$guest_owner_id" >/dev/null 2>&1 || true
+    fi
+    ihar_microvm_release_slot
+    ihar_launch_state_leave
+    ihar_gateway_release
+  }
+  trap _ihar_microvm_early_cleanup EXIT
+  trap '_ihar_microvm_early_cleanup; exit 130' INT TERM
   ihar_microvm_reserve_slot
   tap="$IHAR_MICROVM_TAP"
 
@@ -1263,9 +1276,7 @@ ihar_microvm_launch() {
     ihar_microvm_network_remove
     sudo -n ip link del "$tap" 2>/dev/null || true
     rm -f "$socket"
-    ihar_microvm_release_slot
-    ihar_launch_state_leave
-    ihar_gateway_release
+    _ihar_microvm_early_cleanup
   }
   # shellcheck disable=SC2317
   trap _ihar_microvm_cleanup EXIT
@@ -1283,6 +1294,9 @@ ihar_microvm_launch() {
   manifest="$(ihar_microvm_launch_manifest_write "$config")" \
     || ihar_die 3 "cannot capture the microVM prelaunch manifest"
   : > "$log"
+  ihar_codex_guest_owner starting "$guest_owner_id" \
+    || ihar_die 3 "cannot mark Codex guest start boundary"
+  guest_vm_started=true
   setsid "$IHAR_STORE/bin/firecracker" --api-sock "$socket" --config-file "$config" --log-path "$log" --level Warn \
     >> "$session/console.log" 2>&1 &
   pid=$!

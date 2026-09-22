@@ -113,6 +113,7 @@ guest_bundle="$session/guest-bundle"
 guest_state="$session/guest-state"
 guest_auth="$IHAR_STORE/auth/codex/auth.json"
 mkdir -p "$guest_bundle/runtime/codex" "$guest_state" "$(dirname "$guest_auth")"
+chmod 700 "$guest_bundle"
 chmod 700 "$IHAR_STORE/auth" "$(dirname "$guest_auth")"
 printf '%s' synthetic-guest-seed > "$guest_auth"
 chmod 600 "$guest_auth"
@@ -127,6 +128,14 @@ assert_eq "writable Codex home keeps config on read-only policy" \
 assert_exit "writable Codex auth path is a real file" 1 \
   test -L "$guest_state/.ihar-guest-codex-home/auth.json"
 assert_exit "policy image has no credential copy" 1 test -e "$guest_bundle/store/auth/codex/auth.json"
+guest_policy_image="$session/guest-policy.ext4"
+_ihar_microvm_make_image "$guest_policy_image" "$guest_bundle" 16
+policy_before="$(sha256sum "$guest_policy_image" | cut -d' ' -f1)"
+readonly_attempt="$(debugfs -R "write $guest_auth /runtime/codex/auth.json" "$guest_policy_image" 2>&1)"
+assert_contains "read-only policy image refuses a credential write" \
+  "$readonly_attempt" 'Filesystem opened read/only'
+assert_eq "read-only policy bytes stay unchanged after write refusal" "$policy_before" \
+  "$(sha256sum "$guest_policy_image" | cut -d' ' -f1)"
 assert_eq "state seed holds private credential bytes" "synthetic-guest-seed" \
   "$(cat "$guest_state/.ihar-guest-codex-home/auth.json")"
 assert_eq "state seed credential stays private" "600" \
@@ -163,6 +172,34 @@ mkdir -p "$session/persisted-state"
 rsync -a --exclude='/.ihar-guest-codex-home/' "$guest_state/" "$session/persisted-state/"
 assert_exit "live state transfer omits private credential view" 1 \
   test -e "$session/persisted-state/.ihar-guest-codex-home/auth.json"
+
+early_store="$session/early-store"
+early_runtime="$session/early-runtime"
+mkdir -p "$early_store/auth/codex" "$early_runtime" "$session/early-state"
+chmod 700 "$early_store/auth" "$early_store/auth/codex"
+printf '%s' synthetic-early-owner > "$early_store/auth/codex/auth.json"
+chmod 600 "$early_store/auth/codex/auth.json"
+ln -s "$early_store/auth/codex/auth.json" "$early_runtime/auth.json"
+early_status=0
+(
+  export IHAR_STORE="$early_store" IHAR_STATE_ROOT="$session/early-state-root"
+  export IHAR_STATE="$session/early-state"
+  source "$ROOT/lib/codex/auth.sh"
+  ihar_microvm_preflight() { :; }
+  ihar_gateway_release() { printf x >> "$IHAR_TEST_TMP/early-release-count"; }
+  ihar_microvm_reserve_slot() {
+    _ihar_microvm_early_cleanup
+    ihar_die 3 'synthetic prelaunch failure'
+  }
+  ihar_microvm_launch codex "$early_runtime"
+) > "$session/early-stdout" 2> "$session/early-stderr" || early_status=$?
+assert_eq "synthetic prelaunch failure exits closed" "3" "$early_status"
+assert_exit "early failure releases unregistered guest owner" 1 \
+  test -e "$early_store/auth/codex/.owner.json"
+assert_eq "early failure preserves canonical credential" "synthetic-early-owner" \
+  "$(cat "$early_store/auth/codex/auth.json")"
+assert_eq "early cleanup releases gateway only once" "x" \
+  "$(cat "$IHAR_TEST_TMP/early-release-count")"
 
 # --- host-side deny-by-default policy -------------------------------------------------
 

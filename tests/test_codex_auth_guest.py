@@ -179,6 +179,100 @@ class GuestAuthTests(unittest.TestCase):
             acquire(self.root / "other", "foreground", store=self.store)
         self.assertEqual(self.guest_candidate.read_text(), "synthetic-refresh")
 
+    def test_prelaunch_abort_releases_registered_owner_without_vm(self) -> None:
+        auth_owner.abort_guest_prelaunch(self.owner_id, store=self.store)
+        self.assertTrue(self.guest_candidate.is_file())
+        next_id = acquire(self.root / "next-runtime", "foreground", store=self.store)
+        release(next_id, store=self.store)
+
+    def test_prelaunch_abort_refuses_started_vm(self) -> None:
+        process = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: process.poll() is None and (process.terminate(), process.wait()))
+        bind_guest_vm(self.owner_id, process.pid, "/usr/bin/sleep", store=self.store)
+        with self.assertRaises(AuthOwnerError):
+            auth_owner.abort_guest_prelaunch(self.owner_id, store=self.store)
+        with self.assertRaises(AuthOwnerError):
+            acquire(self.root / "next-runtime", "foreground", store=self.store)
+
+    def test_start_marker_blocks_abort_before_vm_binding(self) -> None:
+        auth_owner.mark_guest_starting(self.owner_id, store=self.store)
+        with self.assertRaises(AuthOwnerError):
+            auth_owner.abort_guest_prelaunch(self.owner_id, store=self.store)
+        self.assertTrue(self.guest_candidate.is_file())
+
+    def test_unregistered_prelaunch_abort_releases_owner(self) -> None:
+        other = self.root / "other-store"
+        (other / "auth" / "codex").mkdir(parents=True, mode=0o700)
+        (other / "auth").chmod(0o700)
+        (other / "auth" / "codex" / "auth.json").write_text("synthetic-other", encoding="utf-8")
+        owner_id = acquire(self.root / "other-runtime", "guest", store=other)
+        auth_owner.abort_guest_prelaunch(owner_id, store=other)
+        next_id = acquire(self.root / "next-runtime", "foreground", store=other)
+        release(next_id, store=other)
+
+    def test_candidate_file_sync_failure_preserves_temporary_bytes(self) -> None:
+        self.guest_candidate.unlink()
+        temporary = self.bundle / ".auth-return-test"
+        temporary.write_text("synthetic-fresh", encoding="utf-8")
+        temporary.chmod(0o600)
+        real_fsync = auth_owner.os.fsync
+
+        def fail_file_sync(fd: int) -> None:
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("synthetic file sync failure")
+            real_fsync(fd)
+
+        with mock.patch.object(auth_owner.os, "fsync", side_effect=fail_file_sync):
+            with self.assertRaises(AuthOwnerError):
+                auth_owner.commit_guest_candidate(temporary, self.bundle)
+        self.assertEqual(temporary.read_text(), "synthetic-fresh")
+        self.assertFalse(self.guest_candidate.exists())
+
+    def test_candidate_directory_sync_failure_retains_both_names(self) -> None:
+        self.guest_candidate.unlink()
+        temporary = self.bundle / ".auth-return-test"
+        temporary.write_text("synthetic-fresh", encoding="utf-8")
+        temporary.chmod(0o600)
+        real_fsync = auth_owner.os.fsync
+
+        def fail_directory_sync(fd: int) -> None:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("synthetic directory sync failure")
+            real_fsync(fd)
+
+        with mock.patch.object(auth_owner.os, "fsync", side_effect=fail_directory_sync):
+            with self.assertRaises(AuthOwnerError):
+                auth_owner.commit_guest_candidate(temporary, self.bundle)
+        self.assertEqual(temporary.read_text(), "synthetic-fresh")
+        self.assertEqual(self.guest_candidate.read_text(), "synthetic-fresh")
+
+    def test_cli_guest_publication_never_prints_candidate_bytes(self) -> None:
+        self.guest_candidate.write_text("synthetic-cli-secret", encoding="utf-8")
+        self.quiesce()
+        environment = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "lib", "python"))
+        result = subprocess.run(
+            [sys.executable, "-m", "ihar.codex.auth_owner", "guest-publish",
+             str(self.store), self.owner_id, str(self.bundle)],
+            capture_output=True, text=True, env=environment, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("synthetic-cli-secret", result.stdout + result.stderr)
+        self.assertEqual(self.canonical.read_text(), "synthetic-cli-secret")
+
+    def test_cli_guest_refusal_never_prints_candidate_bytes(self) -> None:
+        self.guest_candidate.write_text("synthetic-cli-secret", encoding="utf-8")
+        self.quiesce()
+        self.canonical.write_text("synthetic-other-writer", encoding="utf-8")
+        environment = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "lib", "python"))
+        result = subprocess.run(
+            [sys.executable, "-m", "ihar.codex.auth_owner", "guest-publish",
+             str(self.store), self.owner_id, str(self.bundle)],
+            capture_output=True, text=True, env=environment, check=False,
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertNotIn("synthetic-cli-secret", result.stdout + result.stderr)
+        self.assertEqual(self.canonical.read_text(), "synthetic-other-writer")
+
 
 if __name__ == "__main__":
     unittest.main()
