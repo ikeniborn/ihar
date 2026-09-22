@@ -74,6 +74,7 @@ class AuthLeaseTests(unittest.TestCase):
     def _run_ihar(self, *arguments: str, guard_fd: str | None = None,
                   legacy_guard_fd: str | None = None,
                   binary_source: str | None = None,
+                  claude_binary_source: str | None = None,
                   tty_reply: str | None = None,
                   profile_root: Path | None = None,
                   python_binary: Path | None = None,
@@ -91,6 +92,10 @@ class AuthLeaseTests(unittest.TestCase):
         binary.chmod(0o700)
         if not codex_installed:
             binary.unlink()
+        claude_binary = self.root / "claude"
+        if claude_binary_source is not None:
+            claude_binary.write_text(claude_binary_source, encoding="utf-8")
+            claude_binary.chmod(0o700)
         for name in ("hooks", "manifests", "skills"):
             target = self.store / name
             if not target.exists():
@@ -98,7 +103,9 @@ class AuthLeaseTests(unittest.TestCase):
         environment = dict(os.environ, IHAR_STORE=str(self.store),
                            IHAR_STATE_ROOT=str(self.root / "state"),
                            IHAR_PY=str(python_binary or sys.executable),
-                           IHAR_CODEX_BIN=str(binary), IHAR_LOCKFILE=str(root / ".ihar-lockfile.json"))
+                           IHAR_CODEX_BIN=str(binary),
+                           IHAR_CLAUDE_BIN=str(claude_binary),
+                           IHAR_LOCKFILE=str(root / ".ihar-lockfile.json"))
         if profile_root is not None:
             environment["IHAR_ROOT"] = str(profile_root)
         if guard_fd is not None:
@@ -199,6 +206,41 @@ class AuthLeaseTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 3, result.stderr)
         self.assertFalse(vendor_marker.exists(), result.stderr)
         first.wait(timeout=8)
+
+    def test_late_codex_conformance_preserves_existing_proof_without_vendor_start(self) -> None:
+        binary = self.root / "codex"
+        vendor_marker = self.root / "late-conformance-codex-started"
+        wrapper = self.root / "conformance-python-wrapper"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' '#!/bin/sh' 'touch {str(vendor_marker)!r}' > {str(binary)!r}\n"
+            f"chmod 700 {str(binary)!r}\n"
+            "if [ \"$1:$2:$3\" = '-m:ihar.conformance.run:claude' ]; then exit 0; fi\n"
+            f"exec {sys.executable!r} \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o700)
+        proof = self.store / "verification" / "codex-existing.json"
+        proof.parent.mkdir(mode=0o700)
+        proof.write_text("synthetic-proof", encoding="utf-8")
+
+        started = time.monotonic()
+        result = self._run_ihar(
+            "check", "--conformance", python_binary=wrapper,
+            codex_installed=False,
+            claude_binary_source=(
+                "#!/bin/sh\n"
+                "printf '2.1.274 (Claude Code)\\n'\n"
+            ),
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(vendor_marker.exists(), result.stderr)
+        self.assertTrue(proof.exists(), result.stderr)
+        self.assertEqual(proof.read_text(encoding="utf-8"), "synthetic-proof")
+        self.assertFalse((proof.parent / ".recheck-codex").exists())
 
     def test_guardian_admission_precedes_contended_install_store_lock(self) -> None:
         first = self._guardian("import time; time.sleep(5)")

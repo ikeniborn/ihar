@@ -308,6 +308,9 @@ ihar_cmd_conformance() {
   for vendor in claude codex; do
     binary="$(eval echo "\$IHAR_${vendor^^}_BIN")"
     [[ -x "$binary" ]] || continue
+    if [[ "$vendor" == codex && "${IHAR_CHECK_CODEX_PROBES:-true}" != true ]]; then
+      continue
+    fi
     marker="$directory/.recheck-$vendor"
     if [[ ! -e "$directory" && ! -L "$directory" ]]; then
       mkdir -- "$directory" || {

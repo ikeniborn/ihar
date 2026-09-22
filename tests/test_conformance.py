@@ -316,9 +316,14 @@ def test_failed_record_mode_requires_complete_matching_failed_required_case():
             assert actual == expected, (record["cases"], actual)
             assert record_path not in out.getvalue() + err.getvalue()
             assert "SECRET-SENTINEL" not in out.getvalue() + err.getvalue()
-        assert conformance_check.main([
-            "--failed-record", record_path, binary, manifest,
-        ]) == 2
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            invalid_result = conformance_check.main([
+                "--failed-record", record_path, binary, manifest,
+            ])
+        assert invalid_result == 2
+        assert out.getvalue() == ""
+        assert err.getvalue() == conformance_check.__doc__ + "\n"
     finally:
         shutil.rmtree(store, ignore_errors=True)
 

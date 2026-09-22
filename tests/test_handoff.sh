@@ -190,8 +190,12 @@ assert_contains "the export carries the conversation" \
 rm -f "$state/handoff/$source_id-transcript.md"
 ihar_adapter() { [[ "$2" == get_session ]] && return 1; printf '%s\n' '{"open_items":[],"decisions":[],"decisions_heuristic":[],"recent_messages":[]}'; }
 launched_vendor=""
-ihar_cmd_switch
+handoff_warning="$IHAR_TEST_TMP/unreadable-transcript-warning"
+ihar_cmd_switch 2>"$handoff_warning"
 assert_eq "an unreadable transcript still switches" codex "$launched_vendor"
+assert_eq "an unreadable transcript emits the bounded fallback warning" \
+  "warning: the source transcript could not be read; the package falls back to summary mode" \
+  "$(cat "$handoff_warning")"
 package="$(cat "$state/handoff/$source_id.json")"
 assert_contains "an unreadable transcript degrades to summary" "$package" '"mode":"summary"'
 assert_exit "a degraded switch writes no export" 1 test -f "$state/handoff/$source_id-transcript.md"
