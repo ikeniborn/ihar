@@ -576,6 +576,26 @@ ihar_install_conformance() {
       --auth-store "$protected_store" --lockfile "$IHAR_LOCKFILE" \
       --protected-store "$protected_store" 1>&2 && continue
     run_status=$?
+    if [[ "$run_status" == 1 ]]; then
+      # A generation is not held back by a quota, a missing login or an unreachable
+      # endpoint: none of those says this vendor mishandles a hook. The record is
+      # discarded as proof and the vendor is marked unproven, so an enforced profile
+      # still refuses to launch until a real run passes.
+      record="$IHAR_STORE/verification/$vendor-$(ihar_version_slug "$binary").json"
+      if ihar_python ihar.conformance.check --unmeasured-record "$vendor" "$record" "$binary" \
+        "$IHAR_ROOT/manifests/hooks.json" >/dev/null 2>&1; then
+        rm -f -- "$record" || {
+          ihar_warn "cannot discard unmeasured conformance record for $vendor"
+          return 3
+        }
+        printf '%s\n' "$vendor" >> "$IHAR_STORE/.ihar-unproven-vendors" || {
+          ihar_warn "cannot record unproven conformance for $vendor"
+          return 3
+        }
+        ihar_warn "hook conformance could not be measured for $vendor; it stays unproven and enforced profiles will refuse it"
+        continue
+      fi
+    fi
     if [[ "$run_status" == 1 && "${IHAR_INSTALL_BOOTSTRAP:-false}" == true ]]; then
       record="$IHAR_STORE/verification/$vendor-$(ihar_version_slug "$binary").json"
       if ihar_python ihar.conformance.check --failed-record "$vendor" "$record" "$binary" \

@@ -583,6 +583,10 @@ hook enforcement unproven for <vendor> <version>; run ihar check --conformance
 
 **A failed case says why.** Each case already computed a reason and the record stored `name: status` instead, so the printed line carried nothing. The record now keeps the case's own sentence, clipped to 200 characters, and the runner prints it. Those sentences are the runner's words — an exit code, a missing sentinel, a decision that was not recorded — never vendor or model output, which stays out of the record as §14 requires.
 
+**A case that could not be measured is not a case that failed.** A quota, a missing login and an unreachable endpoint say nothing about whether a vendor honours a hook decision. Recording them as failures blocked an install that had nothing wrong with it — observed when this project's own debugging exhausted a Codex quota — so those turns are recorded `unmeasured` with one word from the reason vocabulary. The vendor's text is read to classify and never kept.
+
+The consequence is asymmetric on purpose. An install whose only non-passes are unmeasured activates the generation, discards the record as proof and adds the vendor to the unproven list, with a warning naming what happened. An enforced profile still refuses to launch that vendor, because an unmeasured case proves nothing; `ihar check --conformance` is what turns it into evidence once the environment allows. One real failure among the required cases and the record is a failure again, whatever else went unmeasured.
+
 ## 7. MCP and its egress (slice S4)
 
 ### 7.1 Registry
