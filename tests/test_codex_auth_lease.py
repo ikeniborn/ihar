@@ -86,6 +86,7 @@ class AuthLeaseTests(unittest.TestCase):
             "config_hash": None,
         }
         record.update(updates)
+        auth_owner.validate_guardian_owner_record(record)
         return record
 
     def _run_ihar(self, *arguments: str, guard_fd: str | None = None,
@@ -834,7 +835,7 @@ class AuthLeaseTests(unittest.TestCase):
         metadata = socket_path.stat()
         absent_pid = 2147483647
         record = self._schema_two_record(
-            state="active",
+            state="active", runtime=str(self.runtime_a), config_hash="",
             child={"pid": absent_pid, "start": "absent", "binary": "/bin/false",
                    "pgrp": absent_pid},
             daemon={"pid": absent_pid, "start": "absent", "binary": "/bin/false",

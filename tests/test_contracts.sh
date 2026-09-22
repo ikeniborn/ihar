@@ -373,6 +373,7 @@ assert_eq "auth diagnostic preserves materialized bytes" 'synthetic-credential-d
   "$(cat "$DIAGNOSTIC_ROOT/runtime/auth.json")"
 
 auth_categories="$(python3 - "$IHAR_TEST_TMP/auth-owner-categories" <<'PY'
+import copy
 import io
 import json
 import os
@@ -393,12 +394,17 @@ with ExitStack() as stack:
 canonical = store / "auth" / "codex" / "auth.json"
 canonical.write_text("synthetic-token-not-for-output", encoding="utf-8")
 canonical.chmod(0o600)
+owner_path = store / "auth" / "codex" / ".owner.json"
 
 def report(label):
     captured = io.StringIO()
     with redirect_stdout(captured):
         assert _auth_diff(str(runtime), str(store)) == 0
     print(f"{label}={captured.getvalue().strip()}")
+
+def write_raw(record):
+    owner_path.write_text(json.dumps(record), encoding="utf-8")
+    owner_path.chmod(0o600)
 
 report("missing")
 (runtime / "auth.json").symlink_to(canonical)
@@ -412,7 +418,7 @@ with ExitStack() as stack:
     _root, _auth, owner = auth_owner._owner_directories(store, stack, create=False)
     auth_owner._write_owner(owner, record)
 report("busy")
-record = {
+blocked_record = {
     "schema": 2, "state": "blocked", "guardian": auth_owner._identity_for(os.getpid()),
     "child": None, "children": [], "daemon": None, "guest": None,
     "guest_bundle": None, "guest_reconciled": False,
@@ -420,15 +426,90 @@ record = {
 }
 with ExitStack() as stack:
     _root, _auth, owner = auth_owner._owner_directories(store, stack, create=False)
-    auth_owner._write_owner(owner, record)
+    auth_owner._write_owner(owner, blocked_record)
 report("blocked")
-owner_path = store / "auth" / "codex" / ".owner.json"
-owner_path.write_text(json.dumps({
+identity = {"pid": 99999998, "start": "nested", "binary": "/nested-secret-value",
+            "pgrp": 99999998}
+daemon_record = copy.deepcopy(blocked_record)
+daemon_record["daemon"] = dict(
+    identity, socket=str(root / "private-daemon.sock"), socket_dev=1, socket_ino=2,
+)
+write_raw(daemon_record)
+report("blocked-daemon")
+remote_record = copy.deepcopy(blocked_record)
+remote_record["daemon"] = copy.deepcopy(daemon_record["daemon"])
+remote_record["children"] = [dict(
+    identity, client_state=str(root / "private-client-state"), client_state_dev=3,
+    client_state_ino=4, descendants=[dict(identity, pid=99999997, pgrp=99999997)],
+)]
+write_raw(remote_record)
+report("blocked-remote")
+remote_record["daemon"] = None
+write_raw(remote_record)
+report("blocked-remote-retained")
+auth_stage_record = copy.deepcopy(blocked_record)
+auth_stage_record.update(auth_stage=str(root / "private-auth-stage"), auth_verb="login",
+                         auth_caller=identity)
+write_raw(auth_stage_record)
+report("blocked-auth-stage")
+file_identity = {
+    "dev": 1, "ino": 2, "size": 3, "mtime_ns": 4, "ctime_ns": 5, "sha256": "a" * 64,
+}
+guest_base = {
+    "bundle": str(root / "private-guest-bundle"), "identity": [1, 2],
+    "image": str(root / "private-guest-image"), "image_identity": [3, 4],
+    "baseline": file_identity, "vm": None, "state": "registered",
+}
+for guest_state in ("registered", "starting", "running", "quiescent",
+                    "published-pending", "returned"):
+    guest_record = copy.deepcopy(blocked_record)
+    guest = copy.deepcopy(guest_base)
+    guest["state"] = guest_state
+    if guest_state in ("running", "quiescent", "published-pending", "returned"):
+        guest["vm"] = identity
+    if guest_state in ("published-pending", "returned"):
+        guest.update(candidate=file_identity, published=file_identity, ack_sha256="b" * 64)
+    guest_record["guest_bundle"] = guest
+    guest_record["guest"] = (identity if guest_state in
+                             ("running", "quiescent", "published-pending") else None)
+    guest_record["guest_reconciled"] = guest_state == "returned"
+    write_raw(guest_record)
+    report(f"blocked-guest-{guest_state}")
+write_raw({
     "schema": 2, "state": "blocked", "id": "malformed-owner-id",
     "path": str(root / "private-owner-path"), "secret": "malformed-secret-value",
-}), encoding="utf-8")
-owner_path.chmod(0o600)
+})
 report("malformed")
+daemon_record["daemon"].pop("socket_ino")
+write_raw(daemon_record)
+report("truncated-daemon")
+daemon_record["daemon"]["socket_ino"] = 2
+remote_record["children"][0].pop("descendants")
+write_raw(remote_record)
+report("truncated-remote")
+remote_record = copy.deepcopy(blocked_record)
+remote_record["daemon"] = copy.deepcopy(daemon_record["daemon"])
+remote_record["children"] = [dict(
+    identity, client_state=str(root / "private-client-state"), client_state_dev=3,
+    descendants=[],
+)]
+write_raw(remote_record)
+report("truncated-remote-client-state")
+auth_stage_record.pop("auth_caller")
+write_raw(auth_stage_record)
+report("truncated-auth-stage")
+guest_record = copy.deepcopy(blocked_record)
+guest = copy.deepcopy(guest_base)
+guest.update(state="published-pending", vm=identity, candidate=file_identity,
+             published=file_identity)
+guest_record.update(guest=identity, guest_bundle=guest)
+write_raw(guest_record)
+report("truncated-guest-ack")
+guest["ack_sha256"] = "b" * 64
+guest["state"] = "returned"
+write_raw(guest_record)
+report("invalid-guest-return")
+record = copy.deepcopy(blocked_record)
 record["state"] = "active"
 record["guardian"] = {
     "pid": 99999999, "start": "synthetic", "binary": "/no-such-binary", "pgrp": 99999999,
@@ -447,12 +528,29 @@ assert_contains "active lease has busy category" "$auth_categories" \
   "busy=codex mutable-link: valid; auth-owner: busy"
 assert_contains "blocked guardian has a bounded blocked category" "$auth_categories" \
   "blocked=codex mutable-link: valid; auth-owner: blocked"
+for transition in daemon remote remote-retained auth-stage guest-registered guest-starting \
+  guest-running guest-quiescent \
+  guest-published-pending guest-returned; do
+  assert_contains "valid blocked nested owner transition stays trusted" "$auth_categories" \
+    "blocked-$transition=codex mutable-link: valid; auth-owner: blocked"
+done
 assert_contains "malformed blocked record is unverified" "$auth_categories" \
   "malformed=codex mutable-link: valid; auth-owner: unverified"
+for nested in truncated-daemon truncated-remote truncated-remote-client-state \
+  truncated-auth-stage truncated-guest-ack invalid-guest-return; do
+  assert_contains "truncated nested blocked owner is unverified" "$auth_categories" \
+    "$nested=codex mutable-link: valid; auth-owner: unverified"
+done
 assert_contains "unproven lease has unverified category" "$auth_categories" \
   "unverified=codex mutable-link: valid; auth-owner: unverified"
 for withheld in synthetic-token-not-for-output synthetic-owner-id malformed-owner-id \
-  malformed-secret-value "$IHAR_TEST_TMP/auth-owner-categories/private-owner-path" \
+  malformed-secret-value nested-secret-value \
+  "$IHAR_TEST_TMP/auth-owner-categories/private-owner-path" \
+  "$IHAR_TEST_TMP/auth-owner-categories/private-daemon.sock" \
+  "$IHAR_TEST_TMP/auth-owner-categories/private-client-state" \
+  "$IHAR_TEST_TMP/auth-owner-categories/private-auth-stage" \
+  "$IHAR_TEST_TMP/auth-owner-categories/private-guest-bundle" \
+  "$IHAR_TEST_TMP/auth-owner-categories/private-guest-image" \
   "$IHAR_TEST_TMP/auth-owner-categories"; do
   assert_exit "auth diagnostic withholds synthetic payload and metadata" 1 \
     grep -F -- "$withheld" <<<"$auth_categories"
