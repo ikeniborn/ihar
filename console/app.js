@@ -47,7 +47,11 @@ function sessionRow(project, session) {
   const actions = document.createElement('div');
   actions.className = 'actions';
   if (session.tab) {
-    actions.append(button('open', () => select(session.tab.sid)));
+    actions.append(button('open', () => {
+      if (state.tabs.has(session.tab.sid)) select(session.tab.sid);
+      else if (session.tab.kind === 'acp') attachChat(session.tab.sid, session.vendor, session.tab.caveats);
+      else attach(session.tab.sid, session.vendor);
+    }));
   }
   actions.append(
     button('history', () => showHistory(project, session)),
@@ -127,7 +131,7 @@ function select(sid) {
   }
   el('empty').hidden = state.tabs.size > 0;
   const tab = state.tabs.get(sid);
-  if (tab) { tab.term.focus(); fit(tab); }
+  if (tab && tab.term) { tab.term.focus(); fit(tab); }
 }
 
 function fit(tab) {
@@ -142,6 +146,123 @@ function fit(tab) {
   if (tab.socket && tab.socket.readyState === WebSocket.OPEN) {
     tab.socket.send(JSON.stringify({ type: 'resize', cols, rows }));
   }
+}
+
+/* ------------------------------------------------------------------- chat */
+
+function chatRow(className, who, text) {
+  const row = document.createElement('div');
+  row.className = `row ${className}`;
+  const label = document.createElement('div');
+  label.className = 'who';
+  label.textContent = who;
+  const body = document.createElement('div');
+  body.className = 'text';
+  body.textContent = text;
+  row.append(label, body);
+  return row;
+}
+
+function chatEvent(tab, event) {
+  const log = tab.element.querySelector('.log');
+  if (event.type === 'update') {
+    const update = event.update || {};
+    const text = (update.content && update.content.text) || update.title || '';
+    if (update.sessionUpdate === 'user_message_chunk') log.append(chatRow('user', 'you', text));
+    else if (update.sessionUpdate === 'agent_message_chunk') log.append(chatRow('agent', tab.label, text));
+    else if (update.sessionUpdate === 'agent_thought_chunk') log.append(chatRow('thought', 'thinking', text));
+    else if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+      log.append(chatRow('tool', `tool · ${update.status || ''}`, update.title || update.toolCallId || ''));
+    }
+  } else if (event.type === 'permission') {
+    const row = chatRow('permission', 'permission', (event.tool_call || {}).title || 'the agent asks to act');
+    const options = document.createElement('div');
+    options.className = 'options';
+    for (const option of event.options || []) {
+      options.append(button(option.name || option.optionId, () => {
+        send(tab, { type: 'permission', request_id: event.request_id, option_id: option.optionId });
+        options.replaceChildren(Object.assign(document.createElement('span'),
+                                              { textContent: `answered: ${option.name}` }));
+      }));
+    }
+    row.append(options);
+    log.append(row);
+  } else if (event.type === 'refused') {
+    log.append(chatRow('refused', 'refused', `the agent asked for ${event.method}, which this console does not offer`));
+  } else if (event.type === 'error' || event.type === 'agent-stderr') {
+    log.append(chatRow('error', event.type, event.text || ''));
+  } else if (event.type === 'exit') {
+    log.append(chatRow('error', 'exit', `the agent exited with code ${event.code}`));
+  } else if (event.type === 'turn-end') {
+    log.append(chatRow('tool', 'turn', `ended: ${event.stop_reason || 'unknown'}`));
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+function send(tab, message) {
+  if (tab.socket && tab.socket.readyState === WebSocket.OPEN) {
+    tab.socket.send(JSON.stringify({ type: 'input', data: JSON.stringify(message) }));
+  }
+}
+
+function attachChat(sid, label, caveats) {
+  if (state.tabs.has(sid)) { select(sid); return; }
+
+  const element = document.createElement('div');
+  element.className = 'chat';
+  const notice = document.createElement('p');
+  notice.className = 'caveats';
+  notice.innerHTML = 'This tab is an experimental ACP chat, not the agent\'s own interface. ' +
+    'It does not carry:';
+  const list = document.createElement('ul');
+  for (const caveat of caveats || []) {
+    const item = document.createElement('li');
+    item.textContent = caveat;
+    list.append(item);
+  }
+  notice.append(list);
+
+  const log = document.createElement('div');
+  log.className = 'log';
+  const form = document.createElement('form');
+  const input = document.createElement('textarea');
+  input.placeholder = 'Message the agent…';
+  const stop = button('cancel', () => send(state.tabs.get(sid), { type: 'cancel' }));
+  form.append(input, stop);
+  element.append(notice, log, form);
+  el('terminal').append(element);
+
+  const socket = new WebSocket(`ws://${location.host}/ws/${sid}`);
+  socket.binaryType = 'arraybuffer';
+  const tab = { socket, element, label, kind: 'acp' };
+  state.tabs.set(sid, tab);
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    send(tab, { type: 'prompt', text });
+    input.value = '';
+  });
+
+  socket.addEventListener('message', (event) => {
+    const payload = typeof event.data === 'string'
+      ? event.data : new TextDecoder().decode(new Uint8Array(event.data));
+    for (const line of payload.split('\n')) {
+      if (!line.trim()) continue;
+      try { chatEvent(tab, JSON.parse(line)); } catch (error) { /* a partial line */ }
+    }
+  });
+  socket.addEventListener('close', () => {
+    log.append(chatRow('error', 'detached', 'the conversation keeps running; reattach to follow it'));
+  });
+
+  const header = document.createElement('button');
+  header.dataset.sid = sid;
+  header.textContent = `${label} · chat`;
+  header.addEventListener('click', () => select(sid));
+  el('tabs').append(header);
+  select(sid);
 }
 
 function attach(sid, label) {
@@ -192,14 +313,21 @@ function attach(sid, label) {
   select(sid);
 }
 
-async function launch(project, vendor) {
-  const tab = await api('/api/tabs', {
+async function launch(project, vendor, kind) {
+  const response = await fetch('/api/tabs', {
     method: 'POST',
+    credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project_root: project.project_root, vendor }),
-  }).catch((error) => { alert(`the tab was refused: ${error.message}`); return null; });
-  if (!tab) return;
-  attach(tab.sid, `${vendor} · ${project.project_root.split('/').pop()}`);
+    body: JSON.stringify({ project_root: project.project_root, vendor, kind }),
+  });
+  const tab = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    alert(`the tab was refused: ${tab.error || response.status}`);
+    return;
+  }
+  const label = `${vendor} · ${project.project_root.split('/').pop()}`;
+  if (kind === 'acp') attachChat(tab.sid, label, tab.caveats);
+  else attach(tab.sid, label);
   refresh(true);
 }
 
@@ -284,11 +412,24 @@ async function rename(project, session) {
 
 function askLaunch(project) {
   el('launch-project').textContent = project.project_root;
+  const caveats = el('launch-caveats');
+  const describe = () => {
+    const chat = el('launch-kind').value === 'acp';
+    caveats.hidden = !chat;
+    caveats.textContent = chat
+      ? 'A chat tab is experimental: it does not carry the profile\'s hook or sandbox ' +
+        'guarantees, and a profile that refuses ACP will refuse it.'
+      : '';
+  };
+  el('launch-kind').onchange = describe;
+  describe();
   el('launch').returnValue = 'cancel';
   el('launch').showModal();
   el('launch').addEventListener('close', function once() {
     el('launch').removeEventListener('close', once);
-    if (el('launch').returnValue === 'go') launch(project, el('launch-vendor').value);
+    if (el('launch').returnValue === 'go') {
+      launch(project, el('launch-vendor').value, el('launch-kind').value);
+    }
   });
 }
 
@@ -322,7 +463,7 @@ for (const node of document.querySelectorAll('[data-close]')) {
 el('refresh').addEventListener('click', () => refresh(true));
 window.addEventListener('resize', () => {
   const tab = state.tabs.get(state.active);
-  if (tab) fit(tab);
+  if (tab && tab.term) fit(tab);
 });
 
 if ('Notification' in window) {

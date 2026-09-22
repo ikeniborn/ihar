@@ -160,3 +160,31 @@ dialog label { display: block; margin: .6rem 0; }
 dialog select { margin-left: .5rem; background: #232633; color: var(--text);
                 border: 1px solid var(--line); border-radius: .3rem; padding: .2rem; }
 dialog menu { display: flex; gap: .5rem; justify-content: flex-end; padding: 0; margin: 1rem 0 0; }
+
+/* An ACP chat tab. Deliberately not styled like the terminal: two kinds that look
+   alike and guarantee differently is the confusion the label exists to prevent. */
+.chat { height: 100%; display: flex; flex-direction: column; min-height: 0; }
+.chat .caveats {
+  margin: 0; padding: .5rem .75rem;
+  background: #2a2318; border-bottom: 1px solid var(--waiting);
+  color: var(--waiting); font-size: 12px;
+}
+.chat .caveats ul { margin: .3rem 0 0; padding-left: 1.1rem; }
+.chat .log { flex: 1; overflow-y: auto; padding: .75rem; }
+.chat .row { margin: .5rem 0; }
+.chat .row .who { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+.chat .row .text { white-space: pre-wrap; word-break: break-word; }
+.chat .row.thought .text { color: var(--muted); font-style: italic; }
+.chat .row.refused .text, .chat .row.error .text { color: var(--waiting); }
+.chat .row.permission {
+  border: 1px solid var(--waiting); border-radius: .4rem; padding: .5rem .6rem;
+}
+.chat .row.permission .options { display: flex; gap: .4rem; margin-top: .4rem; }
+.chat form { display: flex; gap: .5rem; padding: .5rem .75rem .75rem; border-top: 1px solid var(--line); }
+.chat form textarea {
+  flex: 1; resize: vertical; min-height: 2.6rem;
+  background: #1b1e29; color: var(--text);
+  border: 1px solid var(--line); border-radius: .35rem; padding: .4rem;
+  font: inherit;
+}
+.caveats { color: var(--waiting); font-size: 12px; }

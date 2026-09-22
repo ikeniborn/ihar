@@ -107,7 +107,8 @@ class Sidebar:
         for project in view["projects"]:
             for row in project["sessions"]:
                 tab = live.get(row["ihar_id"])
-                row["tab"] = {"sid": tab["sid"], "exit_code": tab.get("exit_code")} if tab else None
+                row["tab"] = ({"sid": tab["sid"], "kind": tab.get("kind", "pty"),
+                               "exit_code": tab.get("exit_code")} if tab else None)
         return view
 
     def _projects(self) -> list[dict]:

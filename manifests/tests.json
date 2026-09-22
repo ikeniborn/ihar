@@ -7,6 +7,8 @@
     "tests/test_conformance.py",
     "tests/test_console.py",
     "tests/test_console.sh",
+    "tests/test_console_acp.py",
+    "tests/test_console_acp.sh",
     "tests/test_contracts.sh",
     "tests/test_daemon.sh",
     "tests/test_gateway_explicit.sh",

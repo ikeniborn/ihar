@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 18 (console front end served from a pinned terminal asset; the asset decision is closed) |
+| Status | revision 19 (ACP chat tab implemented against the measured protocol, gated and labelled) |
 | Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -938,9 +938,17 @@ Keyed by the payload's `session_id`, so it needs none of the launch-claim machin
 
 **The handoff button reimplements nothing.** `POST /api/sessions/<state-id>/<ihar-id>/switch` opens a tab running `ihar switch --to <vendor> --history <mode>` with `IHAR_CONSOLE_LAUNCH_ID` naming the source session, so the package, its sanitisation and its profile gates are the ones of §11. An unknown vendor or history mode is 400 before any tab exists.
 
-### 13.3 ACP launcher mode
+### 13.3 ACP launcher mode and the console's chat tab
 
-**ACP**: `ihar acp <vendor>` execs the pinned adapter with the runtime environment. Every `hooks: enforced` profile refuses it at the profile gate, which is HLD §6.9's rule. Under `standard`, or another profile that explicitly allows ACP, a real ACP launch must then pass the same install-receipt check for the selected native Claude/Codex executable before the adapter starts; the adapter delegates to that binary, so ACP is not a receipt-verification carve-out. Adapter version/digest integrity remains a separate pinned-asset check. `ihar check` states that settings hooks may not fire (claude-agent-acp #144) and that codex-acp overrides sandbox and approval policy (#310, #477). ACP sessions are learned through the vendor listing path, since `session-register.py` may not run.
+**The chat tab (slice S13).** The console's second tab kind runs `ihar acp <vendor>` instead of the vendor's TUI and renders the conversation. Its supervisor owns the protocol state, so a broker restart reattaches to a live conversation the way it reattaches to a terminal, and the same ring buffer replays it.
+
+The protocol was measured from `@zed-industries/agent-client-protocol` 0.4.5 rather than recalled: newline-delimited JSON-RPC 2.0 over stdio, `PROTOCOL_VERSION = 1`, client-to-agent `initialize`, `authenticate`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, `session/set_mode`, `session/set_model`, and agent-to-client the `session/update` notification plus `session/request_permission`, `fs/read_text_file`, `fs/write_text_file` and five `terminal/*` methods. Update kinds are `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update` and `current_mode_update`.
+
+Two client-side decisions are security-relevant. **The console declares no client capabilities**: `fs/*` and `terminal/*` are answered with JSON-RPC method-not-found, because an agent that already runs locally with its own tools has no need of the browser window as a second filesystem, and a client that offers one offers an unaudited path. **A permission request is never answered by the process**: it is surfaced and held until the user chooses, since an automatic answer is an approval nobody gave; a cancelled turn answers every pending request `cancelled`, which the protocol requires of a client.
+
+**The gate follows `acp`, not `console`.** A chat tab is offered only where the profile allows ACP, so `protected` and `isolated` refuse it with the reason named in the tab. **The label is not the tab's own words**: it is the three lines `ihar check` already prints — claude-agent-acp #144, codex-acp #310/#477, and the console's own refusal to offer a filesystem or terminal capability — so the terminal and the window say the same thing rather than two wordings that must be reconciled.
+
+**ACP launcher mode**: `ihar acp <vendor>` execs the pinned adapter with the runtime environment. Every `hooks: enforced` profile refuses it at the profile gate, which is HLD §6.9's rule. Under `standard`, or another profile that explicitly allows ACP, a real ACP launch must then pass the same install-receipt check for the selected native Claude/Codex executable before the adapter starts; the adapter delegates to that binary, so ACP is not a receipt-verification carve-out. Adapter version/digest integrity remains a separate pinned-asset check. `ihar check` states that settings hooks may not fire (claude-agent-acp #144) and that codex-acp overrides sandbox and approval policy (#310, #477). ACP sessions are learned through the vendor listing path, since `session-register.py` may not run.
 
 ## 14. Install, update, verify
 
@@ -1038,7 +1046,7 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | web | `tests/test_web.sh` | native Claude and Codex web argv, profile gates, daemon attachment and LAN spelling |
 | S12 | `tests/test_console.sh` | a non-loopback bind is exit 2; a request or upgrade without the cookie is 401 and a foreign `Origin` is refused; the token file is 600 and rewritten at start; a tab spawns the CLI and inherits the base environment only, with an ambient `GITHUB_TOKEN` proven absent; a `console: refuse` project fails that tab and not the broker; killing the broker leaves the supervisor and its child alive and a new broker reattaches |
 | S12 | `tests/test_console.py` | record schemas reject unknown keys; the ring buffer wraps with a truncation marker and no file is created anywhere under the state root during a session; the sidebar joins index, session and status records and reports a process-less status as unknown rather than running; the projection assembles a two-vendor chain in timestamp order with a handoff marker carrying the package bytes; a rotated vendor session yields a labelled gap |
-| S13 | `tests/test_console_acp.sh` | an ACP tab is offered only under a profile with `acp: allow`; the tab kind and its missing hook and sandbox guarantees are labelled and appear in `ihar check` |
+| S13 | `tests/test_console_acp.sh`, `tests/test_console_acp.py` | an ACP tab is offered only under a profile with `acp: allow` and the refusal names the setting; every caveat the tab carries is a line `ihar check` prints; against a fake agent speaking the measured protocol the client initialises at version 1, creates a session, relays message and thought chunks, **holds a permission request until the user answers**, refuses `fs/read_text_file` with method-not-found, and answers `cancelled` on a cancelled turn |
 | S14 | `tests/test_handoff_history.py` | `summary` is the default and leaves `history.file` null; `transcript` renders in order, masks with the same engine, writes 600, and records the real message count when truncated; a planted secret is absent from the rendered file; a masking failure degrades to `summary` with a warning instead of writing an unmasked file; the package stays under 8 kB in both modes |
 | workflow | `tests/test_workflow_gates.sh` | validated chain transitions, stale-hash rejection and bounded gate evidence |
 | concurrency | `tests/test_concurrency.sh` | real-`flock` acknowledgement precedes every blocked-entry assertion; a marker paused inside publication proves a second profile cannot enter, then distinct homes publish and remain unchanged; parallel `ihar_cmd_install` calls serialize through the production store lock; different masking levels create different gateway instances; after one shared consumer releases, a live protocol probe succeeds for the other |
@@ -1094,6 +1102,9 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | console | served terminal asset does not match its reviewed digest | fail-closed per request | 503 |
 | console | console assets absent from the checkout or store | fail-closed per request | 503 |
 | console | static name outside the served map | fail-closed per request | 404 |
+| console | chat tab requested where the profile sets `acp: refuse` | fail-closed per request | 403 |
+| console | agent asks the console for `fs/*` or `terminal/*` | fail-closed per request | JSON-RPC -32601 |
+| console | agent sends an unparseable line | fail-soft, reported in the tab | 0 |
 | handoff | transcript render or its masking fails | fail-soft, degrade to `summary` with a warning | 0 |
 
 ## 18. Delivery plan
