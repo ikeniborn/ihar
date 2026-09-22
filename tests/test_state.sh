@@ -12,6 +12,7 @@ source "$ROOT/lib/store/assets.sh"
 source "$ROOT/lib/state/state.sh"
 source "$ROOT/lib/state/links.sh"
 source "$ROOT/lib/state/runtime.sh"
+source "$ROOT/lib/cli/check.sh"
 source "$ROOT/lib/render/hooks.sh"
 IHAR_CODEX_BIN="$IHAR_TEST_TMP/missing-codex"
 source "$ROOT/lib/state/migrate.sh"
@@ -315,7 +316,8 @@ assert_exit "a wrong input count is a usage error" 2 \
 
 RENDER="$IHAR_TEST_TMP/render"
 mkdir -p "$RENDER"
-printf '{"rendered":true}\n' > "$RENDER/settings.json"
+CLAUDE_SETTINGS='{"hooks":{"PreToolUse":[]},"sandbox":{"enabled":true},"_iharGateway":"https://expected.example"}'
+printf '%s\n' "$CLAUDE_SETTINGS" > "$RENDER/settings.json"
 
 rt="$(ihar_runtime_materialise claude "$h1" "$RENDER")"
 assert_exit "the runtime home is published" 0 test -d "$rt"
@@ -333,18 +335,60 @@ assert_eq "the same configuration reuses its home" "$rt" "$rt_again"
 assert_eq "the existing render is left untouched" "$inode_before" \
   "$(stat -c '%i' "$rt/settings.json")"
 
+# A string theme belongs to Claude, but managed settings and unknown keys do not.
+chmod u+w "$rt/settings.json"
+printf '%s\n' '{"hooks":{"PreToolUse":[]},"sandbox":{"enabled":true},"_iharGateway":"https://expected.example","theme":"dark"}' > "$rt/settings.json"
+assert_exit "runtime reuse accepts Claude's top-level theme" 0 \
+  ihar_runtime_materialise claude "$h1" "$RENDER"
+assert_exit "check comparison accepts Claude's top-level theme" 0 \
+  _ihar_check_file_matches "$RENDER/settings.json" "$rt/settings.json" settings.json
+_test_claude_check_diff() (
+  ihar_profile_resolve() { IHAR_PROFILE_GATEWAY=off; }
+  _ihar_project_state() { printf '%s\n' "$STATE"; }
+  ihar_render_all() {
+    mkdir -p "$2"
+    [[ "$1" != claude ]] || cp "$RENDER/settings.json" "$2/settings.json"
+  }
+  _ihar_check_runtime() {
+    if [[ "$1" == claude ]]; then printf '%s\n' "$rt"; else printf '%s\n' "$STATE/r/none/codex"; fi
+  }
+  IHAR_FLAG_PROFILE=standard
+  ihar_check_diff
+)
+assert_eq "check --diff accepts Claude's top-level theme" "no differences" \
+  "$(_test_claude_check_diff)"
+printf '%s\n' '{"hooks":{"PreToolUse":["secret-value"]},"sandbox":{"enabled":true},"_iharGateway":"https://expected.example","theme":"dark"}' > "$rt/settings.json"
+managed_drift_status=0
+managed_drift_out="$(ihar_runtime_materialise claude "$h1" "$RENDER" 2>&1)" \
+  || managed_drift_status=$?
+assert_eq "runtime reuse rejects managed Claude drift" "3" "$managed_drift_status"
+assert_contains "runtime drift identifies changed field" "$managed_drift_out" "hooks.PreToolUse"
+assert_exit "runtime drift does not print changed value" 1 \
+  grep -F 'secret-value' <<<"$managed_drift_out"
+check_drift_status=0
+check_drift_out="$(_ihar_check_file_matches "$RENDER/settings.json" "$rt/settings.json" settings.json)" \
+  || check_drift_status=$?
+assert_eq "check comparison rejects managed Claude drift" "3" "$check_drift_status"
+assert_eq "check comparison prints only field path" "hooks.PreToolUse" "$check_drift_out"
+check_diff_out="$(_test_claude_check_diff)"
+assert_contains "check --diff names managed Claude field" "$check_diff_out" "hooks.PreToolUse"
+assert_exit "check --diff does not print changed value" 1 \
+  grep -F 'secret-value' <<<"$check_diff_out"
+printf '%s\n' "$CLAUDE_SETTINGS" > "$rt/settings.json"
+chmod 444 "$rt/settings.json"
+
 # Two profiles are two directories, so neither can overwrite the other.
 rt_other="$(ihar_runtime_materialise claude "$h3" "$RENDER")"
 assert_exit "a different configuration gets its own home" 1 test "$rt" = "$rt_other"
 assert_exit "the first home still exists" 0 test -f "$rt/settings.json"
 
 # Drift between the hash and the content means one of them is wrong.
-printf '{"rendered":"changed"}\n' > "$RENDER/settings.json"
+printf '{"hooks":{"PreToolUse":["changed"]},"sandbox":{"enabled":true},"_iharGateway":"https://expected.example"}\n' > "$RENDER/settings.json"
 assert_exit "a drifted runtime home is fail-closed" 3 \
   bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/lock.sh'
            source '$ROOT/lib/state/links.sh'; source '$ROOT/lib/state/runtime.sh'
            IHAR_STATE='$STATE' IHAR_STORE='$IHAR_STORE' ihar_runtime_materialise claude '$h1' '$RENDER'"
-printf '{"rendered":true}\n' > "$RENDER/settings.json"
+printf '%s\n' "$CLAUDE_SETTINGS" > "$RENDER/settings.json"
 
 # A render the existing home lacks entirely is the same defect.
 printf 'x\n' > "$RENDER/extra.json"

@@ -89,13 +89,17 @@ _ihar_check_file_matches() { # <desired> <active> <relative>
       <(sed '/# ihar:hook-trust:start/,$d' "$active" | _ihar_rtrim_blank)
     return $?
   fi
+  if [[ "$relative" == settings.json ]]; then
+    ihar_python ihar.render.claude_compare "$desired" "$active"
+    return $?
+  fi
   cmp -s -- "$desired" "$active"
 }
 
 # ihar_check_diff — compare temporary desired renders with active homes.
 ihar_check_diff() (
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
-  local temp="" state vendor desired active file relative found=false gateway_key port
+  local temp="" state vendor desired active file relative difference found=false gateway_key port
   trap '[[ -z "$temp" ]] || rm -rf -- "$temp"' EXIT
   temp="$(mktemp -d "${TMPDIR:-/tmp}/ihar-check-diff-XXXXXX")" || return 1
   state="$(_ihar_project_state)"
@@ -121,8 +125,12 @@ ihar_check_diff() (
       if [[ -z "$active" || ! -f "$active/$relative" ]]; then
         printf '%s %s missing from active runtime\n' "$vendor" "$relative"
         found=true
-      elif ! _ihar_check_file_matches "$file" "$active/$relative" "$relative"; then
-        printf '%s %s differs from active runtime\n' "$vendor" "$relative"
+      elif ! difference="$(_ihar_check_file_matches "$file" "$active/$relative" "$relative")"; then
+        if [[ "$relative" == settings.json ]]; then
+          printf '%s %s differs from active runtime at %s\n' "$vendor" "$relative" "${difference:-root}"
+        else
+          printf '%s %s differs from active runtime\n' "$vendor" "$relative"
+        fi
         found=true
       fi
     done < <(find "$desired" -type f -print0 | sort -z)
