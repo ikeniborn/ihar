@@ -62,6 +62,17 @@ ihar_main() {
   local needs_codex_guard=false
   case "$IHAR_COMMAND:${IHAR_SUBCOMMAND:-}" in
     codex:*|acp:codex|web:codex) needs_codex_guard=true ;;
+    install:*|update:*|switch:*) needs_codex_guard=true ;;
+    check:*)
+      if [[ -x "$IHAR_CODEX_BIN" ]]; then
+        needs_codex_guard=true
+        IHAR_CHECK_CODEX_PROBES=true
+      else
+        # Keep this invocation metadata-only even if Codex appears after routing.
+        IHAR_CHECK_CODEX_PROBES=false
+      fi
+      export IHAR_CHECK_CODEX_PROBES
+      ;;
     claude:*|acp:claude|web:claude)
       # A microVM launch also renders, seals, and verifies the Codex runtime.
       ihar_profile_resolve "$IHAR_FLAG_PROFILE"

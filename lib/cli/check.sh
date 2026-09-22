@@ -7,6 +7,10 @@ ihar_check_receipt_status() { # <vendor> <binary>
 
 ihar_check_conformance_status() { # <vendor> <binary>
   local vendor="$1" binary="$2" record
+  if [[ "$vendor" == codex && "${IHAR_CHECK_CODEX_PROBES:-true}" != true ]]; then
+    printf 'not-installed\n'
+    return 0
+  fi
   [[ -x "$binary" ]] || { printf 'not-installed\n'; return 0; }
   record="$IHAR_STORE/verification/$vendor-$(ihar_version_slug "$binary").json"
   [[ -f "$record" ]] || { printf 'unproven\n'; return 0; }

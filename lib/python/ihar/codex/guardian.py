@@ -77,13 +77,13 @@ def _exchange(channel: socket.socket, store: Path, operation: str, fields: dict,
         raise auth_owner.AuthOwnerError("Codex guardian channel cannot be verified") from error
 
 
-def request(fd: int, operation: str, fields: dict) -> dict:
+def request(fd: int, operation: str, fields: dict, *, store: Path | None = None) -> dict:
     """Send one bounded request through an inherited, authenticated socket."""
     if fd < 0:
         raise auth_owner.AuthOwnerError("Codex guardian descriptor or request is invalid")
     try:
         with socket.socket(fileno=os.dup(fd)) as channel:
-            return _exchange(channel, auth_owner._lease_store(None), operation, fields)
+            return _exchange(channel, auth_owner._lease_store(store), operation, fields)
     except OSError as error:
         raise auth_owner.AuthOwnerError("Codex guardian channel cannot be verified") from error
 

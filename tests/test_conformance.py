@@ -12,14 +12,16 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "python"))
 
 from ihar import jsonio                     # noqa: E402
-from ihar.codex import hooks_trust          # noqa: E402
+from ihar.codex import auth_owner, guardian, hooks_trust  # noqa: E402
 from ihar.conformance import run as conformance   # noqa: E402
 from ihar.conformance import check as conformance_check  # noqa: E402
 
@@ -30,6 +32,18 @@ CODEX = os.environ.get(
     "IHAR_CODEX_BIN",
     "/home/ikeniborn/Documents/Project/icodex/.codex-isolated/bin/codex",
 )
+
+
+def _main(argv):
+    original_begin = conformance._begin_codex_conformance
+    original_finish = conformance._finish_codex_conformance
+    conformance._begin_codex_conformance = lambda _store: None
+    conformance._finish_codex_conformance = lambda _store, _stage, _failed: None
+    try:
+        return conformance.main(argv)
+    finally:
+        conformance._begin_codex_conformance = original_begin
+        conformance._finish_codex_conformance = original_finish
 
 EXPECTED_REQUIRED_CASES = {
     "claude": {
@@ -85,7 +99,7 @@ def test_main_reports_failed_case_without_dynamic_detail():
     out, err = io.StringIO(), io.StringIO()
     try:
         with redirect_stdout(out), redirect_stderr(err):
-            result = conformance.main([
+            result = _main([
                 "codex", binary, store, manifest,
                 "--auth-store", store, "--lockfile", LOCKFILE,
             ])
@@ -108,7 +122,7 @@ def test_main_hides_pre_record_exception_detail():
     out, err = io.StringIO(), io.StringIO()
     try:
         with redirect_stdout(out), redirect_stderr(err):
-            result = conformance.main([
+            result = _main([
                 "codex", "binary", store, "manifest",
                 "--auth-store", store, "--lockfile", LOCKFILE,
             ])
@@ -140,7 +154,7 @@ def test_main_treats_record_write_error_as_pre_record_failure():
     out, err = io.StringIO(), io.StringIO()
     try:
         with redirect_stdout(out), redirect_stderr(err):
-            result = conformance.main([
+            result = _main([
                 "codex", binary, store, manifest,
                 "--auth-store", store, "--lockfile", LOCKFILE,
             ])
@@ -176,7 +190,7 @@ def test_main_persists_only_fixed_case_details():
     out, err = io.StringIO(), io.StringIO()
     try:
         with redirect_stdout(out), redirect_stderr(err):
-            result = conformance.main([
+            result = _main([
                 "codex", binary, store, manifest,
                 "--auth-store", store, "--lockfile", LOCKFILE, "--json",
             ])
@@ -217,7 +231,7 @@ def test_vendor_version_rejects_extra_output_without_echoing_it():
                 raise AssertionError(f"{vendor} accepted unbounded version output")
             out, err = io.StringIO(), io.StringIO()
             with redirect_stdout(out), redirect_stderr(err):
-                result = conformance.main([
+                result = _main([
                     vendor, binary, store, MANIFEST,
                     "--auth-store", store, "--lockfile", LOCKFILE,
                 ])
@@ -237,7 +251,7 @@ def test_main_bounds_invalid_utf8_vendor_version():
         os.chmod(binary, 0o755)
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            result = conformance.main([
+            result = _main([
                 "codex", binary, store, MANIFEST,
                 "--auth-store", store, "--lockfile", LOCKFILE,
             ])
@@ -602,28 +616,89 @@ def test_vendor_turn_uses_supported_native_cli_and_exact_claude_tool_allowlist()
     assert codex_kwargs["env"]["CODEX_HOME"] == "/runtime"
 
 
-def test_staged_vendor_home_links_the_stable_shared_login():
+def test_staged_vendor_home_uses_stable_login_without_exposing_codex_canonical():
     stage = _store()
     active = tempfile.mkdtemp(prefix="ihar-conf-active-store-")
     try:
         for vendor, name in (("claude", ".credentials.json"), ("codex", "auth.json")):
             source_dir = os.path.join(active, "auth", vendor)
             os.makedirs(source_dir, exist_ok=True)
+            if vendor == "codex":
+                os.chmod(os.path.join(active, "auth"), 0o700)
+                os.chmod(source_dir, 0o700)
             source = os.path.join(source_dir, name)
             with open(source, "w", encoding="utf-8") as handle:
                 handle.write("login evidence\n")
-            home = tempfile.mkdtemp(prefix=f"ihar-conf-{vendor}-")
+            home = (str(auth_owner.stage(active)) if vendor == "codex"
+                    else tempfile.mkdtemp(prefix=f"ihar-conf-{vendor}-"))
             try:
+                if vendor == "codex":
+                    auth_owner._seed_stage_from_canonical(Path(home), Path(active))
                 conformance._stage(stage, MANIFEST, vendor, home, auth_store=active)
                 target = os.path.join(home, name)
-                assert os.path.islink(target), f"{vendor} login was copied or omitted"
-                assert os.path.realpath(target) == os.path.realpath(source)
+                if vendor == "codex":
+                    assert os.path.isfile(target) and not os.path.islink(target)
+                    assert Path(target).read_bytes() == Path(source).read_bytes()
+                    Path(target).write_text("synthetic-candidate", encoding="utf-8")
+                    assert Path(source).read_text(encoding="utf-8") == "login evidence\n"
+                else:
+                    assert os.path.islink(target), f"{vendor} login was copied or omitted"
+                    assert os.path.realpath(target) == os.path.realpath(source)
                 assert not os.path.exists(os.path.join(stage, "auth", vendor, name))
             finally:
-                shutil.rmtree(home, ignore_errors=True)
+                if vendor == "codex":
+                    guardian._cleanup_auth_stage(Path(active), Path(home))
+                else:
+                    shutil.rmtree(home, ignore_errors=True)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
         shutil.rmtree(active, ignore_errors=True)
+
+
+def test_failed_codex_conformance_retains_changed_auth():
+    store = _store()
+    binary = os.path.join(store, "codex")
+    canonical = os.path.join(store, "auth", "codex", "auth.json")
+    os.makedirs(os.path.dirname(canonical), mode=0o700, exist_ok=True)
+    os.chmod(os.path.join(store, "auth"), 0o700)
+    os.chmod(os.path.dirname(canonical), 0o700)
+    with open(canonical, "w", encoding="utf-8") as handle:
+        handle.write("synthetic-original")
+    os.chmod(canonical, 0o600)
+    with open(binary, "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\nprintf 'codex-cli 0.154.0\\n'\n")
+    os.chmod(binary, 0o700)
+
+    original_cases = conformance.CASES
+    original_live_cases = conformance.LIVE_CASES
+    def change_auth(_vendor, _binary, home, _workdir):
+        with open(os.path.join(home, "auth.json"), "w", encoding="utf-8") as handle:
+            handle.write("synthetic-candidate")
+        return "failed", "synthetic failure"
+
+    conformance.CASES = {"changed-auth": change_auth}
+    conformance.LIVE_CASES = frozenset()
+    try:
+        record = conformance.run(
+            "codex", binary, store, MANIFEST,
+            auth_store=store, lockfile_path=LOCKFILE,
+        )
+        recovery = list(Path(store, "auth", "codex", "recovery").glob("*/auth.json"))
+        assert record["cases"]["changed-auth"]["status"] == "failed"
+        assert Path(canonical).read_bytes() == b"synthetic-original"
+        assert len(recovery) == 1, recovery
+        assert recovery[0].read_bytes() == b"synthetic-candidate"
+        assert stat.S_IMODE(recovery[0].stat().st_mode) == 0o600
+        assert stat.S_IMODE(recovery[0].parent.stat().st_mode) == 0o700
+        metadata = b"".join(
+            path.read_bytes() for path in recovery[0].parent.rglob("*")
+            if path.is_file() and path != recovery[0]
+        )
+        assert b"synthetic-candidate" not in metadata
+    finally:
+        conformance.CASES = original_cases
+        conformance.LIVE_CASES = original_live_cases
+        shutil.rmtree(store, ignore_errors=True)
 
 
 def test_run_rejects_a_binary_that_does_not_match_the_release_pin():

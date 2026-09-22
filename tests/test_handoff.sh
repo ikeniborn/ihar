@@ -14,6 +14,35 @@ IHAR_ROOT="$ROOT"
 
 project="$IHAR_TEST_TMP/project"
 mkdir -p "$project"
+
+distill_home="$IHAR_TEST_TMP/distill-home"
+distill_state="$IHAR_TEST_TMP/distill-state"
+distill_marker="$IHAR_TEST_TMP/unguarded-distill-started"
+mkdir -p "$distill_home" "$distill_state"
+cat > "$IHAR_TEST_TMP/distill-codex" <<EOF
+#!/usr/bin/env bash
+touch "$distill_marker"
+exit 0
+EOF
+chmod +x "$IHAR_TEST_TMP/distill-codex"
+distill_status=0
+python3 -m ihar.handoff.distill codex "$IHAR_TEST_TMP/distill-codex" \
+  "$distill_home" source-session "$distill_state" --timeout 1 >/dev/null 2>&1 \
+  || distill_status=$?
+assert_eq "Codex distill without authenticated guardian is refused" "3" "$distill_status"
+assert_exit "refused Codex distill starts no vendor process" 1 test -e "$distill_marker"
+
+cat > "$IHAR_TEST_TMP/distill-claude" <<EOF
+#!/usr/bin/env bash
+touch "$IHAR_TEST_TMP/claude-distill-started"
+exit 0
+EOF
+chmod +x "$IHAR_TEST_TMP/distill-claude"
+assert_exit "Claude-only distill remains unguarded" 0 \
+  python3 -m ihar.handoff.distill claude "$IHAR_TEST_TMP/distill-claude" \
+    "$distill_home" source-session "$distill_state" --timeout 1
+assert_exit "Claude-only distill starts its vendor" 0 test -e "$IHAR_TEST_TMP/claude-distill-started"
+
 out="$(cd "$project" && IHAR_LAUNCH_ID=missing "$ROOT/ihar.sh" switch --to codex 2>&1 || true)"
 assert_contains "switch is a delivered command" "$out" "unknown source session 'missing'"
 

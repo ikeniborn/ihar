@@ -74,6 +74,15 @@ def main(argv=None) -> int:
     parser.add_argument("binary"); parser.add_argument("home"); parser.add_argument("session")
     parser.add_argument("state"); parser.add_argument("--timeout", type=int, default=60)
     args = parser.parse_args(argv)
+    if args.vendor == "codex":
+        from ihar.codex import auth_owner, guardian
+        try:
+            guard_fd = os.environ.get("IHAR_GUARD_FD")
+            if guard_fd is None:
+                raise auth_owner.AuthOwnerError("Codex guardian admission is missing")
+            guardian.request(int(guard_fd), "admit", {})
+        except (auth_owner.AuthOwnerError, OSError, TypeError, ValueError):
+            return 3
     try:
         summary = globals()[args.vendor](args.binary, args.home, args.session,
                                          Path(args.state) / "ephemeral.jsonl", args.timeout)

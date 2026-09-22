@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import array
+import fcntl
 import json
 import os
 import pty
@@ -11,6 +12,7 @@ import select
 import shutil
 import signal
 import socket as socket_module
+import stat
 import subprocess
 import sys
 import tempfile
@@ -74,7 +76,9 @@ class AuthLeaseTests(unittest.TestCase):
                   binary_source: str | None = None,
                   tty_reply: str | None = None,
                   profile_root: Path | None = None,
-                  python_binary: Path | None = None) -> subprocess.CompletedProcess:
+                  python_binary: Path | None = None,
+                  codex_installed: bool = True,
+                  timeout: float = 15) -> subprocess.CompletedProcess:
         root = Path(__file__).resolve().parents[1]
         project = self.root / "project"
         project.mkdir(exist_ok=True)
@@ -85,6 +89,8 @@ class AuthLeaseTests(unittest.TestCase):
                            f"case \"$1\" in app-server) touch {str(marker)!r} ;; esac\n"
                            "case \"$1\" in --version) echo 'codex-cli 0.154.0' ;; esac\n"))
         binary.chmod(0o700)
+        if not codex_installed:
+            binary.unlink()
         for name in ("hooks", "manifests", "skills"):
             target = self.store / name
             if not target.exists():
@@ -102,7 +108,7 @@ class AuthLeaseTests(unittest.TestCase):
         command = [str(root / "ihar.sh"), *arguments]
         if tty_reply is None:
             return subprocess.run(command, cwd=project, env=environment,
-                                  capture_output=True, text=True, timeout=15)
+                                  capture_output=True, text=True, timeout=timeout)
         pid, master = pty.fork()
         if pid == 0:
             os.chdir(project)
@@ -144,6 +150,138 @@ class AuthLeaseTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 3, result.stderr)
                 self.assertFalse(marker.exists(), result.stderr)
         first.wait(timeout=8)
+
+    def test_busy_owner_blocks_auxiliary_codex_paths_before_vendor_start(self) -> None:
+        marker = self.root / "auxiliary-codex-started"
+        canonical = self.store / "auth" / "codex" / "auth.json"
+        canonical.parent.mkdir(parents=True, mode=0o700)
+        (self.store / "auth").chmod(0o700)
+        canonical.parent.chmod(0o700)
+        canonical.write_text("synthetic-original", encoding="utf-8")
+        proof = self.store / "verification" / "codex-existing.json"
+        proof.parent.mkdir(mode=0o700)
+        proof.write_text("synthetic-proof", encoding="utf-8")
+        source = (
+            "#!/bin/sh\n"
+            f"touch {str(marker)!r}\n"
+            "case \"$1\" in --version) echo 'codex-cli 0.154.0' ;; esac\n"
+        )
+        first = self._guardian("import time; time.sleep(8)")
+        self._wait_for(self.record)
+        for arguments in (("check",), ("check", "--conformance"), ("install",),
+                          ("update",), ("switch", "--to", "claude")):
+            with self.subTest(arguments=arguments):
+                marker.unlink(missing_ok=True)
+                result = self._run_ihar(*arguments, binary_source=source)
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertFalse(marker.exists(), result.stderr)
+                self.assertEqual(canonical.read_text(encoding="utf-8"), "synthetic-original")
+                self.assertEqual(proof.read_text(encoding="utf-8"), "synthetic-proof")
+        first.wait(timeout=10)
+
+    def test_absent_codex_check_stays_metadata_only_if_binary_appears_after_route(self) -> None:
+        binary = self.root / "codex"
+        vendor_marker = self.root / "late-codex-started"
+        wrapper = self.root / "python-wrapper"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' '#!/bin/sh' 'touch {str(vendor_marker)!r}' > {str(binary)!r}\n"
+            f"chmod 700 {str(binary)!r}\n"
+            f"exec {sys.executable!r} \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o700)
+        first = self._guardian("import time; time.sleep(5)")
+        self._wait_for(self.record)
+        result = self._run_ihar(
+            "check", python_binary=wrapper, codex_installed=False, timeout=10
+        )
+        self.assertNotEqual(result.returncode, 3, result.stderr)
+        self.assertFalse(vendor_marker.exists(), result.stderr)
+        first.wait(timeout=8)
+
+    def test_guardian_admission_precedes_contended_install_store_lock(self) -> None:
+        first = self._guardian("import time; time.sleep(5)")
+        self._wait_for(self.record)
+        lock_path = self.store / ".ihar-store.lock"
+        with lock_path.open("w", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self._run_ihar("install", timeout=2)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("owns the shared login", result.stderr)
+        self.assertFalse((self.root / "app-server-started").exists())
+        first.wait(timeout=8)
+
+    def test_crashed_conformance_retains_private_candidate_and_blocks_release(self) -> None:
+        auth = self.store / "auth"
+        owner = auth / "codex"
+        owner.mkdir(parents=True, mode=0o700)
+        auth.chmod(0o700)
+        owner.chmod(0o700)
+        canonical = owner / "auth.json"
+        canonical.write_text("synthetic-original", encoding="utf-8")
+        canonical.chmod(0o600)
+        marker = self.root / "conformance-stage-ready"
+        script = (
+            "import os\n"
+            "from pathlib import Path\n"
+            "from ihar.conformance import run as conformance\n"
+            f"stage = conformance._begin_codex_conformance({str(self.store)!r})\n"
+            "candidate = Path(stage) / 'auth.json'\n"
+            "candidate.write_text('synthetic-candidate', encoding='utf-8')\n"
+            "candidate.chmod(0o600)\n"
+            f"Path({str(marker)!r}).touch()\n"
+            "os._exit(19)\n"
+        )
+        process = self._guardian(script)
+        self._wait_for(marker)
+        self.assertEqual(process.wait(timeout=5), 3, process.stderr.read())
+        record_bytes = self.record.read_bytes()
+        record = json.loads(record_bytes)
+        retained = Path(record["auth_stage"]) / "auth.json"
+        self.assertEqual(record["state"], "blocked")
+        self.assertEqual(retained.read_text(encoding="utf-8"), "synthetic-candidate")
+        self.assertEqual(stat.S_IMODE(retained.parent.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(retained.stat().st_mode), 0o600)
+        self.assertEqual(canonical.read_text(encoding="utf-8"), "synthetic-original")
+        self.assertNotIn(b"synthetic-candidate", record_bytes)
+
+    def test_failed_guarded_conformance_recovers_candidate_and_releases_owner(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        auth = self.store / "auth"
+        owner = auth / "codex"
+        owner.mkdir(parents=True, mode=0o700)
+        auth.chmod(0o700)
+        owner.chmod(0o700)
+        canonical = owner / "auth.json"
+        canonical.write_text("synthetic-original", encoding="utf-8")
+        canonical.chmod(0o600)
+        shutil.copytree(project_root / "hooks", self.store / "hooks")
+        binary = self.root / "conformance-codex"
+        binary.write_text("#!/bin/sh\nprintf 'codex-cli 0.154.0\\n'\n", encoding="utf-8")
+        binary.chmod(0o700)
+        script = (
+            "from pathlib import Path\n"
+            "from ihar.conformance import run as conformance\n"
+            "def fail(_vendor, _binary, home, _workdir):\n"
+            "    Path(home, 'auth.json').write_text('synthetic-candidate', encoding='utf-8')\n"
+            "    return 'failed', 'synthetic failure'\n"
+            "def passed(_vendor, _binary, _home, _workdir):\n"
+            "    return 'passed', 'synthetic pass'\n"
+            "conformance.CASES = {name: passed for name in conformance.REQUIRED_CASES['codex']}\n"
+            "conformance.CASES['deny-blocks-the-tool'] = fail\n"
+            "conformance.LIVE_CASES = frozenset()\n"
+            f"raise SystemExit(conformance.main(['codex', {str(binary)!r}, {str(self.store)!r}, "
+            f"{str(project_root / 'manifests' / 'hooks.json')!r}, '--auth-store', "
+            f"{str(self.store)!r}, '--lockfile', {str(project_root / '.ihar-lockfile.json')!r}]))\n"
+        )
+        process = self._guardian(script)
+        self.assertEqual(process.wait(timeout=8), 1, process.stderr.read())
+        recovered = list((owner / "recovery").glob("*/auth.json"))
+        self.assertEqual([path.read_text(encoding="utf-8") for path in recovered],
+                         ["synthetic-candidate"])
+        self.assertEqual(canonical.read_text(encoding="utf-8"), "synthetic-original")
+        self.assertFalse(self.record.exists())
 
     def test_busy_owner_blocks_claude_microvm_before_codex_preflight(self) -> None:
         project_root = Path(__file__).resolve().parents[1]

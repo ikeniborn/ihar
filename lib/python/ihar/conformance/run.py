@@ -30,8 +30,11 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import ExitStack
+from pathlib import Path
 
 from .. import jsonio
+from ..codex import auth_owner
 from ..render import claude_settings
 from ..render import hooks as render_hooks
 from . import LIVE_CASES, REQUIRED_CASES
@@ -167,7 +170,30 @@ def _stage(
 
     auth_name = ".credentials.json" if vendor == "claude" else "auth.json"
     auth_source = os.path.join(auth_store, "auth", vendor, auth_name)
-    if os.path.isfile(auth_source):
+    if vendor == "codex" and os.path.isfile(auth_source):
+        stage_path = Path(os.path.abspath(home))
+        store_path = Path(os.path.abspath(auth_store))
+        seeded = False
+        with ExitStack() as stack:
+            root, _auth, owner = auth_owner._owner_directories(store_path, stack, create=False)
+            stage_fd, _token, marker = auth_owner._validated_stage(
+                stage_path, store_path, root, owner, stack,
+            )
+            try:
+                candidate = os.open("auth.json", auth_owner._FILE_FLAGS, dir_fd=stage_fd)
+            except FileNotFoundError:
+                seeded = False
+            else:
+                stack.callback(os.close, candidate)
+                identity = auth_owner._identity(candidate)
+                baseline = marker["baseline"]
+                if (baseline is None or identity["sha256"] != baseline["sha256"]
+                    or identity["size"] != baseline["size"]):
+                    raise auth_owner.AuthOwnerError("Codex conformance credential stage changed")
+                seeded = True
+        if not seeded:
+            auth_owner._seed_stage_from_canonical(stage_path, store_path)
+    elif os.path.isfile(auth_source):
         os.symlink(auth_source, os.path.join(home, auth_name))
 
     if vendor == "codex":
@@ -685,6 +711,7 @@ def run(
     auth_store: str,
     lockfile_path: str,
     protected_store: str | None = None,
+    codex_home: str | None = None,
 ) -> dict:
     """Run staged hooks/binary while probing denial against the final store."""
     version = vendor_version(vendor, binary)
@@ -700,8 +727,11 @@ def run(
     }
 
     workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
-    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    home = (codex_home or str(auth_owner.stage(auth_store)) if vendor == "codex"
+            else tempfile.mkdtemp(prefix="ihar-conf-home-"))
+    owns_codex_home = vendor == "codex" and codex_home is None
     state_root = tempfile.mkdtemp(prefix="ihar-conf-state-")
+    failed = True
     try:
         protected_roots = [protected_store or store, state_root, home] \
             if vendor == "claude" else None
@@ -723,12 +753,46 @@ def run(
             except Exception:                      # noqa: BLE001
                 status = "failed"
             record["cases"][name] = {"status": status, "detail": f"{name}: {status}"}
+        failed = any(case["status"] == "failed" for case in record["cases"].values())
     finally:
-        shutil.rmtree(home, ignore_errors=True)
+        if owns_codex_home:
+            from ..codex import guardian
+            guardian._cleanup_auth_stage(
+                Path(auth_store), Path(home), retain_changed=failed,
+            )
+        elif vendor != "codex":
+            shutil.rmtree(home, ignore_errors=True)
         shutil.rmtree(workdir, ignore_errors=True)
         shutil.rmtree(state_root, ignore_errors=True)
 
     return record
+
+
+def _begin_codex_conformance(auth_store: str) -> str:
+    from ..codex import guardian
+    guard_fd = os.environ.get("IHAR_GUARD_FD")
+    if guard_fd is None:
+        raise auth_owner.AuthOwnerError("Codex guardian admission is missing")
+    guardian.request(int(guard_fd), "admit", {}, store=Path(auth_store))
+    answer = guardian.request(
+        int(guard_fd), "auth-stage", {"verb": "status"}, store=Path(auth_store),
+    )
+    stage = answer.get("stage")
+    if not isinstance(stage, str):
+        raise auth_owner.AuthOwnerError("Codex conformance stage is invalid")
+    return stage
+
+
+def _finish_codex_conformance(auth_store: str, stage: str, failed: bool) -> None:
+    from ..codex import guardian
+    guard_fd = os.environ.get("IHAR_GUARD_FD")
+    if guard_fd is None:
+        raise auth_owner.AuthOwnerError("Codex guardian admission is missing")
+    operation = "auth-abort" if failed else "auth-finish"
+    guardian.request(
+        int(guard_fd), operation, {"stage": stage, "verb": "status"},
+        store=Path(auth_store),
+    )
 
 
 def main(argv: list[str]) -> int:
@@ -765,30 +829,44 @@ def main(argv: list[str]) -> int:
             or any(option != "--json" for option in options):
         print(__doc__, file=sys.stderr)
         return 2
+    codex_stage = None
     try:
+        if vendor == "codex":
+            codex_stage = _begin_codex_conformance(auth_store)
         record = run(
             vendor, binary, store, manifest_path,
             auth_store=auth_store,
             lockfile_path=lockfile_path,
             protected_store=protected_store,
+            codex_home=codex_stage,
         )
         target = os.path.join(store, "verification",
                               f"{vendor}-{version_slug(record['version'])}.json")
         os.makedirs(os.path.dirname(target), exist_ok=True)
         jsonio.write("conformance", target, record, mode=0o644)
-    except (RuntimeError, OSError, jsonio.SchemaError) as error:
+        failed = any(record["cases"][name]["status"] == "failed"
+                     for name in REQUIRED_CASES[vendor])
+        if codex_stage is not None:
+            _finish_codex_conformance(auth_store, codex_stage, failed)
+            codex_stage = None
+    except (RuntimeError, OSError, ValueError, jsonio.SchemaError) as error:
+        if codex_stage is not None:
+            try:
+                _finish_codex_conformance(auth_store, codex_stage, True)
+            except (RuntimeError, OSError, ValueError):
+                pass
         print(f"ihar: conformance setup failed for {vendor}: {type(error).__name__}",
               file=sys.stderr)
         return 3
 
-    failed = sorted(name for name in REQUIRED_CASES[vendor]
-                    if record["cases"][name]["status"] == "failed")
+    failed_cases = sorted(name for name in REQUIRED_CASES[vendor]
+                          if record["cases"][name]["status"] == "failed")
     if "--json" in options:
         print(json.dumps(record, indent=2, sort_keys=True))
     else:
-        for name in failed:
+        for name in failed_cases:
             print(f"failed {name}")
-    return 1 if failed else 0
+    return 1 if failed_cases else 0
 
 
 if __name__ == "__main__":
