@@ -32,11 +32,6 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
       *) ihar_die 2 "profile '$IHAR_PROFILE' does not allow ${vendor^} web" ;;
     esac
   fi
-  if [[ "$vendor" == codex && "${IHAR_PROFILE_SANDBOX:-}" == microvm &&
-        "$IHAR_FLAG_DRY_RUN" != true ]]; then
-    ihar_die 3 "Codex isolated launch requires a credential-owner lease; guest handoff is not yet available"
-  fi
-
   # 3. store integrity, at the severity the profile asks for
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR
   local native_binary

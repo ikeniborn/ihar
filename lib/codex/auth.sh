@@ -27,3 +27,9 @@ ihar_codex_auth_run() { # <store> <harness-root> <runtime> <hash> <mode> <vendor
       run "$store" "$runtime" "$hash" "$mode" -- "$@"
   fi
 }
+
+ihar_codex_guest_owner() { # <guest-action> <action-arguments...>
+  local action="$1"
+  shift
+  ihar_python ihar.codex.auth_owner "guest-$action" "$IHAR_STORE" "$@"
+}

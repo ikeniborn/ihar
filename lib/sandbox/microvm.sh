@@ -25,6 +25,8 @@ run 'ihar install --microvm'"
     || ihar_die 3 "profile 'isolated' requires debugfs"
   command -v ssh >/dev/null 2>&1 \
     || ihar_die 3 "profile 'isolated' requires ssh"
+  command -v setsid >/dev/null 2>&1 \
+    || ihar_die 3 "profile 'isolated' requires setsid for guest quiescence"
   command -v rsync >/dev/null 2>&1 \
     || ihar_die 3 "profile 'isolated' requires rsync for workspace persistence"
   local key="${IHAR_MICROVM_SSH_KEY:-$IHAR_STORE/microvm/current/client_key}"
@@ -89,7 +91,7 @@ ihar_microvm_write_guest_env() {
   cat > "$file" <<EOF
 export IHAR_VENDOR='$vendor'
 export CLAUDE_CONFIG_DIR='/mnt/ihar/runtime/claude'
-export CODEX_HOME='/mnt/ihar/runtime/codex'
+export CODEX_HOME='/mnt/ihar-state/.ihar-guest-codex-home'
 export PATH='/mnt/ihar/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 export ANTHROPIC_BASE_URL='$gateway'
 export IHAR_GATEWAY_URL='$gateway'
@@ -130,7 +132,7 @@ _ihar_microvm_assets_available() {
     [[ -f "$IHAR_STORE/bin/$name" ]] || return 1
   done
   [[ -x "$IHAR_STORE/bin/firecracker" ]] || return 1
-  for name in mkfs.ext4 debugfs ssh rsync ssh-keygen sha256sum; do
+  for name in mkfs.ext4 debugfs ssh rsync ssh-keygen sha256sum setsid; do
     command -v "$name" >/dev/null 2>&1 || return 1
   done
   local client_key="${IHAR_MICROVM_SSH_KEY:-$IHAR_STORE/microvm/current/client_key}"
@@ -1089,6 +1091,8 @@ _ihar_microvm_quote_argv() {
 _ihar_microvm_rewrite_runtime_links() {
   local root="$1" link target relative
   while IFS= read -r -d '' link; do
+    # Codex auth is staged on the writable state drive under a global owner.
+    [[ "$link" == "$root/runtime/codex/auth.json" ]] && continue
     target="$(readlink -f "$link")"
     if [[ "$target" == "$IHAR_STATE/st/"* ]]; then
       relative="${target#"$IHAR_STATE/st/"}"
@@ -1100,6 +1104,52 @@ _ihar_microvm_rewrite_runtime_links() {
       rm "$link" && ln -s "/mnt/ihar/store/$relative" "$link"
     fi
   done < <(find "$root/runtime" -type l -print0)
+}
+
+_ihar_microvm_stage_guest_auth() { # <policy-bundle> <state-seed> <canonical>
+  local bundle="$1" state_seed="$2" canonical="$3"
+  local link="$bundle/runtime/codex/auth.json" target="$state_seed/.ihar-guest-codex-home/auth.json"
+  local entry name
+  [[ -L "$link" && "$(readlink "$link")" == "$canonical" ]] || return 1
+  [[ ! -e "$(dirname "$target")" && ! -L "$(dirname "$target")" ]] || return 1
+  mkdir -m 700 "$(dirname "$target")" || return 1
+  chmod 700 "$state_seed" || return 1
+  ( umask 077; cp -L -- "$canonical" "$target" ) || return 1
+  chmod 600 "$target" || return 1
+  for entry in "$bundle/runtime/codex"/* "$bundle/runtime/codex"/.[!.]* "$bundle/runtime/codex"/..?*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    name="${entry##*/}"
+    [[ "$name" == auth.json ]] && continue
+    ln -s "/mnt/ihar/runtime/codex/$name" "$(dirname "$target")/$name" || return 1
+  done
+  rm -- "$link" || return 1
+  ln -s /mnt/ihar-state/.ihar-guest-codex-home/auth.json "$link"
+}
+
+_ihar_microvm_extract_guest_auth() { # <state-image> <private-bundle>
+  local image="$1" bundle="$2" metadata temporary
+  metadata="$(debugfs -R 'stat /.ihar-guest-codex-home/auth.json' "$image" 2>/dev/null)" || return 1
+  grep -q 'Type: regular' <<< "$metadata" || return 1
+  temporary="$(mktemp "$bundle/.auth-return-XXXXXX")" || return 1
+  if ! debugfs -R "dump /.ihar-guest-codex-home/auth.json $temporary" "$image" >/dev/null 2>&1; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  chmod 600 "$temporary" || return 1
+  mv -f -- "$temporary" "$bundle/auth.json"
+}
+
+_ihar_microvm_image_auth_matches() { # <state-image> <seed-auth> <private-bundle>
+  local image="$1" seed="$2" bundle="$3" metadata temporary result=1
+  metadata="$(debugfs -R 'stat /.ihar-guest-codex-home/auth.json' "$image" 2>/dev/null)" || return 1
+  grep -q 'Type: regular' <<< "$metadata" || return 1
+  temporary="$(mktemp "$bundle/.auth-seed-check-XXXXXX")" || return 1
+  if debugfs -R "dump /.ihar-guest-codex-home/auth.json $temporary" "$image" >/dev/null 2>&1 \
+      && cmp -s -- "$seed" "$temporary"; then
+    result=0
+  fi
+  rm -f -- "$temporary"
+  return "$result"
 }
 
 _ihar_microvm_translate_bundle_paths() {
@@ -1133,14 +1183,27 @@ ihar_microvm_launch() {
   local vendor="$1" runtime="$2"
   ihar_microvm_preflight
 
-  local session="$IHAR_STATE_ROOT/microvm/${IHAR_LAUNCH_ID:-$$}" tap
-  mkdir -p "$session" && chmod 700 "$session" \
+  local session tap
+  mkdir -p "$IHAR_STATE_ROOT/microvm" \
+    || ihar_die 3 "cannot create microVM session parent"
+  [[ ! -L "$IHAR_STATE_ROOT/microvm" ]] \
+    || ihar_die 3 "microVM session parent is unsafe"
+  session="$(mktemp -d "$IHAR_STATE_ROOT/microvm/${IHAR_LAUNCH_ID:-$$}.XXXXXX")" \
     || ihar_die 3 "cannot create microVM session directory"
+  local codex_runtime="$runtime" guest_owner_id old_umask
+  [[ "$vendor" == codex ]] || codex_runtime="${IHAR_OTHER_RUNTIME:?Codex guest runtime is absent}"
+  old_umask="$(umask)"
+  umask 077
+  ihar_codex_guest_owner acquire "$codex_runtime" > "$session/guest-owner-id" \
+    || ihar_die 3 "Codex guest credential owner is unavailable"
+  umask "$old_umask"
+  IFS= read -r guest_owner_id < "$session/guest-owner-id"
   ihar_microvm_reserve_slot
   tap="$IHAR_MICROVM_TAP"
 
   local rootfs="$session/rootfs.ext4" workspace="$session/workspace.ext4"
   local policy="$session/policy.ext4" state_img="$session/state.ext4"
+  local state_seed="$session/state-seed" guest_auth_bundle="$session/guest-auth"
   cp --sparse=always "$IHAR_STORE/bin/rootfs.ext4" "$rootfs" \
     || ihar_die 3 "cannot copy the microVM rootfs"
   local rootfs_base_sha256
@@ -1149,9 +1212,10 @@ ihar_microvm_launch() {
     || ihar_die 3 "cannot install the client key in the microVM rootfs copy"
   _ihar_microvm_make_image "$workspace" "$IHAR_PROJECT_ROOT" "${IHAR_MICROVM_WORKSPACE_MB:-2048}" \
     || ihar_die 3 "cannot build the writable workspace image"
-  local state_mib=$(( $(du -sm "$IHAR_STATE" | awk '{print $1}') + 64 ))
-  _ihar_microvm_make_image "$state_img" "$IHAR_STATE" "$state_mib" \
-    || ihar_die 3 "cannot build the writable vendor state image"
+  mkdir -m 700 "$state_seed" "$guest_auth_bundle" \
+    || ihar_die 3 "cannot create private guest credential bundle"
+  cp -a "$IHAR_STATE"/. "$state_seed"/ \
+    || ihar_die 3 "cannot stage writable vendor state"
 
   local bundle="$session/bundle"
   mkdir -p "$bundle/bin" "$bundle/runtime/claude" "$bundle/runtime/codex" "$bundle/state" "$bundle/policy"
@@ -1169,7 +1233,17 @@ ihar_microvm_launch() {
   cp -RL "$IHAR_STORE/manifests" "$bundle/policy/manifests" \
     || ihar_die 3 "cannot stage the policy bundle"
   _ihar_microvm_rewrite_runtime_links "$bundle" || ihar_die 3 "cannot rewrite guest runtime links"
+  _ihar_microvm_stage_guest_auth "$bundle" "$state_seed" "$IHAR_STORE/auth/codex/auth.json" \
+    || ihar_die 3 "cannot stage private Codex guest credential"
   _ihar_microvm_translate_bundle_paths "$bundle" || ihar_die 3 "cannot translate guest configuration paths"
+  local state_mib=$(( $(du -sm "$state_seed" | awk '{print $1}') + 64 ))
+  _ihar_microvm_make_image "$state_img" "$state_seed" "$state_mib" \
+    || ihar_die 3 "cannot build the writable vendor state image"
+  _ihar_microvm_image_auth_matches "$state_img" "$state_seed/.ihar-guest-codex-home/auth.json" \
+    "$guest_auth_bundle" || ihar_die 3 "Codex guest credential image differs from private seed"
+  ihar_codex_guest_owner register "$guest_owner_id" "$guest_auth_bundle" "$state_img" \
+    "$state_seed/.ihar-guest-codex-home/auth.json" \
+    || ihar_die 3 "cannot register Codex guest bundle"
   local size_mib=$(( $(du -sm "$bundle" | awk '{print $1}') + 64 ))
   _ihar_microvm_make_image "$policy" "$bundle" "$size_mib" \
     || ihar_die 3 "cannot build the read-only policy image"
@@ -1209,9 +1283,17 @@ ihar_microvm_launch() {
   manifest="$(ihar_microvm_launch_manifest_write "$config")" \
     || ihar_die 3 "cannot capture the microVM prelaunch manifest"
   : > "$log"
-  "$IHAR_STORE/bin/firecracker" --api-sock "$socket" --config-file "$config" --log-path "$log" --level Warn \
+  setsid "$IHAR_STORE/bin/firecracker" --api-sock "$socket" --config-file "$config" --log-path "$log" --level Warn \
     >> "$session/console.log" 2>&1 &
   pid=$!
+  local vm_pgrp="" group_ticks=0
+  while [[ "$vm_pgrp" != "$pid" ]]; do
+    vm_pgrp="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    (( group_ticks++ < 40 )) || ihar_die 3 "Codex guest VM process group cannot be verified"
+    sleep 0.05
+  done
+  ihar_codex_guest_owner bind-vm "$guest_owner_id" "$pid" "$IHAR_STORE/bin/firecracker" \
+    || ihar_die 3 "cannot bind Codex guest VM identity"
   local key="${IHAR_MICROVM_SSH_KEY:-$IHAR_STORE/microvm/current/client_key}" ticks=0 ssh_user=root
   local known_hosts="$session/known_hosts"
   { printf '%s ' "$IHAR_MICROVM_GUEST_IP"; cat "$IHAR_STORE/microvm/current/host_key.pub"; } > "$known_hosts"
@@ -1253,8 +1335,30 @@ ihar_microvm_launch() {
   rsync -a --delete -e "ssh -i $key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts" \
     "$ssh_user@$IHAR_MICROVM_GUEST_IP:/workspace/" "$IHAR_PROJECT_ROOT/" \
     || ihar_die 3 "cannot persist the isolated workspace"
-  rsync -a --delete -e "ssh -i $key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts" \
+  rsync -a --delete --exclude='/.ihar-guest-codex-home/' -e "ssh -i $key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts" \
     "$ssh_user@$IHAR_MICROVM_GUEST_IP:/mnt/ihar-state/" "$IHAR_STATE/" \
     || ihar_die 3 "cannot persist isolated vendor state"
+  ssh -i "$key" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
+    "$ssh_user@$IHAR_MICROVM_GUEST_IP" sync >/dev/null 2>&1 \
+    || ihar_die 3 "cannot flush isolated guest state"
+  ssh -i "$key" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
+    "$ssh_user@$IHAR_MICROVM_GUEST_IP" poweroff >/dev/null 2>&1 || true
+  local shutdown_ticks=0 vm_state
+  while [[ -e "/proc/$pid/stat" ]]; do
+    vm_state="$(sed -E 's/^.*\) ([A-Z]).*/\1/' "/proc/$pid/stat" 2>/dev/null)" || break
+    [[ "$vm_state" == Z ]] && break
+    (( shutdown_ticks++ < 100 )) || ihar_die 3 "Codex guest shutdown cannot be verified; credential bundle retained"
+    sleep 0.1
+  done
+  wait "$pid" 2>/dev/null || true
+  pid=""
+  ihar_codex_guest_owner quiescent "$guest_owner_id" \
+    || ihar_die 3 "Codex guest quiescence cannot be verified; credential bundle retained"
+  _ihar_microvm_extract_guest_auth "$state_img" "$guest_auth_bundle" \
+    || ihar_die 3 "Codex guest credential cannot be extracted; state image retained"
+  ihar_codex_guest_owner publish "$guest_owner_id" "$guest_auth_bundle" \
+    || ihar_die 3 "Codex guest credential cannot be reconciled; bundle retained"
+  ihar_codex_guest_owner release "$guest_owner_id" "$codex_runtime" \
+    || ihar_die 3 "Codex guest owner release cannot be verified"
   _ihar_microvm_cleanup; trap - EXIT INT TERM; return "$status"
 }

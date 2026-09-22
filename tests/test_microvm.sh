@@ -102,9 +102,67 @@ env_file="$session/guest-env.sh"
 ihar_microvm_write_guest_env "$env_file" codex /mnt/ihar/runtime/codex
 guest_env="$(cat "$env_file")"
 assert_contains "Claude home is always visible" "$guest_env" "CLAUDE_CONFIG_DIR='/mnt/ihar/runtime/claude'"
-assert_contains "Codex home is always visible" "$guest_env" "CODEX_HOME='/mnt/ihar/runtime/codex'"
+assert_contains "Codex uses a writable home for atomic credential replacement" "$guest_env" \
+  "CODEX_HOME='/mnt/ihar-state/.ihar-guest-codex-home'"
 assert_contains "both binaries are on PATH" "$guest_env" "PATH='/mnt/ihar/bin:"
 assert_contains "gateway uses host side address" "$guest_env" "http://172.31.0.1:43123"
+
+# Credential writes must hit the separate writable state drive. Policy content
+# remains immutable and contains neither a private credential copy nor a link to one.
+guest_bundle="$session/guest-bundle"
+guest_state="$session/guest-state"
+guest_auth="$IHAR_STORE/auth/codex/auth.json"
+mkdir -p "$guest_bundle/runtime/codex" "$guest_state" "$(dirname "$guest_auth")"
+chmod 700 "$IHAR_STORE/auth" "$(dirname "$guest_auth")"
+printf '%s' synthetic-guest-seed > "$guest_auth"
+chmod 600 "$guest_auth"
+ln -s "$guest_auth" "$guest_bundle/runtime/codex/auth.json"
+printf '%s' managed-policy > "$guest_bundle/runtime/codex/config.toml"
+_ihar_microvm_stage_guest_auth "$guest_bundle" "$guest_state" "$guest_auth"
+assert_eq "Codex guest link targets writable state" "/mnt/ihar-state/.ihar-guest-codex-home/auth.json" \
+  "$(readlink "$guest_bundle/runtime/codex/auth.json")"
+assert_eq "writable Codex home keeps config on read-only policy" \
+  "/mnt/ihar/runtime/codex/config.toml" \
+  "$(readlink "$guest_state/.ihar-guest-codex-home/config.toml")"
+assert_exit "writable Codex auth path is a real file" 1 \
+  test -L "$guest_state/.ihar-guest-codex-home/auth.json"
+assert_exit "policy image has no credential copy" 1 test -e "$guest_bundle/store/auth/codex/auth.json"
+assert_eq "state seed holds private credential bytes" "synthetic-guest-seed" \
+  "$(cat "$guest_state/.ihar-guest-codex-home/auth.json")"
+assert_eq "state seed credential stays private" "600" \
+  "$(stat -c %a "$guest_state/.ihar-guest-codex-home/auth.json")"
+guest_state_image="$session/guest-state.ext4"
+_ihar_microvm_make_image "$guest_state_image" "$guest_state" 16
+assert_eq "writable guest drive contains credential" "synthetic-guest-seed" \
+  "$(debugfs -R 'cat /.ihar-guest-codex-home/auth.json' "$guest_state_image" 2>/dev/null)"
+assert_exit "prelaunch state image matches the private seed" 0 \
+  _ihar_microvm_image_auth_matches "$guest_state_image" \
+  "$guest_state/.ihar-guest-codex-home/auth.json" "$guest_bundle"
+assert_exit "stopped state image yields a private candidate" 0 \
+  _ihar_microvm_extract_guest_auth "$guest_state_image" "$guest_bundle"
+assert_eq "extracted candidate preserves bytes" "synthetic-guest-seed" \
+  "$(cat "$guest_bundle/auth.json")"
+assert_eq "extracted candidate is owner-only" "600" \
+  "$(stat -c %a "$guest_bundle/auth.json")"
+debugfs -w -R 'rm /.ihar-guest-codex-home/auth.json' "$guest_state_image" >/dev/null 2>&1
+assert_exit "missing image credential is not treated as logout" 1 \
+  _ihar_microvm_extract_guest_auth "$guest_state_image" "$guest_bundle"
+assert_eq "failed extraction retains earlier candidate" "synthetic-guest-seed" \
+  "$(cat "$guest_bundle/auth.json")"
+assert_exit "fake guest can substitute a symlink in its writable image" 0 \
+  debugfs -w -R 'symlink /.ihar-guest-codex-home/auth.json /etc/passwd' "$guest_state_image"
+assert_exit "symlinked image credential is rejected" 1 \
+  _ihar_microvm_extract_guest_auth "$guest_state_image" "$guest_bundle"
+printf '%s' synthetic-atomic-refresh > "$guest_state/.ihar-guest-codex-home/.auth-next"
+chmod 600 "$guest_state/.ihar-guest-codex-home/.auth-next"
+mv "$guest_state/.ihar-guest-codex-home/.auth-next" \
+  "$guest_state/.ihar-guest-codex-home/auth.json"
+assert_eq "writable Codex home permits atomic credential replacement" \
+  "synthetic-atomic-refresh" "$(cat "$guest_state/.ihar-guest-codex-home/auth.json")"
+mkdir -p "$session/persisted-state"
+rsync -a --exclude='/.ihar-guest-codex-home/' "$guest_state/" "$session/persisted-state/"
+assert_exit "live state transfer omits private credential view" 1 \
+  test -e "$session/persisted-state/.ihar-guest-codex-home/auth.json"
 
 # --- host-side deny-by-default policy -------------------------------------------------
 
