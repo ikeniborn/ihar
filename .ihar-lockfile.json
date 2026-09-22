@@ -11,6 +11,15 @@
     "sha256": "d7e18b2597ae8f242f5f31ee9e90deef48dbc9edd634d9868fb6435d08c07f02",
     "version": "rust-v0.154.0"
   },
+  "console": {
+    "assets": {
+      "xterm.css": "ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6",
+      "xterm.js": "1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495"
+    },
+    "version": {
+      "xterm": "5.5.0"
+    }
+  },
   "hooks": {
     "hooks/_shared/hookio.py": "6387e3392767482db33f6886102713025ae5acae47a609b73e866aca19c697c9",
     "hooks/_shared/patterns.py": "8ee0cf9a7cf109f16e3c783516113b81b6addd241e10ee14e37826f19bcdf40e",
@@ -19,7 +28,8 @@
     "hooks/gwt-gate.py": "915a925d2b3e87a1a701fe1375adfa27bde8e273b6abbee73508ed5ccc3be1bd",
     "hooks/handoff-inject.py": "09fe49c6e1639343cc97f9de1decd5bf81d8e2e4264e8d215707ca1e5c6f0eb7",
     "hooks/security-pretool.py": "cfbddcc7c69500e03042780a090fb244f68fb10a4aba8de866aacef0888f7b80",
-    "hooks/session-register.py": "ad00138f6f174c7634c72fc2e85ebbaa17f71746a1013384e31209bd7dc62ef4"
+    "hooks/session-register.py": "ad00138f6f174c7634c72fc2e85ebbaa17f71746a1013384e31209bd7dc62ef4",
+    "hooks/session-status.py": "984b2c49ec36cd9de6186fbb128fb3b31a2b83f69c35f9d62a0461bfcc3b1e62"
   },
   "managedHooks": {},
   "node": {

@@ -36,6 +36,7 @@ PROFILE = {
     "remote": [],
     "mcp": {"strict": False},
     "acp": "allow",
+    "console": "allow",
     "env_passthrough": [],
     "handoff": {"system_prompt": False},
 }
@@ -106,6 +107,8 @@ CHECK_RESULT = {
         "verified": False,
     },
     "handoff": {"exports": 2, "bytes": 4096},
+    "console": {"state": "running", "port": 8712, "live_sessions": 1,
+                "token_present": True, "reach": ["a1b2c3d4"]},
     "vendors": {
         "claude": {"receipt": "verified", "hooks": [{"id": "security-pretool", "trust": "configured", **HOOK_DETAIL_EMPTY}], "conformance": "proven", "capabilities": ["fork", "remote-control"]},
         "codex": {"receipt": "missing receipt", "hooks": [{"id": "security-pretool", "trust": "trusted", "trusted_hash": "sha256:" + "a" * 64, "trustStatus": "trusted", "enabled": True, "source": "user", "currentHash": "sha256:" + "a" * 64}], "conformance": "unproven", "capabilities": ["archive", "fork"]},

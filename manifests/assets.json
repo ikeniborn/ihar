@@ -3,6 +3,7 @@
   "entries": [
     {"vendor":"common","source":"hooks","target":"hooks","kind":"directory","required":true,"runtime":true},
     {"vendor":"common","source":"manifests","target":"manifests","kind":"directory","required":true,"runtime":false},
+    {"vendor":"common","source":"console","target":"console","kind":"directory","required":false,"runtime":false},
     {"vendor":"common","source":"skills","target":"skills","kind":"directory","required":true,"runtime":true},
     {"vendor":"claude","source":"manifests/config/claude/CLAUDE.md","target":"CLAUDE.md","kind":"file","required":true,"runtime":true},
     {"vendor":"claude","source":"manifests/config/claude/commands","target":"commands","kind":"directory","required":false,"runtime":true},

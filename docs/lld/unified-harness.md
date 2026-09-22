@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 15 (inline-script convention of the Python helper recorded after a shipped switch defect) |
+| Status | revision 19 (ACP chat tab implemented against the measured protocol, gated and labelled) |
 | Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -879,11 +879,14 @@ $IHAR_STATE_ROOT/console/
   token                      32 random bytes, urlsafe, 600, rewritten at every start
   s/<sid>.json               per-session record, schema 1, 600
   s/<sid>.sock               per-session control socket, 600
+  broker.err                 the broker's own stderr, so a start that fails can say why
 ```
 
 There is no scrollback file and no transcript file, in this tree or anywhere else. A tab's output lives in the owning supervisor's memory as a bounded ring buffer (`IHAR_CONSOLE_MAX_SESSIONS` tabs, 256 KiB each) and is replayed to a reconnecting browser; when the ring wraps, the tab shows an explicit truncation marker rather than silently losing the top. `<sid>` is the first twelve hex characters of the `ihar_id`, because the socket path enters the same preflight budget as the Codex control socket (§2.2) and a full UUID does not fit it.
 
-**Two processes, and the reason for the second.** The broker serves the browser; a per-session supervisor owns the pseudo-terminal. Without the supervisor a broker restart would send `SIGHUP` to every tab, which is the outcome the daemon decision exists to avoid. Each supervisor is `setsid`-detached, so it survives the broker, and the broker reattaches by reconnecting to `s/<sid>.sock`. The supervisor holds no policy: it opens the pty, spawns the CLI, keeps the ring buffer, forwards input and window size, records the exit code and removes its own record.
+**Two processes, and the reason for the second.** The broker serves the browser; a per-session supervisor owns the pseudo-terminal. Without the supervisor a broker restart would send `SIGHUP` to every tab, which is the outcome the daemon decision exists to avoid. Each supervisor is `setsid`-detached, so it survives the broker, and the broker reattaches by reconnecting to `s/<sid>.sock`. The supervisor holds no policy: it opens the pty, spawns the CLI, keeps the ring buffer, forwards input and window size, and on exit records the code in its own record and removes only its socket. Revision 13 said it removed the record; the implementation keeps it, because a tab that vanishes the instant it exits takes its exit status with it and the sidebar has nothing to show. The record is removed when the user closes the tab.
+
+**A detached daemon closes what it inherited.** `ihar console start` runs under a required lock, held on a file descriptor the broker would otherwise inherit and keep open for its whole life; every later `console stop` then waited ten seconds for a lock whose holder had already exited. The broker therefore closes descriptors 3 upward before it binds. This is measured behaviour, not a precaution: the timeout was observed before the close was added.
 
 ```json
 {"schema": 1, "pid": 4711, "port": 8712, "token_sha256": "…",
@@ -900,11 +903,19 @@ Both records are metadata; `ihar.jsonio.check` rejects an unknown key, and neith
 
 **Broker lifecycle mirrors §5.5, because the failure it prevents is the same one.** `ihar console start` takes the console lock, refuses a second broker for the same user, writes the token and the record, and prints `http://127.0.0.1:<port>/?t=<token>`; the broker exchanges that parameter once for an `HttpOnly; SameSite=Strict` cookie and redirects, so the token is not re-sent on every request. A live broker whose `release_digest` differs from the installed receipt is stopped and restarted rather than serving a window from code that is no longer installed. `ihar update` stops the broker before replacing binaries and restarts it only if it was running, the rule §14.3 already applies to the Codex daemon. Supervisors are not stopped by either path: they are detached, and their tabs reattach to the new broker.
 
-**Access control, all three checks fail-closed.** The listener binds `127.0.0.1` only; a configured bind that is not loopback is exit 2 with the reason named, never a silent downgrade to loopback and never a network bind. Every request and every WebSocket upgrade requires the cookie, compared to the token in constant time; a missing or wrong one is 401. The upgrade additionally requires `Origin` to equal the console's own origin, which closes the cross-site WebSocket path that a token cookie alone would leave open. Remote use is an SSH tunnel, which is the same answer §13.1 gives for `toad serve`.
+**Access control, all three checks fail-closed.** The listener binds `127.0.0.1` only; a bind that is not loopback is exit 2 with the reason named, never a silent downgrade to loopback and never a network bind. The address is a broker flag rather than a project key on purpose: a configuration file that can ask for a network bind invites the refusal to be argued with, while the flag keeps the refusal testable without offering it as a setting. Every request and every WebSocket upgrade requires the cookie, compared to the token in constant time; a missing or wrong one is 401. The upgrade additionally requires `Origin` to equal the console's own origin, which closes the cross-site WebSocket path that a token cookie alone would leave open. Remote use is an SSH tunnel, which is the same answer §13.1 gives for `toad serve`.
+
+**Refusals are HTTP statuses, and the mapping is fixed.** A missing or wrong cookie is 401; a foreign `Origin`, a profile whose `console` is `refuse`, and a profile file that does not validate are all 403, because each ends the same way — the tab does not start — and none of them is a malformed request; the session cap is 409; an unknown tab or route is 404; a body over 64 kB is 413. A refused tab never stops the window, which is why none of these reaches the broker's own exit code.
 
 **Environment.** A console session never inherits the broker's ambient environment, in any profile. The supervisor builds the base environment of §3.4 — `HOME`, `PATH`, `TERM`, `LANG`, `SHELL`, `USER`, `TMPDIR`, `XDG_*` — adds `IHAR_CONSOLE=1`, and lets the CLI apply the profile's own rules from there. Inheriting instead would carry one shell's `AWS_*` and `GITHUB_TOKEN` into every project in the window, which is exactly what a cross-project surface must not do. The consequence is stated rather than hidden: a name a project lists in `env_passthrough` reaches a console tab only if the broker's own environment carried it at start, and the console reads secrets from nowhere else.
 
-**Sidebar.** One list, grouped by project, built from three sources and nothing else: the index reader of §10.4 for every project state under `$IHAR_STATE_ROOT`, the session records above for what is live in this window, and the status records below for the badge. Discovery is the marker file of §4.1 — a directory without a valid `home.json` is skipped, not guessed at. Rename writes through the adapter (`claude -n`, Codex `thread/name/set`, §19) so the native pickers show the same title, and resume opens a new tab through `ihar sessions resume <id>`.
+**A console tab names its own launch.** The broker mints the `ihar_id` before spawning and passes it as `IHAR_CONSOLE_LAUNCH_ID`, which the lifecycle adopts after the handoff and resume ids and before minting one of its own (§3.3). Without it the record and the session index would disagree on the identity of the same session, and the sidebar join of §10.4 would have nothing to join on.
+
+**Sidebar.** One list, grouped by project, built from three sources and nothing else: the merge of §10.4 for every project state under `$IHAR_STATE_ROOT`, the session records above for what is live in this window, and the status records below for the badge. Discovery is the marker file of §4.1 — a directory without a valid `home.json` is skipped, not guessed at. `GET /api/sidebar` answers it, cached for five seconds because the list is polled and changes on human timescales; `?refresh=1` forces a rebuild.
+
+The merge runs the **file and SQLite readers only**: the broker passes neither a Codex binary nor a daemon socket, so drawing a list can never start a vendor process. A session with no badge is reported as `unknown` rather than as running, and a badge outlives its session — the sidebar shows the last state the hook recorded, because a badge that disappeared would be indistinguishable from a session that never reported.
+
+Rename writes through the adapter by running `ihar sessions name <id> <title>` in the project (`claude -n`, Codex `thread/name/set`, §19), so the native pickers show the same title and the console reimplements no adapter call; `POST /api/sessions/<state-id>/<ihar-id>/name` is the route. Resume opens a new tab through `ihar sessions resume <id>`.
 
 **Status contract.** The `session-status` hooks of §6.1 write one file per vendor session under the project's own state:
 
@@ -915,15 +926,29 @@ Both records are metadata; `ihar.jsonio.check` rejects an unknown key, and neith
 
 Keyed by the payload's `session_id`, so it needs none of the launch-claim machinery of §10.3 and cannot attribute a status to the wrong session under a Codex daemon. The sidebar joins it to the index on `(vendor, vendor_session_id)`, the join §10.4 already performs. A stale file — process gone, no `stopped` written — is shown as unknown after the reader finds no live process, never as running.
 
-**Thread projection (R10).** Selecting a session opens a read-only history pane beside the terminal. The projection walks `handoff_from` and `handoff_to` transitively through the index to collect the chain, calls each node's adapter `get_session()`, normalises to `{vendor, role, text, at}`, orders by timestamp, and inserts a marker between consecutive nodes carrying that handoff's `bytes`, `masking_level` and truncation flags from §11.1. The marker is the point of the pane: it is where the next agent received a bounded package instead of the preceding messages, and a reader who cannot see it would mistake a summary for a memory. The projection is assembled per request, held in memory, and never written to disk — so it is not a transcript store, and a vendor session that has been rotated away leaves a labelled gap rather than a fabricated one. It is not masked, because it never leaves the machine; masking governs model requests (§8.4) and handoff packages (§11.2), and applying it to a local viewer would hide from the user what the agent already saw.
+**Thread projection (R10).** Selecting a session opens a read-only history pane beside the terminal, answered by `GET /api/thread/<state-id>/<ihar-id>`. The projection walks `handoff_from` back to the first session and `handoff_to` forward to the last, so any session in a chain shows the whole chain; reads each node with the transcript reader the handoff builder uses (§11.2 step 6); orders the messages; and inserts a marker between consecutive nodes carrying that handoff's `bytes`, `masking_level` and history mode from §11.1. A node whose vendor store no longer holds the session contributes a labelled entry in `gaps` and no messages at all. The marker is the point of the pane: it is where the next agent received a bounded package instead of the preceding messages, and a reader who cannot see it would mistake a summary for a memory. The projection is assembled per request, held in memory, and never written to disk — so it is not a transcript store, and a vendor session that has been rotated away leaves a labelled gap rather than a fabricated one. It is not masked, because it never leaves the machine; masking governs model requests (§8.4) and handoff packages (§11.2), and applying it to a local viewer would hide from the user what the agent already saw.
 
 **Tab kinds.** `kind: "pty"` is the shipped one and carries every guarantee of the resolved profile. `kind: "acp"` (S13) runs `ihar acp <vendor>` and renders ACP updates as a chat; the broker offers it only when the project profile has `acp: allow`, and the UI labels it with the two gaps §13.3 names, because two tab kinds that look alike and guarantee differently is the confusion this labelling exists to prevent. A vendor change is never implicit in either kind: the handoff button runs `ihar switch --to <vendor>` (§11.4) and opens the resulting session as a new tab, linked in the sidebar.
 
-**Check panel.** The console renders `ihar check --json` per project through the closed schema of §12.4 and adds one console block: `{state, port, live_sessions, token_present, reach}`, where `reach` names the project states this broker can launch into. It is read-only and fail-soft; a project whose check fails is shown as failing, not omitted.
+**Check panel.** The console runs `ihar check` in the project and shows what it printed, cached for thirty seconds because the command starts processes of its own; `GET /api/check/<state-id>` is the route. The report already carries the console block of §12.4 — `{state, port, live_sessions, token_present, reach}` — so the window states the token's reach in the same words the terminal does. Read-only and fail-soft: a project whose check fails is shown as failing, not omitted.
 
-### 13.3 ACP launcher mode
+**The window and its assets.** `GET /` serves `console/index.html`; `GET /static/<name>` serves exactly four files named in a closed map — the window's own script and stylesheet, and the pinned `xterm.js` and `xterm.css`. A name outside the map is 404 rather than a path join, so no request can walk out of the asset directory, and every asset needs the same cookie as the rest of the surface.
 
-**ACP**: `ihar acp <vendor>` execs the pinned adapter with the runtime environment. Every `hooks: enforced` profile refuses it at the profile gate, which is HLD §6.9's rule. Under `standard`, or another profile that explicitly allows ACP, a real ACP launch must then pass the same install-receipt check for the selected native Claude/Codex executable before the adapter starts; the adapter delegates to that binary, so ACP is not a receipt-verification carve-out. Adapter version/digest integrity remains a separate pinned-asset check. `ihar check` states that settings hooks may not fire (claude-agent-acp #144) and that codex-acp overrides sandbox and approval policy (#310, #477). ACP sessions are learned through the vendor listing path, since `session-register.py` may not run.
+**The terminal is pinned, and a mismatch is a refusal.** `xterm.js` 5.5.0 is vendored under `console/vendor/`, and its digest is recorded in the release lockfile beside every other release input. The broker hashes the bytes before serving them: a build whose terminal is not the reviewed one answers 503 naming the digest rather than serving it. The window loads nothing else — no CDN, no network at runtime — because a local tool that needs the internet to draw a terminal is not a local tool.
+
+**The handoff button reimplements nothing.** `POST /api/sessions/<state-id>/<ihar-id>/switch` opens a tab running `ihar switch --to <vendor> --history <mode>` with `IHAR_CONSOLE_LAUNCH_ID` naming the source session, so the package, its sanitisation and its profile gates are the ones of §11. An unknown vendor or history mode is 400 before any tab exists.
+
+### 13.3 ACP launcher mode and the console's chat tab
+
+**The chat tab (slice S13).** The console's second tab kind runs `ihar acp <vendor>` instead of the vendor's TUI and renders the conversation. Its supervisor owns the protocol state, so a broker restart reattaches to a live conversation the way it reattaches to a terminal, and the same ring buffer replays it.
+
+The protocol was measured from `@zed-industries/agent-client-protocol` 0.4.5 rather than recalled: newline-delimited JSON-RPC 2.0 over stdio, `PROTOCOL_VERSION = 1`, client-to-agent `initialize`, `authenticate`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, `session/set_mode`, `session/set_model`, and agent-to-client the `session/update` notification plus `session/request_permission`, `fs/read_text_file`, `fs/write_text_file` and five `terminal/*` methods. Update kinds are `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update` and `current_mode_update`.
+
+Two client-side decisions are security-relevant. **The console declares no client capabilities**: `fs/*` and `terminal/*` are answered with JSON-RPC method-not-found, because an agent that already runs locally with its own tools has no need of the browser window as a second filesystem, and a client that offers one offers an unaudited path. **A permission request is never answered by the process**: it is surfaced and held until the user chooses, since an automatic answer is an approval nobody gave; a cancelled turn answers every pending request `cancelled`, which the protocol requires of a client.
+
+**The gate follows `acp`, not `console`.** A chat tab is offered only where the profile allows ACP, so `protected` and `isolated` refuse it with the reason named in the tab. **The label is not the tab's own words**: it is the three lines `ihar check` already prints — claude-agent-acp #144, codex-acp #310/#477, and the console's own refusal to offer a filesystem or terminal capability — so the terminal and the window say the same thing rather than two wordings that must be reconciled.
+
+**ACP launcher mode**: `ihar acp <vendor>` execs the pinned adapter with the runtime environment. Every `hooks: enforced` profile refuses it at the profile gate, which is HLD §6.9's rule. Under `standard`, or another profile that explicitly allows ACP, a real ACP launch must then pass the same install-receipt check for the selected native Claude/Codex executable before the adapter starts; the adapter delegates to that binary, so ACP is not a receipt-verification carve-out. Adapter version/digest integrity remains a separate pinned-asset check. `ihar check` states that settings hooks may not fire (claude-agent-acp #144) and that codex-acp overrides sandbox and approval policy (#310, #477). ACP sessions are learned through the vendor listing path, since `session-register.py` may not run.
 
 ## 14. Install, update, verify
 
@@ -976,7 +1001,7 @@ With `--migrate-store`, eligible legacy content is copied into that same store s
 | Handoff transcript export | §11.1, §11.2 | `$IHAR_STATE/handoff/<ihar_id>-transcript.md` |
 | Console daemon record | §13.2 | `$IHAR_STATE_ROOT/console/daemon.json` |
 | Console session record | §13.2 | `$IHAR_STATE_ROOT/console/s/<sid>.json` |
-| Session status record | §13.2 | `$IHAR_STATE/status/*.json` |
+| Session status record | §13.2 | `$IHAR_STATE/status/<vendor>-<session>.json` |
 | Profile definition | §12.1 | `manifests/profiles/*.json` |
 | Daemon record | §5.5 | `$IHAR_STATE/daemons/codex.json` |
 | Conformance record | §6.6 | `$IHAR_STORE/verification/*.json` |
@@ -1021,7 +1046,7 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | web | `tests/test_web.sh` | native Claude and Codex web argv, profile gates, daemon attachment and LAN spelling |
 | S12 | `tests/test_console.sh` | a non-loopback bind is exit 2; a request or upgrade without the cookie is 401 and a foreign `Origin` is refused; the token file is 600 and rewritten at start; a tab spawns the CLI and inherits the base environment only, with an ambient `GITHUB_TOKEN` proven absent; a `console: refuse` project fails that tab and not the broker; killing the broker leaves the supervisor and its child alive and a new broker reattaches |
 | S12 | `tests/test_console.py` | record schemas reject unknown keys; the ring buffer wraps with a truncation marker and no file is created anywhere under the state root during a session; the sidebar joins index, session and status records and reports a process-less status as unknown rather than running; the projection assembles a two-vendor chain in timestamp order with a handoff marker carrying the package bytes; a rotated vendor session yields a labelled gap |
-| S13 | `tests/test_console_acp.sh` | an ACP tab is offered only under a profile with `acp: allow`; the tab kind and its missing hook and sandbox guarantees are labelled and appear in `ihar check` |
+| S13 | `tests/test_console_acp.sh`, `tests/test_console_acp.py` | an ACP tab is offered only under a profile with `acp: allow` and the refusal names the setting; every caveat the tab carries is a line `ihar check` prints; against a fake agent speaking the measured protocol the client initialises at version 1, creates a session, relays message and thought chunks, **holds a permission request until the user answers**, refuses `fs/read_text_file` with method-not-found, and answers `cancelled` on a cancelled turn |
 | S14 | `tests/test_handoff_history.py` | `summary` is the default and leaves `history.file` null; `transcript` renders in order, masks with the same engine, writes 600, and records the real message count when truncated; a planted secret is absent from the rendered file; a masking failure degrades to `summary` with a warning instead of writing an unmasked file; the package stays under 8 kB in both modes |
 | workflow | `tests/test_workflow_gates.sh` | validated chain transitions, stale-hash rejection and bounded gate evidence |
 | concurrency | `tests/test_concurrency.sh` | real-`flock` acknowledgement precedes every blocked-entry assertion; a marker paused inside publication proves a second profile cannot enter, then distinct homes publish and remain unchanged; parallel `ihar_cmd_install` calls serialize through the production store lock; different masking levels create different gateway instances; after one shared consumer releases, a live protocol probe succeeds for the other |
@@ -1062,15 +1087,24 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | handoff | masking engine unavailable, level above `off` | fail-closed | 3 |
 | sessions | no vendor source readable | runtime | 1 |
 | profile | `--web` for a vendor not in `remote`; `acp` under `refuse` | usage | 2 |
-| console | configured bind is not loopback | usage | 2 |
-| console | tab requested for a project whose profile is `console: refuse` | usage | 2 in the tab |
+| console | bind is not loopback | usage | 2 |
+| console | tab requested for a project whose profile is `console: refuse`, or whose profile file does not validate | fail-closed per request | 403 |
 | console | token file missing, unreadable, or wrong mode | fail-closed | 3 |
-| console | request or upgrade without a valid cookie, or with a foreign `Origin` | fail-closed per request | 401 / 403 |
-| console | second broker for the same user, or a live broker on a different release digest | fail-closed, restart the broker | 3 |
-| console | `max_sessions` reached | usage | 2 in the tab |
+| console | request or upgrade without a valid cookie | fail-closed per request | 401 |
+| console | upgrade carrying a foreign `Origin` | fail-closed per request | 403 |
+| console | second broker for the same user | fail-closed | 3 |
+| console | live broker on a different release digest | fail-closed, restart the broker | 3 |
+| console | `max_sessions` reached | fail-closed per request | 409 |
 | console | supervisor socket unreachable for a recorded session | fail-soft, tab shown as detached | 0 |
-| console | status record present with no live process | fail-soft, badge shown as unknown | 0 |
+| console | no status record for a session | fail-soft, badge shown as unknown | 0 |
+| console | a project state whose index or vendor store cannot be read | fail-soft, that project reports its error and the window keeps its other projects | 0 |
 | console | adapter read fails while projecting a thread | fail-soft, labelled gap in the pane | 0 |
+| console | served terminal asset does not match its reviewed digest | fail-closed per request | 503 |
+| console | console assets absent from the checkout or store | fail-closed per request | 503 |
+| console | static name outside the served map | fail-closed per request | 404 |
+| console | chat tab requested where the profile sets `acp: refuse` | fail-closed per request | 403 |
+| console | agent asks the console for `fs/*` or `terminal/*` | fail-closed per request | JSON-RPC -32601 |
+| console | agent sends an unparseable line | fail-soft, reported in the tab | 0 |
 | handoff | transcript render or its masking fails | fail-soft, degrade to `summary` with a warning | 0 |
 
 ## 18. Delivery plan
@@ -1092,7 +1126,7 @@ The review is right that the original slice order puts feature work before the c
 | S9 | Web flags over native remote surfaces | `tests/test_web.sh`; manual protocol in `docs/manual/web-surfaces.md` |
 | S10 | `isolated`: microVM with both binaries, read-only policy bundle, deny-by-default network and observed prelaunch-to-live evidence | `tests/test_microvm.sh` |
 | S11 | ACP launcher mode, experimental | `tests/test_acp.sh` |
-| S12 | Console broker and supervisors, PTY tabs, cross-project sidebar, status hooks, thread projection, check panel, rename, handoff button | `tests/test_console.sh`, `tests/test_console.py` |
+| S12 | Console broker and supervisors, PTY tabs, cross-project sidebar, status hooks, thread projection, check panel, rename, handoff button. Delivered in three ledger slices: the boundary first, then the data layer, then the front end | `tests/test_console.sh`, `tests/test_console.py` |
 | S13 | ACP chat tab inside the console, experimental | `tests/test_console_acp.sh` |
 | S14 | Handoff history modes: `transcript` export, budget, masking, degradation | `tests/test_handoff_history.py` |
 | — | concurrency suite, run from S1 onward and extended by each slice | `tests/test_concurrency.sh` |
@@ -1119,9 +1153,8 @@ S12 depends on S7 for the index reader and on S8 for the handoff button; S13 dep
 
 Revision 12 records only choices supported by the approved artifacts and reviewed implementation. Vendor timeout behavior is an executable mandatory case in §6.6 rather than a prose assumption; future pinned-version changes must earn new evidence before activation. Any question not supported by that evidence remains open rather than being closed by this reconciliation.
 
-Revision 13 opens three, each owned by the slice that must measure it rather than assume it:
+Revision 13 opened three. The terminal asset pin is now answered and closed: `xterm.js` 5.5.0 is vendored at `console/vendor/xterm.js`, sha256 `1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495`, with its stylesheet at `ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6`; both digests were taken from the installed files and are recorded in the release lockfile, which the broker verifies before serving. Two remain, each owned by the slice that must measure it rather than assume it:
 
-- **Terminal asset pin (S12).** The browser terminal needs a pinned `xterm.js` build in `manifests/assets.json` with its digest; the version and digest are recorded when the asset is first installed, never from memory, and the console refuses to serve a mismatched one.
 - **Masking throughput on a transcript (S14).** The 2 MB default budget assumes the masking engine finishes a large render in a time a user will wait for. Presidio's rate on this class of input is unmeasured; S14 measures it and either keeps the default, lowers it, or streams the render, and records the number here.
 - **ACP tab promotion (S13).** claude-agent-acp #144 and codex-acp #310/#477 decide whether an ACP tab can ever be offered under an enforced profile. Until a measurement says they are closed, the tab exists only where `acp: allow` already stands.
 

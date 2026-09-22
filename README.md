@@ -148,9 +148,67 @@ incompatible with that vendor feature. Codex works with `standard` and `protecte
 `ihar` starts its managed app-server daemon, prints a pairing code, and attaches
 the terminal client to it. The `isolated` profile offers neither web surface.
 
-This is not a separate ihar browser UI, and `ihar` does not issue web credentials.
-For the vendor-specific flow and the optional authenticated Codex LAN listener,
-see [Native web surfaces](docs/manual/web-surfaces.md).
+These bridges are vendor-owned and each carries one session. For the vendor-specific
+flow and the optional authenticated Codex LAN listener, see
+[Native web surfaces](docs/manual/web-surfaces.md).
+
+## Multi-session console
+
+`ihar console start` runs a local broker that launches ihar sessions and serves their
+terminals in one place, across every project on the machine:
+
+```bash
+ihar console start
+ihar console status
+ihar console stop
+```
+
+It prints a `http://127.0.0.1:<port>/?t=<token>` URL. The listener is loopback only —
+a bind that is not loopback is refused rather than downgraded — so reaching it from
+another machine means an SSH tunnel. The token is exchanged once for an `HttpOnly`
+cookie; every request needs it and every WebSocket needs this origin as well.
+
+Each tab runs the ordinary CLI under a pseudo-terminal, so a tab is a normal launch:
+the profile, its hooks, its gateway and its sandbox all apply unchanged, and a project
+whose profile sets `console: refuse` fails in that tab without disturbing the others.
+`standard` and `protected` allow the console; `isolated` refuses it, because its
+session runs inside the guest.
+
+Terminal output is never written to disk: it lives in a bounded in-memory buffer per
+tab and is replayed when a browser reattaches. A tab outlives the broker, so restarting
+the console — or updating ihar — does not kill the agents running in it.
+
+The broker also answers what the window will show: one list of every project on the
+machine with each session's vendor, title, profile and live state, and a read-only
+thread that follows a `switch` across vendors and marks where the handoff cut the
+context. A session whose vendor store no longer holds it appears as a labelled gap
+rather than invented text, because ihar keeps no copy. States come from a hook on the
+four lifecycle events both agents share — running, waiting for approval, idle, stopped
+— so the list can say which agent is waiting for you.
+
+Open the printed URL and the window shows all of it: a sidebar of every project and
+its sessions, a tab per running agent with the vendor's own terminal in it, a history
+pane that reads a chain across a `switch`, a panel with that project's `ihar check`,
+and buttons to rename a session or hand it to the other agent. Browser notifications,
+if you allow them, tell you when a session starts waiting for you.
+
+A tab comes in two kinds. The default runs the agent's own terminal and carries the
+profile unchanged. The second is an experimental chat over ACP: it is offered only where
+the profile allows ACP, so `protected` and `isolated` refuse it, and the tab states what
+it does not carry — hooks that may not fire under the Claude adapter, a sandbox and
+approval policy the Codex adapter replaces, and the console's own refusal to give the
+agent a filesystem or terminal through the browser. Those are the same three lines
+`ihar check` prints. A permission the agent asks for is shown and waits for you; nothing
+answers it on your behalf.
+
+Everything the page loads is served by the broker from a pinned copy — the terminal is
+`xterm.js` 5.5.0, vendored with its digest in the release lockfile, and a build whose
+bytes do not match is refused rather than served. Nothing is fetched from the network,
+so the console works with the machine offline.
+
+One caveat worth stating plainly: a console token starts launches in every project
+state on this machine, which is wider than a single launch. `ihar check` prints that
+reach, and so does the window.
 
 ## Configure
 

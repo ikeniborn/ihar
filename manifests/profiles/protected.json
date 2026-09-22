@@ -1,5 +1,6 @@
 {
   "acp": "refuse",
+  "console": "allow",
   "env_passthrough": [],
   "gateway": "explicit",
   "guarantee": "Model egress: no unmasked supported content reaches a model provider, and unsupported content is refused rather than sent. MCP servers are restricted to a registry allowlist. Other tool network egress is not controlled.",
