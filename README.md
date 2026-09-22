@@ -130,6 +130,12 @@ Neither vendor accepts a foreign session, so the transcript arrives as a file th
 next agent may read, never as a session it resumes. Those exports are kept until you
 delete them; `ihar check` reports how many there are and how much space they use.
 
+The export is bounded at 256 KiB by default, which is a measured figure rather than a
+round one: the masking engine that `protected` promises processes this kind of text at
+roughly 0.015 MiB/s, so a larger default would mean minutes of waiting for one switch.
+If the engine cannot mask something at all, ihar refuses or degrades and says so — it
+never quietly masks with something weaker than the level you asked for.
+
 ## Web access today
 
 Run `ihar web` on the computer that owns the project and vendor login. For now,

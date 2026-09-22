@@ -22,6 +22,19 @@ from ._shared import SECRET_PATTERNS
 
 LEVELS = ("off", "secrets", "standard")
 
+
+class MaskingUnavailable(RuntimeError):
+    """The selected engine could not analyse this input.
+
+    Raised rather than quietly falling back to the regex patterns. Measured on
+    2026-09-22: spaCy refuses input over 1,000,000 characters with `ValueError [E088]`,
+    and the fallback that used to catch it left the caller recording `masked: true` at
+    level `standard` while `ihar check` still reported `engine: presidio` — a weaker
+    promise than the label, invisible to everyone. A caller that can degrade does so
+    knowingly; the gateway refuses the request instead.
+    """
+
+
 # Personal data the `standard` level masks in addition to credentials. Deliberately
 # conservative: a pattern that fires on ordinary prose would make the gateway mangle
 # the very requests it is meant to protect, and a user who sees that turns masking
@@ -106,8 +119,10 @@ def _load_presidio():
 def _presidio_mask(analyzer, text: str, token: str) -> tuple[str, list[str]]:
     try:
         results = analyzer.analyze(text=text, language="en")
-    except Exception:                                      # noqa: BLE001
-        return _apply(text, _PII_PATTERNS, token)
+    except Exception as error:                             # noqa: BLE001
+        raise MaskingUnavailable(
+            f"the presidio engine could not analyse {len(text)} characters: {error}"
+        ) from error
     kinds: list[str] = []
     # Replace from the end so earlier offsets stay valid.
     for result in sorted(results, key=lambda item: item.start, reverse=True):

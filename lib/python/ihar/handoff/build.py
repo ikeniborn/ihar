@@ -17,8 +17,14 @@ from ihar.mask.engine import Masker
 
 MAX_BYTES = 8192
 # The transcript export is pointed at, never inlined, so this budget bounds the file on
-# disk and the masking work, not the package. LLD section 20 owns its measurement.
-TRANSCRIPT_BYTES = 2_000_000
+# disk and the masking work, not the package. Measured on 2026-09-22 rather than assumed:
+# the presidio engine runs at roughly 0.012 to 0.016 MiB/s on transcript-shaped text
+# (64 KiB in 4.0 s, 256 KiB in 20.6 s with en_core_web_lg), the regex engine at about
+# 6 MiB/s, and spaCy refuses input over 1,000,000 characters outright. The old 2 MB
+# default meant minutes of masking for one switch and sat above that hard limit, so the
+# budget is now a quarter of a mebibyte: about twenty seconds in the slow engine, well
+# under the limit, and still hundreds of messages.
+TRANSCRIPT_BYTES = 256 * 1024
 
 
 def _git(cwd: Path, *args: str) -> str:

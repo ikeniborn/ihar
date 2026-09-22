@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 20 (ACP promotion is an executable gate; the condition is measured, not recalled) |
+| Status | revision 21 (masking throughput measured; a failed analysis is refused instead of silently downgraded) |
 | Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -198,7 +198,7 @@ skills/  tests/  docs/
 
 ### 2.6 Project configuration `.ihar_config`
 
-Keys: `IHAR_PROFILE`, `IHAR_DEFAULT_AGENT`, `IHAR_GATEWAY_MASKING_LEVEL` (tighten-only, §12.3), `IHAR_GATEWAY_ENGINE`, `IHAR_STATE_ROOT`, `IHAR_STORE`, `IHAR_PROXY_URL`, `IHAR_PROXY_CA`, `IHAR_PROXY_INSECURE`, `IHAR_TELEMETRY`, `IHAR_CHAT_LANG`, `IHAR_DOC_LANG`, `IHAR_IWIKI_*`, `IHAR_DISTILLER`, `IHAR_SOCKET_PATH_MAX`, `IHAR_CONSOLE_PORT`, `IHAR_CONSOLE_MAX_SESSIONS`, `IHAR_HANDOFF_HISTORY`, `IHAR_HANDOFF_TRANSCRIPT_BYTES`. An unknown `IHAR_*` key is exit 2. Precedence is defaults < file < flags, with the tighten-only exception of §12.3. There is no shared-home mode. The two console keys are read by the broker, which is per user rather than per project (§13.2): the project file that starts the broker wins, and a second project cannot retune a running one.
+Keys: `IHAR_PROFILE`, `IHAR_DEFAULT_AGENT`, `IHAR_GATEWAY_MASKING_LEVEL` (tighten-only, §12.3), `IHAR_GATEWAY_ENGINE`, `IHAR_STATE_ROOT`, `IHAR_STORE`, `IHAR_PROXY_URL`, `IHAR_PROXY_CA`, `IHAR_PROXY_INSECURE`, `IHAR_TELEMETRY`, `IHAR_CHAT_LANG`, `IHAR_DOC_LANG`, `IHAR_IWIKI_*`, `IHAR_DISTILLER`, `IHAR_SOCKET_PATH_MAX`, `IHAR_CONSOLE_PORT`, `IHAR_CONSOLE_MAX_SESSIONS`, `IHAR_HANDOFF_HISTORY`, `IHAR_HANDOFF_TRANSCRIPT_BYTES` (262144 by default, measured in §8.4). An unknown `IHAR_*` key is exit 2. Precedence is defaults < file < flags, with the tighten-only exception of §12.3. There is no shared-home mode. The two console keys are read by the broker, which is per user rather than per project (§13.2): the project file that starts the broker wins, and a second project cannot retune a running one.
 
 ## 3. Control plane
 
@@ -661,6 +661,12 @@ Revision 2 said both that `system` is masked and that `system` content is preser
 
 Engine (`ihar.mask.engine`): Presidio with spaCy when available, the iclaude regex engine as fallback, `IHAR_GATEWAY_ENGINE=regex` to force it, levels `off | secrets | standard`. The same module sanitises handoff packages (§11.2), so one implementation carries the claim. This also closes the icodex defect where `ICODEX_PII_ENGINE=nlp` is accepted while `server.py` never imports Presidio.
 
+**7. A failed analysis is a refusal, not a quieter mask.** Measured on 2026-09-22 with presidio-analyzer and spaCy 3.8.16 on `en_core_web_lg`: the engine refuses input over 1,000,000 characters with `ValueError [E088] Text of length 1000001 exceeds maximum of 1000000`. The implementation used to catch every exception from `analyze()` and mask with the regex patterns instead, so a body that exceeded the limit was recorded `masked: true` at level `standard` while `ihar check` still reported `engine: presidio` — a weaker promise than the label, visible to nobody. The call now raises `MaskingUnavailable` and each caller decides: the gateway refuses the request (502, as it does for any payload it cannot promise about) and the handoff degrades its transcript to `summary` with a named warning.
+
+**Throughput, measured rather than assumed.** On transcript-shaped text — prose with paths, identifiers, an address and a planted credential — the presidio engine ran at 0.012 to 0.016 MiB/s (64 KiB in 3.99 s, 256 KiB in 20.58 s) and the regex engine at about 6 MiB/s, linearly to 2 MiB. Two consequences are already in force: the handoff transcript budget is 256 KiB rather than 2 MB (§11.2), which is roughly twenty seconds in the slow engine and stays under the hard limit; and a gateway body large enough to matter now refuses rather than degrades.
+
+**What ships today is the regex engine.** This checkout has no `lib/python/requirements.lock`, so `ihar install` installs no Python dependency at all and `AnalyzerEngine` never imports; `ihar check` reports `engine: regex` truthfully. The presidio numbers above were taken in a scratch environment, so they describe what would happen once the dependency is delivered, not what happens now. Plan task X2.4 owns that gap.
+
 ### 8.5 Transparent mode spike: no-go
 
 S11 measured cgroup v2 and positive `iptables -m cgroup --path` support on the target kernel. nftables on the same host exposes only numeric cgroup ids. The redirect still requires root or `CAP_NET_ADMIN`: unprivileged nat-table access exits 4 with permission denied, while `route_localnet` is disabled. The approved design defined no root-owned helper, polkit policy or sudo contract. Adding one would create a new privileged security boundary rather than implement this design.
@@ -777,7 +783,7 @@ Load the index and fold by `ihar_id`; call both adapters' `list_sessions`; join 
 3. **Optional summary** from the distiller; a timeout omits the field with a warning.
 4. **Sanitise** every string with `ihar.mask.engine` at the effective level. `masked: true` is set only after the pass. No engine and a level other than `off` is exit 3.
 5. **Size**, target 8 kB, measured after each step. Truncation order: `recent_messages` oldest first, then `summary`, then `decisions_heuristic`, then `decisions` beyond 20, then `open_items` beyond 30, then `files_touched` beyond 50 with `files_touched_truncated: true` and `git.files_changed` carrying the real count. Only `git` (a single shortstat line), `ledger` and the identity fields are never truncated, so the bound is reachable on any repository.
-6. **Transcript render**, in `transcript` mode only: `adapter_<source>_get_session` is normalised to `{role, text, at}` in order, rendered as Markdown with a header naming the source vendor, session and revision, masked by the same engine as step 4, and written atomically at mode 600. The budget is `IHAR_HANDOFF_TRANSCRIPT_BYTES` (default 2 MB), applied oldest-first with `history.truncated` and the real `history.messages` count recorded; a render or masking failure **degrades to `summary` mode with a named warning** rather than shipping an unmasked or partial file, and the switch continues, because handoff is a convenience layer while its sanitisation is not.
+6. **Transcript render**, in `transcript` mode only: `adapter_<source>_get_session` is normalised to `{role, text, at}` in order, rendered as Markdown with a header naming the source vendor, session and revision, masked by the same engine as step 4, and written atomically at mode 600. The budget is `IHAR_HANDOFF_TRANSCRIPT_BYTES` (default 262144 bytes, the measured figure of §8.4 rather than a round number), applied oldest-first with `history.truncated` and the real `history.messages` count recorded; a render or masking failure **degrades to `summary` mode with a named warning** rather than shipping an unmasked or partial file, and the switch continues, because handoff is a convenience layer while its sanitisation is not.
 7. **Write** both files atomically and the pending file for the target.
 
 **The transcript file is kept indefinitely, by decision.** It is an export under `$IHAR_STATE/handoff/`, outside the checkout, mode 600, masked — the same class of artifact as `handoff.json`, which has always carried `recent_messages`. The consequence is stated rather than discovered later: a project that switches often accumulates a masked archive of its own conversations that no retention rule removes, `ihar homes clean` does not touch it because it is not a runtime generation, and deleting it is a user action. `ihar check` reports the directory's file count and total bytes so the growth is visible rather than silent.
@@ -1088,6 +1094,7 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | gateway | unhealthy within 15 s | fail-closed | 3 |
 | gateway | unknown route, masking on | fail-closed per request | 502 |
 | gateway | unknown content block or non-text payload, enforced profile | fail-closed per request | 502 |
+| gateway | the promised masking engine cannot analyse the body | fail-closed per request | 502 |
 | gateway | body unparseable / compressed / over limits | fail-closed per request | 400 / 415 / 413 |
 | sandbox | microVM boot, prelaunch manifest/artifact lineage, observed launch identity or network policy verification fails | fail-closed | 3 |
 | index | append fails | fail-soft | 0 |
@@ -1165,7 +1172,7 @@ Revision 12 records only choices supported by the approved artifacts and reviewe
 
 Revision 13 opened three. The terminal asset pin is now answered and closed: `xterm.js` 5.5.0 is vendored at `console/vendor/xterm.js`, sha256 `1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495`, with its stylesheet at `ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6`; both digests were taken from the installed files and are recorded in the release lockfile, which the broker verifies before serving. Two remain, each owned by the slice that must measure it rather than assume it:
 
-- **Masking throughput on a transcript (S14).** The 2 MB default budget assumes the masking engine finishes a large render in a time a user will wait for. Presidio's rate on this class of input is unmeasured; S14 measures it and either keeps the default, lowers it, or streams the render, and records the number here.
+- **The masking engine is not installed by anything (plan task X2.4).** `lib/python/ihar/mask/engine.py` selects Presidio when it imports, and §1.4's `protected` guarantee is written against that engine, but this checkout carries no `lib/python/requirements.lock`, so `ihar install` builds an empty venv and the regex fallback is always what runs. `ihar check` reports it truthfully, so nothing is overclaimed today; what is undelivered is the dependency, and with it the difference between a named-entity engine and a pattern list. Whether to ship it — and at which spaCy model, given the 400 MB `en_core_web_lg` the analyzer pulls by default — is the decision X2.4 owes.
 - **ACP tab promotion (S13).** claude-agent-acp #144 and codex-acp #310/#477 decide whether an ACP tab can ever be offered under an enforced profile. The question is now asked by `ihar check --acp-promotion` rather than by hand, and on 2026-09-22 it answered `not promotable` with all three issues open and the behavioural half unmeasurable here. Two things must still be produced by a machine that has the adapters and vendor credentials: a passing `claude-hooks-fire` probe, and a measured run of `codex-acp` from which the `codex-config-survives` assertion can finally be written.
 
 ## 21. Disposition of the architecture review

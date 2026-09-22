@@ -136,6 +136,33 @@ def main():
               not list((state / "handoff").glob("*-transcript.md")))
         check("failure is named on stderr", "transcript" in captured.getvalue().lower())
 
+        # The budget follows the measurement rather than a round number.
+        from ihar.handoff.build import TRANSCRIPT_BYTES
+        check("the transcript budget stays under the engine's hard limit",
+              TRANSCRIPT_BYTES < 1_000_000)
+        check("the transcript budget is the measured quarter mebibyte",
+              TRANSCRIPT_BYTES == 256 * 1024)
+
+        # An engine that cannot analyse is a degradation the user is told about, not a
+        # file masked by something weaker than the label claims.
+        from ihar.mask import engine as mask_engine
+
+        def unavailable(*_args, **_kwargs):
+            raise mask_engine.MaskingUnavailable("the presidio engine could not analyse")
+
+        original_render = build_module._render_transcript
+        build_module._render_transcript = unavailable
+        try:
+            captured = io.StringIO()
+            with redirect_stderr(captured):
+                package = build(root, state, context, history_mode="transcript",
+                                transcript=messages)
+        finally:
+            build_module._render_transcript = original_render
+        check("an unavailable engine degrades the mode rather than writing a weaker file",
+              package["history"]["mode"] == "summary")
+        check("the degradation is named on stderr", "transcript" in captured.getvalue().lower())
+
         # an empty session is a summary, not an empty file.
         package = build(root, state, context, history_mode="transcript", transcript=[])
         check("empty transcript degrades to summary", package["history"]["mode"] == "summary")

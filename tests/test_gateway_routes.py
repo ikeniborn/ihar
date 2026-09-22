@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 os.environ.setdefault("IHAR_ROOT", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from ihar.gateway import limits, log, routes    # noqa: E402
-from ihar.mask import shapes                    # noqa: E402
+from ihar.mask import engine, shapes                    # noqa: E402
 from ihar.mask.engine import Masker             # noqa: E402
 
 SECRET = "sk-ant-abcdefghijklmnopqrstuvwxyz0123"
@@ -138,6 +138,47 @@ def test_a_large_base64_value_is_refused():
 
 def test_a_body_that_is_not_an_object_is_refused():
     _rejects([1, 2, 3], enforced=True, needle="not an object")
+
+
+def test_an_engine_that_cannot_analyse_refuses_rather_than_degrading():
+    """The silent fallback this replaces was the real defect (measured 2026-09-22).
+
+    spaCy refuses text over 1,000,000 characters with ValueError E088, and the engine
+    used to catch that and mask with regexes instead, while the package recorded
+    `masked: true` at level `standard` and `ihar check` still reported `engine:
+    presidio`. Nobody could see the weaker promise. Now the call raises and the caller
+    decides; the gateway refuses.
+    """
+    class Refusing:
+        def analyze(self, text, language):
+            raise ValueError("[E088] Text of length 1000001 exceeds maximum of 1000000")
+
+    instrument = engine.Masker("standard")
+    instrument._analyzer = Refusing()
+    instrument._engine = "presidio"
+    try:
+        instrument.mask("contact dev@example.invalid")
+    except engine.MaskingUnavailable as reason:
+        assert "E088" in str(reason), reason
+        assert "presidio" in str(reason), reason
+    else:
+        raise AssertionError("a failed analysis was masked by something weaker in silence")
+
+
+def test_the_engine_failure_reaches_the_gateway_as_a_refusal():
+    class Refusing:
+        def analyze(self, text, language):
+            raise ValueError("[E088] too long")
+
+    instrument = engine.Masker("standard")
+    instrument._analyzer = Refusing()
+    instrument._engine = "presidio"
+    body = {"messages": [{"role": "user", "content": "anything at all"}]}
+    try:
+        shapes.transform(body, instrument, family="anthropic", enforced=True)
+    except engine.MaskingUnavailable:
+        return
+    raise AssertionError("the body was transformed although the promised engine never ran")
 
 
 def _rejects(body, *, enforced, needle):
