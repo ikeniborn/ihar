@@ -72,7 +72,8 @@ class AuthLeaseTests(unittest.TestCase):
     def _run_ihar(self, *arguments: str, guard_fd: str | None = None,
                   legacy_guard_fd: str | None = None,
                   binary_source: str | None = None,
-                  tty_reply: str | None = None) -> subprocess.CompletedProcess:
+                  tty_reply: str | None = None,
+                  profile_root: Path | None = None) -> subprocess.CompletedProcess:
         root = Path(__file__).resolve().parents[1]
         project = self.root / "project"
         project.mkdir(exist_ok=True)
@@ -90,6 +91,8 @@ class AuthLeaseTests(unittest.TestCase):
         environment = dict(os.environ, IHAR_STORE=str(self.store),
                            IHAR_STATE_ROOT=str(self.root / "state"), IHAR_PY=sys.executable,
                            IHAR_CODEX_BIN=str(binary), IHAR_LOCKFILE=str(root / ".ihar-lockfile.json"))
+        if profile_root is not None:
+            environment["IHAR_ROOT"] = str(profile_root)
         if guard_fd is not None:
             environment["IHAR_GUARD_FD"] = guard_fd
         if legacy_guard_fd is not None:
@@ -139,6 +142,70 @@ class AuthLeaseTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 3, result.stderr)
                 self.assertFalse(marker.exists(), result.stderr)
         first.wait(timeout=8)
+
+    def test_busy_owner_blocks_claude_microvm_before_codex_preflight(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        profile_root = self.root / "profile-root"
+        (profile_root / "manifests" / "profiles").mkdir(parents=True)
+        shutil.copy2(project_root / "manifests" / "profiles" / "isolated.json",
+                     profile_root / "manifests" / "profiles" / "isolated.json")
+        (profile_root / "lib").symlink_to(project_root / "lib", target_is_directory=True)
+        first = self._guardian("import time; time.sleep(5)")
+        self._wait_for(self.record)
+        result = self._run_ihar("--profile", "isolated", "--dry-run", "claude",
+                                profile_root=profile_root)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("another Codex runtime owns the shared login", result.stderr)
+        self.assertFalse((self.root / "app-server-started").exists())
+        first.wait(timeout=8)
+
+    def test_auth_vendor_cannot_run_before_child_binding(self) -> None:
+        from ihar.codex import guardian
+        marker = self.root / "detached-auth-descendant"
+        vendor = self.root / "fast-auth-vendor"
+        vendor.write_text("#!/bin/sh\n"
+                          f"setsid sh -c 'touch {str(marker)!r}; sleep 1' >/dev/null 2>&1 &\n"
+                          "exit 19\n")
+        vendor.chmod(0o700)
+        def refuse_binding(_fd: int, operation: str, _fields: dict) -> dict:
+            self.assertEqual(operation, "bind-child")
+            for _ in range(50):
+                if marker.exists():
+                    break
+                time.sleep(.01)
+            raise auth_owner.AuthOwnerError("synthetic binding refusal")
+        with mock.patch.object(guardian, "request", side_effect=refuse_binding):
+            with self.assertRaisesRegex(auth_owner.AuthOwnerError,
+                                        "synthetic binding refusal"):
+                guardian._run_auth_vendor(3, [str(vendor), "login"], dict(os.environ))
+        self.assertFalse(marker.exists(), "vendor or descendant ran before binding")
+
+    def test_fast_exit_auth_vendor_keeps_stage_until_detached_child_exits(self) -> None:
+        observed = self.root / "detached-auth-stage"
+        still_present = self.root / "detached-auth-stage-still-present"
+        source = ("#!/bin/sh\n"
+                  "case \"$1\" in login) "
+                  f"setsid sh -c 'printf %s \"$CODEX_HOME\" > {str(observed)!r}; "
+                  f"sleep 1.5; test -d \"$CODEX_HOME\" && touch {str(still_present)!r}' "
+                  "</dev/null >/dev/null 2>&1 & exit 19 ;; esac\n")
+        result: list[subprocess.CompletedProcess] = []
+        worker = threading.Thread(target=lambda: result.append(
+            self._run_ihar("codex", "--", "login", binary_source=source)))
+        worker.start()
+        for _ in range(250):
+            if observed.exists():
+                break
+            time.sleep(.02)
+        self.assertTrue(observed.exists(), "detached auth child did not start")
+        stage = Path(observed.read_text())
+        self.assertTrue(stage.is_dir())
+        self.assertTrue(self.record.exists())
+        worker.join(timeout=15)
+        self.assertFalse(worker.is_alive(), "guardian did not quiesce")
+        self.assertEqual(result[0].returncode, 19, result[0].stderr)
+        self.assertTrue(still_present.exists(), "stage was removed while child used it")
+        self.assertFalse(stage.exists())
+        self.assertFalse(self.record.exists())
 
     def test_spoofed_guard_descriptor_fails_before_codex_start(self) -> None:
         result = self._run_ihar("--dry-run", "codex", guard_fd="3")
