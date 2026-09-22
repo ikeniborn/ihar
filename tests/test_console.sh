@@ -70,4 +70,41 @@ mapfile -t stray < <(find "$IHAR_STATE_ROOT/console" -type f \
   ! -name '*.json' ! -name token ! -name lock ! -name broker.err 2>/dev/null)
 assert_eq "no terminal output is written to disk" 0 "${#stray[@]}"
 
+# The status hook writes one badge per session, keyed by the payload's own id.
+runtime="$IHAR_TEST_TMP/runtime"
+status_state="$IHAR_TEST_TMP/hook-state"
+mkdir -p "$runtime" "$status_state"
+cat > "$runtime/ihar-policy.json" <<EOF
+{"vendor":"codex","profile":"standard","runtime_hash":"deadbeef","state":"$status_state"}
+EOF
+CODEX_HOME="$runtime" python3 -I "$ROOT/hooks/session-status.py" --vendor codex --state waiting-approval <<'EOF'
+{"hook_event_name":"PermissionRequest","session_id":"codex-badge","tool_input":{}}
+EOF
+badge="$status_state/status/codex-codex-badge.json"
+assert_exit "the status hook writes a badge" 0 test -f "$badge"
+assert_contains "the badge carries the state" "$(cat "$badge")" '"state": "waiting-approval"'
+assert_contains "the badge is keyed by the payload session" "$(cat "$badge")" '"vendor_session_id": "codex-badge"'
+assert_eq "the badge is owner-only" 600 "$(stat -c '%a' "$badge")"
+
+CODEX_HOME="$runtime" python3 -I "$ROOT/hooks/session-status.py" --vendor codex --state idle <<'EOF'
+{"hook_event_name":"Stop","session_id":"codex-badge","tool_input":{}}
+EOF
+assert_contains "a later event replaces the badge" "$(cat "$badge")" '"state": "idle"'
+
+# An unknown state writes nothing rather than inventing one, and the hook stays fail-soft.
+CODEX_HOME="$runtime" python3 -I "$ROOT/hooks/session-status.py" --vendor codex --state confused <<'EOF'
+{"hook_event_name":"Stop","session_id":"codex-other","tool_input":{}}
+EOF
+assert_exit "an unknown state writes no badge" 1 test -f "$status_state/status/codex-codex-other.json"
+assert_exit "a payload without a session writes no badge" 0 bash -c \
+  'CODEX_HOME="$1" python3 -I "$2/hooks/session-status.py" --vendor codex --state idle <<< "{\"hook_event_name\":\"Stop\"}"' _ "$runtime" "$ROOT"
+
+# The four entries are in the manifest, on the coarse events and on neither tool call.
+manifest="$(cat "$ROOT/manifests/hooks.json")"
+for event in SessionStart PermissionRequest Stop SessionEnd; do
+  assert_contains "the manifest carries the $event badge" "$manifest" "\"event\": \"$event\""
+done
+assert_exit "no status hook runs on PreToolUse" 1 bash -c \
+  'python3 -c "import json,sys; m=json.load(open(sys.argv[1])); sys.exit(0 if [e for e in m[\"entries\"] if e[\"script\"]==\"session-status.py\" and e[\"event\"]==\"PreToolUse\"] else 1)" "$1"' _ "$ROOT/manifests/hooks.json"
+
 finish

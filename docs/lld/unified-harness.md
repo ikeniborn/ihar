@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 16 (console broker, supervisor and boundary implemented; gate G6 evidenced) |
+| Status | revision 17 (console status hook, sidebar assembly and thread projection implemented) |
 | Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -911,7 +911,11 @@ Both records are metadata; `ihar.jsonio.check` rejects an unknown key, and neith
 
 **A console tab names its own launch.** The broker mints the `ihar_id` before spawning and passes it as `IHAR_CONSOLE_LAUNCH_ID`, which the lifecycle adopts after the handoff and resume ids and before minting one of its own (§3.3). Without it the record and the session index would disagree on the identity of the same session, and the sidebar join of §10.4 would have nothing to join on.
 
-**Sidebar.** One list, grouped by project, built from three sources and nothing else: the index reader of §10.4 for every project state under `$IHAR_STATE_ROOT`, the session records above for what is live in this window, and the status records below for the badge. Discovery is the marker file of §4.1 — a directory without a valid `home.json` is skipped, not guessed at. Rename writes through the adapter (`claude -n`, Codex `thread/name/set`, §19) so the native pickers show the same title, and resume opens a new tab through `ihar sessions resume <id>`.
+**Sidebar.** One list, grouped by project, built from three sources and nothing else: the merge of §10.4 for every project state under `$IHAR_STATE_ROOT`, the session records above for what is live in this window, and the status records below for the badge. Discovery is the marker file of §4.1 — a directory without a valid `home.json` is skipped, not guessed at. `GET /api/sidebar` answers it, cached for five seconds because the list is polled and changes on human timescales; `?refresh=1` forces a rebuild.
+
+The merge runs the **file and SQLite readers only**: the broker passes neither a Codex binary nor a daemon socket, so drawing a list can never start a vendor process. A session with no badge is reported as `unknown` rather than as running, and a badge outlives its session — the sidebar shows the last state the hook recorded, because a badge that disappeared would be indistinguishable from a session that never reported.
+
+Rename writes through the adapter by running `ihar sessions name <id> <title>` in the project (`claude -n`, Codex `thread/name/set`, §19), so the native pickers show the same title and the console reimplements no adapter call; `POST /api/sessions/<state-id>/<ihar-id>/name` is the route. Resume opens a new tab through `ihar sessions resume <id>`.
 
 **Status contract.** The `session-status` hooks of §6.1 write one file per vendor session under the project's own state:
 
@@ -922,7 +926,7 @@ Both records are metadata; `ihar.jsonio.check` rejects an unknown key, and neith
 
 Keyed by the payload's `session_id`, so it needs none of the launch-claim machinery of §10.3 and cannot attribute a status to the wrong session under a Codex daemon. The sidebar joins it to the index on `(vendor, vendor_session_id)`, the join §10.4 already performs. A stale file — process gone, no `stopped` written — is shown as unknown after the reader finds no live process, never as running.
 
-**Thread projection (R10).** Selecting a session opens a read-only history pane beside the terminal. The projection walks `handoff_from` and `handoff_to` transitively through the index to collect the chain, calls each node's adapter `get_session()`, normalises to `{vendor, role, text, at}`, orders by timestamp, and inserts a marker between consecutive nodes carrying that handoff's `bytes`, `masking_level` and truncation flags from §11.1. The marker is the point of the pane: it is where the next agent received a bounded package instead of the preceding messages, and a reader who cannot see it would mistake a summary for a memory. The projection is assembled per request, held in memory, and never written to disk — so it is not a transcript store, and a vendor session that has been rotated away leaves a labelled gap rather than a fabricated one. It is not masked, because it never leaves the machine; masking governs model requests (§8.4) and handoff packages (§11.2), and applying it to a local viewer would hide from the user what the agent already saw.
+**Thread projection (R10).** Selecting a session opens a read-only history pane beside the terminal, answered by `GET /api/thread/<state-id>/<ihar-id>`. The projection walks `handoff_from` back to the first session and `handoff_to` forward to the last, so any session in a chain shows the whole chain; reads each node with the transcript reader the handoff builder uses (§11.2 step 6); orders the messages; and inserts a marker between consecutive nodes carrying that handoff's `bytes`, `masking_level` and history mode from §11.1. A node whose vendor store no longer holds the session contributes a labelled entry in `gaps` and no messages at all. The marker is the point of the pane: it is where the next agent received a bounded package instead of the preceding messages, and a reader who cannot see it would mistake a summary for a memory. The projection is assembled per request, held in memory, and never written to disk — so it is not a transcript store, and a vendor session that has been rotated away leaves a labelled gap rather than a fabricated one. It is not masked, because it never leaves the machine; masking governs model requests (§8.4) and handoff packages (§11.2), and applying it to a local viewer would hide from the user what the agent already saw.
 
 **Tab kinds.** `kind: "pty"` is the shipped one and carries every guarantee of the resolved profile. `kind: "acp"` (S13) runs `ihar acp <vendor>` and renders ACP updates as a chat; the broker offers it only when the project profile has `acp: allow`, and the UI labels it with the two gaps §13.3 names, because two tab kinds that look alike and guarantee differently is the confusion this labelling exists to prevent. A vendor change is never implicit in either kind: the handoff button runs `ihar switch --to <vendor>` (§11.4) and opens the resulting session as a new tab, linked in the sidebar.
 
@@ -983,7 +987,7 @@ With `--migrate-store`, eligible legacy content is copied into that same store s
 | Handoff transcript export | §11.1, §11.2 | `$IHAR_STATE/handoff/<ihar_id>-transcript.md` |
 | Console daemon record | §13.2 | `$IHAR_STATE_ROOT/console/daemon.json` |
 | Console session record | §13.2 | `$IHAR_STATE_ROOT/console/s/<sid>.json` |
-| Session status record | §13.2 | `$IHAR_STATE/status/*.json` |
+| Session status record | §13.2 | `$IHAR_STATE/status/<vendor>-<session>.json` |
 | Profile definition | §12.1 | `manifests/profiles/*.json` |
 | Daemon record | §5.5 | `$IHAR_STATE/daemons/codex.json` |
 | Conformance record | §6.6 | `$IHAR_STORE/verification/*.json` |
@@ -1078,7 +1082,8 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | console | live broker on a different release digest | fail-closed, restart the broker | 3 |
 | console | `max_sessions` reached | fail-closed per request | 409 |
 | console | supervisor socket unreachable for a recorded session | fail-soft, tab shown as detached | 0 |
-| console | status record present with no live process | fail-soft, badge shown as unknown | 0 |
+| console | no status record for a session | fail-soft, badge shown as unknown | 0 |
+| console | a project state whose index or vendor store cannot be read | fail-soft, that project reports its error and the window keeps its other projects | 0 |
 | console | adapter read fails while projecting a thread | fail-soft, labelled gap in the pane | 0 |
 | handoff | transcript render or its masking fails | fail-soft, degrade to `summary` with a warning | 0 |
 

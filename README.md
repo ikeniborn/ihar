@@ -178,10 +178,18 @@ Terminal output is never written to disk: it lives in a bounded in-memory buffer
 tab and is replayed when a browser reattaches. A tab outlives the broker, so restarting
 the console — or updating ihar — does not kill the agents running in it.
 
+The broker also answers what the window will show: one list of every project on the
+machine with each session's vendor, title, profile and live state, and a read-only
+thread that follows a `switch` across vendors and marks where the handoff cut the
+context. A session whose vendor store no longer holds it appears as a labelled gap
+rather than invented text, because ihar keeps no copy. States come from a hook on the
+four lifecycle events both agents share — running, waiting for approval, idle, stopped
+— so the list can say which agent is waiting for you.
+
 One caveat worth stating plainly: a console token starts launches in every project
 state on this machine, which is wider than a single launch. `ihar check` prints that
 reach. The browser interface itself lands in the next slice; today the broker serves
-its API and terminal sockets.
+that data and the terminal sockets.
 
 ## Configure
 
