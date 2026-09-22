@@ -73,7 +73,8 @@ class AuthLeaseTests(unittest.TestCase):
                   legacy_guard_fd: str | None = None,
                   binary_source: str | None = None,
                   tty_reply: str | None = None,
-                  profile_root: Path | None = None) -> subprocess.CompletedProcess:
+                  profile_root: Path | None = None,
+                  python_binary: Path | None = None) -> subprocess.CompletedProcess:
         root = Path(__file__).resolve().parents[1]
         project = self.root / "project"
         project.mkdir(exist_ok=True)
@@ -89,7 +90,8 @@ class AuthLeaseTests(unittest.TestCase):
             if not target.exists():
                 shutil.copytree(root / name, target)
         environment = dict(os.environ, IHAR_STORE=str(self.store),
-                           IHAR_STATE_ROOT=str(self.root / "state"), IHAR_PY=sys.executable,
+                           IHAR_STATE_ROOT=str(self.root / "state"),
+                           IHAR_PY=str(python_binary or sys.executable),
                            IHAR_CODEX_BIN=str(binary), IHAR_LOCKFILE=str(root / ".ihar-lockfile.json"))
         if profile_root is not None:
             environment["IHAR_ROOT"] = str(profile_root)
@@ -159,6 +161,49 @@ class AuthLeaseTests(unittest.TestCase):
         self.assertFalse((self.root / "app-server-started").exists())
         first.wait(timeout=8)
 
+    def test_profile_switch_to_microvm_refuses_unadmitted_claude(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        profile_root = self.root / "profile-root"
+        shutil.copytree(project_root / "manifests", profile_root / "manifests")
+        profiles = profile_root / "manifests" / "profiles"
+        (profile_root / "lib").symlink_to(project_root / "lib", target_is_directory=True)
+        (profile_root / "hooks").symlink_to(project_root / "hooks", target_is_directory=True)
+        (profile_root / "skills").symlink_to(project_root / "skills", target_is_directory=True)
+        standard = profiles / "standard.json"
+        microvm = profiles / "microvm.json"
+        profile = json.loads((project_root / "manifests" / "profiles" / "standard.json").read_text())
+        standard.write_text(json.dumps(profile))
+        profile.update(sandbox="microvm", netpolicy="isolated")
+        microvm.write_text(json.dumps(profile))
+        first_read = self.root / "first-profile-read"
+        second_read = self.root / "second-profile-read"
+        interpreter = self.root / "profile-switch-interpreter"
+        interpreter.write_text("#!/bin/sh\n"
+                               f"{sys.executable!r} \"$@\"\n"
+                               "status=$?\n"
+                               'if [ "$1" = -m ] && [ "$2" = ihar.profile_read ]; then\n'
+                               f"  if [ ! -e {str(first_read)!r} ]; then\n"
+                               f"    touch {str(first_read)!r}\n"
+                               f"    cp {str(microvm)!r} {str(standard)!r}\n"
+                               "  else\n"
+                               f"    touch {str(second_read)!r}\n"
+                               "  fi\n"
+                               "fi\n"
+                               "exit \"$status\"\n")
+        interpreter.chmod(0o700)
+        claude_binary = self.root / "claude"
+        claude_binary.write_text("#!/bin/sh\ncase \"$1\" in --version) echo 2.1.274 ;; esac\n")
+        claude_binary.chmod(0o700)
+        with mock.patch.dict(os.environ, {"IHAR_CLAUDE_BIN": str(claude_binary)}):
+            result = self._run_ihar("--dry-run", "claude", profile_root=profile_root,
+                                    python_binary=interpreter)
+        self.assertTrue(first_read.exists())
+        self.assertTrue(second_read.exists())
+        self.assertFalse((self.root / "app-server-started").exists(),
+                         "Codex subprocess started without guardian admission")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("Codex guardian admission cannot be verified", result.stderr)
+
     def test_auth_vendor_cannot_run_before_child_binding(self) -> None:
         from ihar.codex import guardian
         marker = self.root / "detached-auth-descendant"
@@ -206,6 +251,86 @@ class AuthLeaseTests(unittest.TestCase):
         self.assertTrue(still_present.exists(), "stage was removed while child used it")
         self.assertFalse(stage.exists())
         self.assertFalse(self.record.exists())
+
+    def test_auth_helper_survives_term_during_descendant_quiescence(self) -> None:
+        marker = self.root / "signal-descendant-ready"
+        descendant_done = self.root / "signal-descendant-done"
+        vendor_pid = self.root / "signal-vendor-pid"
+        stage = self.root / "signal-auth-stage"
+        completed = self.root / "signal-auth-abort-completed"
+        status_file = self.root / "signal-auth-status"
+        vendor = self.root / "signal-fast-auth-vendor"
+        vendor.write_text("#!/bin/sh\n"
+                          f"setsid sh -c 'touch {str(marker)!r}; sleep 2; "
+                          f"touch {str(descendant_done)!r}' </dev/null >/dev/null 2>&1 &\n"
+                          "exit 19\n")
+        vendor.chmod(0o700)
+        script = ("import os\n"
+                  "from pathlib import Path\n"
+                  "from ihar.codex import guardian\n"
+                  f"stage = Path({str(stage)!r})\n"
+                  "def request(_fd, operation, fields):\n"
+                  "    if operation == 'auth-stage':\n"
+                  "        stage.mkdir()\n"
+                  "        return {'stage': str(stage)}\n"
+                  "    if operation == 'bind-child':\n"
+                  f"        Path({str(vendor_pid)!r}).write_text(str(fields['pid']))\n"
+                  "        return {}\n"
+                  "    assert operation == 'auth-abort'\n"
+                  "    assert fields['stage'] == str(stage)\n"
+                  "    stage.rmdir()\n"
+                  f"    Path({str(completed)!r}).write_text('aborted')\n"
+                  "    return {}\n"
+                  "guardian.request = request\n"
+                  f"status = guardian._main(['auth', '3', '--', {str(vendor)!r}, 'login'])\n"
+                  f"Path({str(status_file)!r}).write_text(str(status))\n")
+        helper = subprocess.Popen(
+            [sys.executable, "-c", script],
+            env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "lib" / "python")),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        def cleanup() -> None:
+            if helper.poll() is None:
+                helper.kill()
+            helper.wait(timeout=5)
+            helper.stderr.close()
+        self.addCleanup(cleanup)
+        self._wait_for(marker)
+        self._wait_for(vendor_pid)
+        pid = int(vendor_pid.read_text())
+        for _ in range(100):
+            try:
+                observed = Path(f"/proc/{pid}/stat").read_text()
+            except OSError:
+                break
+            if observed[observed.rfind(")") + 2] == "Z":
+                break
+            time.sleep(.01)
+        else:
+            self.fail("fast-exit vendor did not exit")
+        time.sleep(.05)
+        self.assertFalse(descendant_done.exists())
+        self.assertTrue(stage.is_dir())
+        helper.send_signal(signal.SIGTERM)
+        self.assertEqual(helper.wait(timeout=5), 0, helper.stderr.read())
+        self.assertEqual(completed.read_text(), "aborted")
+        self.assertEqual(status_file.read_text(), "143")
+        self.assertTrue(descendant_done.exists())
+        self.assertFalse(stage.exists())
+
+    def test_auth_quiescence_retries_transient_process_observation(self) -> None:
+        from ihar.codex import guardian
+        with (mock.patch.object(guardian, "request", return_value={}),
+              mock.patch.object(auth_owner, "_process_table", side_effect=[
+                  auth_owner.AuthOwnerError("Codex process identity cannot be verified"),
+                  {}, {},
+              ])):
+            try:
+                status = guardian._run_auth_vendor(3, ["/bin/true", "login"], dict(os.environ))
+            except auth_owner.AuthOwnerError as error:
+                self.fail(f"transient observation escaped quiescence: {error}")
+        self.assertEqual(status, 0)
 
     def test_spoofed_guard_descriptor_fails_before_codex_start(self) -> None:
         result = self._run_ihar("--dry-run", "codex", guard_fd="3")

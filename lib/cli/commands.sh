@@ -32,6 +32,12 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
       *) ihar_die 2 "profile '$IHAR_PROFILE' does not allow ${vendor^} web" ;;
     esac
   fi
+  if [[ "$vendor" == claude && "$IHAR_PROFILE_SANDBOX" == microvm ]]; then
+    [[ -z "${IHAR_CODEX_GUARD_FD:-}" && -n "${IHAR_GUARD_FD:-}" ]] \
+      || ihar_die 3 "Codex guardian admission cannot be verified"
+    ihar_python ihar.codex.guardian admit "$IHAR_GUARD_FD" \
+      || ihar_die 3 "Codex guardian admission cannot be verified"
+  fi
   # 3. store integrity, at the severity the profile asks for
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR
   local native_binary

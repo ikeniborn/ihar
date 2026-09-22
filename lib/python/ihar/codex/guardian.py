@@ -478,42 +478,60 @@ def _run_auth_vendor(fd: int, command: list[str], environment: dict[str, str]) -
     auth_owner.require_descendant_supervision()
     gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
     process = None
-    try:
-        try:
-            process = subprocess.Popen([sys.executable, "-c", _BOOT, str(gate_read), *command],
-                                       env=environment, pass_fds=(gate_read,),
-                                       start_new_session=True)
-            request(fd, "bind-child", {"pid": process.pid, "binary": command[0]})
-            os.write(gate_write, b"1")
-        finally:
-            os.close(gate_read)
-            os.close(gate_write)
-        def forward(number: int, _frame: object) -> None:
+    interrupted = 0
+    status = None
+    def forward(number: int, _frame: object) -> None:
+        nonlocal interrupted
+        interrupted = number
+        if process is not None:
             try:
                 os.killpg(process.pid, number)
             except ProcessLookupError:
                 pass
-        previous = {number: signal.signal(number, forward) for number in (signal.SIGINT, signal.SIGTERM)}
+    previous = {number: signal.signal(number, forward)
+                for number in (signal.SIGINT, signal.SIGTERM)}
+    try:
         try:
-            status = process.wait()
+            if interrupted:
+                raise auth_owner.AuthOwnerError("Codex authentication was interrupted")
+            process = subprocess.Popen([sys.executable, "-c", _BOOT, str(gate_read), *command],
+                                       env=environment, pass_fds=(gate_read,),
+                                       start_new_session=True)
+            request(fd, "bind-child", {"pid": process.pid, "binary": command[0]})
+            if interrupted:
+                raise auth_owner.AuthOwnerError("Codex authentication was interrupted")
+            os.write(gate_write, b"1")
+        finally:
+            os.close(gate_read)
+            os.close(gate_write)
+        status = process.wait()
+    finally:
+        try:
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            if process is not None:
+                while True:
+                    auth_owner._reap_children()
+                    try:
+                        active = (auth_owner._group_active({"pgrp": process.pid})
+                                  or auth_owner._descendants_active(os.getpid()))
+                    except auth_owner.AuthOwnerError:
+                        # A disappearing /proc entry is uncertainty, never proof of exit.
+                        time.sleep(0.05)
+                        continue
+                    if not active:
+                        break
+                    time.sleep(0.05)
         finally:
             for number, handler in previous.items():
                 signal.signal(number, handler)
-        return 128 - status if status < 0 else status
-    finally:
-        if process is not None and process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            process.wait()
-        if process is not None:
-            while True:
-                auth_owner._reap_children()
-                if not (auth_owner._group_active({"pgrp": process.pid})
-                        or auth_owner._descendants_active(os.getpid())):
-                    break
-                time.sleep(0.05)
+    if interrupted:
+        return 128 + interrupted
+    return 128 - status if status < 0 else status
 
 
 def _main(arguments: list[str]) -> int:
