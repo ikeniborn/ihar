@@ -1,6 +1,6 @@
 ---
 review:
-  plan_hash: 773a4bd68da12c9d
+  plan_hash: 85a78a76c93c8f3c
   last_run: 2026-09-22
   phases:
     structure: { status: passed }
@@ -195,9 +195,9 @@ def test_busy_owner_blocks_prelaunch_app_server(self):
 
 ### Task 6: Keep daemon and attached clients in the original owner (R2)
 
-**Files:** Modify `lib/python/ihar/codex/guardian.py`, `lib/python/ihar/codex/daemon.py`, `lib/codex/daemon.sh`, `lib/cli/commands.sh`; test `tests/test_codex_auth_lease.py`, `tests/test_daemon.sh`, `tests/test_web.sh`.
+**Files:** Modify `ihar.sh`, `lib/python/ihar/codex/guardian.py`, `lib/python/ihar/codex/daemon.py`, `lib/codex/daemon.sh`, `lib/cli/commands.sh`; add `lib/python/ihar/codex/remote_sandbox.py`; test `tests/test_codex_auth_lease.py`, `tests/test_daemon.sh`, `tests/test_web.sh`.
 
-**Interfaces:** Daemon start and remote-control setup use Task 4's owner through authenticated control, never a new daemon guardian. When the initiating shell exits, that guardian remains alive while the exact daemon PID/start identity, socket inode, or plausible descendant is active. `guardian.attach(runtime, config_hash, argv, stdio_fds)` uses an owner-only Unix control socket with peer-credential verification and passes standard-I/O descriptors to the original guardian; only that guardian spawns and tracks the attached client. Attachment requires exact runtime/hash and socket identity plus proof that the attached client is protocol-only rather than a second credential writer; absent proof, exit 3. Stop/restart requests go through the same owner and release only after verified daemon quiescence.
+**Interfaces:** Daemon start and remote-control setup use Task 4's owner through authenticated control, never a new daemon guardian. When the initiating shell exits, that guardian remains alive while the exact daemon PID/start identity, socket inode, or plausible descendant is active. `guardian.attach(runtime, config_hash, argv, stdio_fds)` uses an owner-only Unix control socket with peer-credential verification and passes standard-I/O descriptors to the original guardian; only that guardian spawns and tracks the attached client. Before vendor exec, `remote_sandbox` creates a Linux user/mount namespace, bind-mounts the verified runtime and canonical auth directory read-only at their original absolute paths, exposes only declared non-credential client state as writable, drops mount capability, and sets `no_new_privs`. It verifies the live runtime link and canonical target only through nofollow identity/read/mount evidence. Write, truncate, replace, unlink, and symlink-replacement probes target fabricated adjacent sentinels created before the read-only remount, never live credential paths. Only after every sentinel mutation is refused may the guardian bind and supervise the exact remote client PID and descendants. Missing namespace support, failed setup/probe, unsupported platform, different generation, or uncertain teardown exits 3 without starting the vendor client. Stop/restart requests go through the same owner and release only after verified daemon quiescence.
 
 Test anchor in `tests/test_codex_auth_lease.py`:
 
@@ -209,9 +209,9 @@ def test_launcher_exit_does_not_release_live_daemon(self):
     self.assertFalse(self.second_vendor_start_marker.exists())
 ```
 
-- [ ] Add failing fake-daemon tests for launcher exit, same-owner attachment, different generation refusal, daemon stop/restart, guardian crash, remote-control child start, and a client that can independently write credentials. Fix `tests/test_web.sh`'s fake daemon so its reported PID and socket remain live for identity checks; do not weaken production checks. Run `PYTHONPATH=lib/python python3 tests/test_codex_auth_lease.py`, `bash tests/test_daemon.sh`, and `bash tests/test_web.sh`; expect the new cases to fail before implementation.
-- [ ] Remove the separate daemon `acquire`/guardian route. Have the original guardian register the daemon's exact process and socket through Task 4's control channel, accept same-owner clients through authenticated Unix-socket attachment with descriptor passing, and retain the record after launcher exit. Refuse an attachment whose credential-write topology is unproved; keep unverified start/stop outcomes blocking.
-- [ ] Run the same three focused checks; expect exit 0. Confirm the web fixture proves a real live PID/socket instead of merely suppressing the new identity refusal.
+- [ ] Preserve the review-clean daemon/control subset at `08209e9`. Add failing namespace-boundary tests for launcher exit, same-owner attachment, different generation refusal, guardian crash, remote-control child start, and non-destructive exact-path identity/read/mount checks. Exercise direct write, truncate, rename-over, unlink, and symlink replacement only against fabricated adjacent sentinels; prove the live credential bytes and identities remain unchanged. Test missing namespace support and failed capability drop as exit 3 before the vendor marker. Keep the live PID/socket web fixture; do not weaken production identity checks. Run `PYTHONPATH=lib/python python3 tests/test_codex_auth_lease.py`, `bash tests/test_daemon.sh`, and `bash tests/test_web.sh`; expect new attachment cases to fail before implementation.
+- [ ] Add the minimal namespace helper and attach route. The helper must finish mounts and refusal probes, drop mount capability, and set `no_new_privs` before releasing an exec gate. Have the original guardian pass stdio descriptors, register the exact client PID/start identity and plausible descendants, and retain daemon ownership after launcher exit. Do not copy credentials or treat file modes/argv as enforcement. Keep every unverified start, attachment, stop, or teardown outcome blocking.
+- [ ] Run the same three focused checks; expect exit 0. Confirm the fake remote client can use the verified daemon socket and declared client-state path but cannot mutate either credential path through any tested filesystem operation. Confirm unsupported enforcement refuses instead of falling back.
 - [ ] Commit with `fix(auth): retain owner across Codex daemon lifetime`.
 
 ### Task 7: Guard check, conformance, install/update, and switch (R2)
