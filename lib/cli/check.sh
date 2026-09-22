@@ -99,7 +99,7 @@ _ihar_check_file_matches() { # <desired> <active> <relative>
 # ihar_check_diff — compare temporary desired renders with active homes.
 ihar_check_diff() (
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
-  local temp="" state vendor desired active file relative difference found=false gateway_key port
+  local temp="" state vendor desired active file relative difference found=false gateway_key port auth_diagnostic
   trap '[[ -z "$temp" ]] || rm -rf -- "$temp"' EXIT
   temp="$(mktemp -d "${TMPDIR:-/tmp}/ihar-check-diff-XXXXXX")" || return 1
   state="$(_ihar_project_state)"
@@ -120,16 +120,25 @@ ihar_check_diff() (
     desired="$temp/$vendor"
     ihar_render_all "$vendor" "$desired"
     active="$(_ihar_check_runtime "$vendor" "$state")" || return
+    printf '%s selected runtime generation %s (effective-mcp-identity included)\n' \
+      "$vendor" "$(basename "$(dirname "$active")")"
+    if [[ "$vendor" == codex && -d "$active" ]]; then
+      auth_diagnostic="$(ihar_python ihar.check_result auth-diff "$active" "$IHAR_STORE")" || return
+      printf '%s\n' "$auth_diagnostic"
+      [[ "$auth_diagnostic" == 'codex mutable-link: valid; auth-owner: no recorded owner' ]] || found=true
+    fi
     while IFS= read -r -d '' file; do
       relative="${file#"$desired"/}"
       if [[ -z "$active" || ! -f "$active/$relative" ]]; then
-        printf '%s %s missing from active runtime\n' "$vendor" "$relative"
+        printf '%s %s missing from selected runtime (%s)\n' "$vendor" "$relative" \
+          "$([[ "$relative" == mcp/ihar.json ]] && printf effective-mcp-identity || printf managed-setting-drift)"
         found=true
       elif ! difference="$(_ihar_check_file_matches "$file" "$active/$relative" "$relative")"; then
         if [[ "$relative" == settings.json ]]; then
-          printf '%s %s differs from active runtime at %s\n' "$vendor" "$relative" "${difference:-root}"
+          printf '%s %s managed-setting-drift at %s\n' "$vendor" "$relative" "${difference:-root}"
         else
-          printf '%s %s differs from active runtime\n' "$vendor" "$relative"
+          printf '%s %s differs from selected runtime (%s)\n' "$vendor" "$relative" \
+            "$([[ "$relative" == mcp/ihar.json ]] && printf effective-mcp-identity || printf managed-setting-drift)"
         fi
         found=true
       fi

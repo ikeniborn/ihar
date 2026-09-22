@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import sys
 import tomllib
+from contextlib import ExitStack
+from pathlib import Path
 
 from . import jsonio
 
@@ -427,6 +430,44 @@ def _receipt(argv: list[str]) -> int:
     return 0
 
 
+def _auth_diff(runtime: str, store: str) -> int:
+    """Report Codex link and lease categories without emitting credential bytes."""
+    from .codex import auth_owner
+
+    target = Path(runtime) / "auth.json"
+    try:
+        metadata = target.lstat()
+    except FileNotFoundError:
+        print("codex mutable-link: missing; auth-owner: unverified")
+        return 0
+    except OSError:
+        print("codex mutable-link: unverified; auth-owner: unverified")
+        return 0
+    if not stat.S_ISLNK(metadata.st_mode):
+        kind = "materialized" if stat.S_ISREG(metadata.st_mode) else "unsafe type"
+        print(f"codex mutable-link: {kind} credential preserved; user-approved recovery required")
+        return 0
+    try:
+        auth_owner.verify_runtime_link(runtime, store)
+        with ExitStack() as stack:
+            _root, _auth, owner = auth_owner._owner_directories(
+                auth_owner._lease_store(store), stack, create=False
+            )
+            record = auth_owner._read_owner(owner)
+        if record is None:
+            status = "no recorded owner"
+        elif not auth_owner.owner_identity_proven(record):
+            status = "unverified"
+        elif auth_owner.owner_is_active(record):
+            status = "busy"
+        else:
+            status = "quiescence unverified"
+        print(f"codex mutable-link: valid; auth-owner: {status}")
+    except (auth_owner.AuthOwnerError, OSError, ValueError, AttributeError, KeyError, TypeError):
+        print("codex mutable-link: unverified; auth-owner: unverified")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     try:
         if len(argv) == 2 and argv[0] in ("text", "json"):
@@ -438,6 +479,8 @@ def main(argv: list[str]) -> int:
             return 0
         if len(argv) == 5 and argv[0] == "receipt":
             return _receipt(argv[1:])
+        if len(argv) == 3 and argv[0] == "auth-diff":
+            return _auth_diff(argv[1], argv[2])
         if len(argv) == 2 and argv[0] == "validate-receipt":
             jsonio.read("install-receipt", argv[1])
             return 0

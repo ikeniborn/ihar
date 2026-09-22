@@ -354,4 +354,39 @@ managed = {
 sys.exit(0 if set(lock["hooks"]) == hooks and set(lock["managedHooks"]) == managed else 1)
 ' "$ROOT"
 
+# A pre-existing materialized runtime credential must remain untouched and its
+# synthetic payload must never enter diagnostic output.
+DIAGNOSTIC_ROOT="$IHAR_TEST_TMP/check-diagnostics"
+mkdir -p "$DIAGNOSTIC_ROOT/runtime" "$DIAGNOSTIC_ROOT/store/auth/codex"
+printf '%s' 'synthetic-credential-do-not-print' > "$DIAGNOSTIC_ROOT/runtime/auth.json"
+diagnostic_status=0
+diagnostic_output="$(python3 -m ihar.check_result auth-diff \
+  "$DIAGNOSTIC_ROOT/runtime" "$DIAGNOSTIC_ROOT/store" 2>&1)" || diagnostic_status=$?
+assert_eq "materialized Codex auth diagnostic is available" "0" "$diagnostic_status"
+assert_contains "materialized Codex auth is a mutable-link issue" "$diagnostic_output" "mutable-link: materialized"
+assert_contains "materialized Codex auth needs approval" "$diagnostic_output" "user-approved recovery"
+assert_exit "auth diagnostic never prints credential bytes" 1 \
+  grep -F 'synthetic-credential-do-not-print' <<<"$diagnostic_output"
+assert_eq "auth diagnostic preserves materialized bytes" 'synthetic-credential-do-not-print' \
+  "$(cat "$DIAGNOSTIC_ROOT/runtime/auth.json")"
+
+# A selected generation is visible even when no rendered file differs. The
+# effective MCP identity is already an input to that generation's hash.
+_test_generation_diagnostic() (
+  source "$ROOT/lib/cli/check.sh"
+  ihar_profile_resolve() { IHAR_PROFILE_GATEWAY=off; }
+  _ihar_project_state() { printf '%s\n' "$DIAGNOSTIC_ROOT/state"; }
+  ihar_render_all() { mkdir -p "$2"; }
+  _ihar_check_runtime() { printf '%s/r/abcdef12/%s\n' "$DIAGNOSTIC_ROOT/state" "$1"; }
+  IHAR_FLAG_PROFILE=standard
+  ihar_check_diff
+)
+generation_output="$(_test_generation_diagnostic)"
+assert_contains "check diff names selected Claude generation" "$generation_output" \
+  "claude selected runtime generation abcdef12"
+assert_contains "check diff names selected Codex generation" "$generation_output" \
+  "codex selected runtime generation abcdef12"
+assert_contains "check diff says MCP identity is in selection" "$generation_output" \
+  "effective-mcp-identity"
+
 finish

@@ -62,8 +62,8 @@ assert_exit "a profile needing an undelivered gateway is fail-closed" 3 \
 isolated_codex_status=0
 isolated_codex_output="$(ihar --profile isolated codex)" || isolated_codex_status=$?
 assert_eq "isolated Codex refuses before an unleased guest can start" "3" "$isolated_codex_status"
-assert_contains "isolated refusal names missing auth ownership" "$isolated_codex_output" \
-  "Codex isolated launch requires a credential-owner lease"
+assert_contains "isolated refusal names the earlier receipt gate" "$isolated_codex_output" \
+  "requires verified install receipt evidence"
 
 # --- the configuration hash reaches the runtime home ---------------------------------
 
@@ -101,7 +101,9 @@ for vendor in claude codex; do
 done
 enabled_diff="$(IWIKI_REMOTE_TOKEN=synthetic \
   IHAR_IWIKI_REMOTE_URL=https://wiki.example/mcp ihar check --diff)"
-assert_eq "check selects the same MCP generations as launch" "no differences" "$enabled_diff"
+assert_contains "check selects the same MCP generations as launch" "$enabled_diff" "no differences"
+assert_contains "check reports selected MCP-bound generation" "$enabled_diff" \
+  "effective-mcp-identity included"
 
 # --- the project's own configuration is what is read ------------------------------------
 #

@@ -68,6 +68,23 @@ proof records.
 An explicit recheck revokes the prior managed proof for each checked vendor. If it fails,
 the enforced profile stays closed until that vendor passes a later recheck.
 
+Codex uses one shared credential at `$IHAR_STORE/auth/codex/auth.json` across projects
+and profiles. Sign in with the existing `ihar codex -- login` entry point: only the
+authentication command runs in a private staging home, while ordinary launches keep
+the verified runtime link. Re-authentication when a shared credential already exists
+requires direct human approval; preserving its old bytes cannot undo a vendor-side
+account or token change. Only one ihar-managed Codex credential writer may run at a
+time, including a managed daemon or isolated guest. A busy or unverifiable owner is a
+refusal, not a fallback to an unprotected writer.
+
+Run `ihar check --diff` to see the selected runtime generation and bounded drift
+categories. The generation includes effective MCP selection, so changing available
+servers or a non-secret endpoint selects a new home without rewriting the old one.
+Claude's top-level string `theme` is vendor-owned; managed settings and unknown fields
+still fail closed. If a Codex runtime already contains a real `auth.json` in place of
+the required link, ihar preserves it and asks for a separate user-approved recovery
+proposal. Do not delete, move, or paste that credential as a troubleshooting step.
+
 The specialised Firecracker guest comes from a compatible, locally built asset directory.
 Its `firecracker`, `vmlinux` and `rootfs.ext4` files are checked against lockfile
 digests. The three SSH key files are checked for their expected format and pairing;
