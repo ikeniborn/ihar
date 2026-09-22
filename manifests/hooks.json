@@ -4,49 +4,93 @@
       "args": [],
       "event": "PreToolUse",
       "id": "security-pretool",
-      "profiles": ["*"],
-      "required_in": ["protected", "isolated"],
+      "profiles": [
+        "*"
+      ],
+      "required_in": [
+        "protected",
+        "isolated"
+      ],
       "rewrites_input": true,
       "script": "security-pretool.py",
       "timeout": 10,
-      "tools": ["shell", "file-read", "file-write", "mcp:*"],
-      "vendors": ["claude", "codex"]
+      "tools": [
+        "shell",
+        "file-read",
+        "file-write",
+        "mcp:*"
+      ],
+      "vendors": [
+        "claude",
+        "codex"
+      ]
     },
     {
       "args": [],
       "event": "PreToolUse",
       "id": "chain-gate-pre",
-      "profiles": ["*"],
+      "profiles": [
+        "*"
+      ],
       "script": "chain-gate.py",
       "timeout": 10,
-      "tools": ["skill", "file-read", "file-write", "shell"],
-      "vendors": ["claude", "codex"]
+      "tools": [
+        "skill",
+        "file-read",
+        "file-write",
+        "shell"
+      ],
+      "vendors": [
+        "claude",
+        "codex"
+      ]
     },
     {
-      "args": ["--post"],
+      "args": [
+        "--post"
+      ],
       "event": "PostToolUse",
       "id": "chain-gate-post",
-      "profiles": ["*"],
+      "profiles": [
+        "*"
+      ],
       "script": "chain-gate.py",
       "timeout": 10,
-      "tools": ["file-write"],
-      "vendors": ["claude", "codex"]
+      "tools": [
+        "file-write"
+      ],
+      "vendors": [
+        "claude",
+        "codex"
+      ]
     },
     {
       "args": [],
       "event": "PreToolUse",
       "id": "gwt-gate-pre",
-      "profiles": ["*"],
+      "profiles": [
+        "*"
+      ],
       "script": "gwt-gate.py",
       "timeout": 10,
-      "tools": ["mcp:iwiki*__wiki_update_page", "tool:wiki_update_page"],
-      "vendors": ["claude", "codex"]
+      "tools": [
+        "mcp:iwiki*__wiki_update_page",
+        "tool:wiki_update_page"
+      ],
+      "vendors": [
+        "claude",
+        "codex"
+      ]
     },
     {
-      "args": ["--post"],
+      "args": [
+        "--post"
+      ],
       "event": "PostToolUse",
       "id": "gwt-gate-post",
-      "profiles": ["*"],
+      "profiles": [
+        "*"
+      ],
       "script": "gwt-gate.py",
       "timeout": 10,
       "tools": [
@@ -57,27 +101,123 @@
         "mcp:iwiki*__wiki_update_page",
         "tool:wiki_update_page"
       ],
-      "vendors": ["claude", "codex"]
+      "vendors": [
+        "claude",
+        "codex"
+      ]
     },
     {
       "args": [],
       "event": "SessionStart",
       "id": "session-register",
-      "profiles": ["*"],
+      "profiles": [
+        "*"
+      ],
       "script": "session-register.py",
       "timeout": 5,
-      "tools": ["any"],
-      "vendors": ["claude", "codex"]
+      "tools": [
+        "any"
+      ],
+      "vendors": [
+        "claude",
+        "codex"
+      ]
     },
     {
       "args": [],
       "event": "SessionStart",
       "id": "handoff-inject",
-      "profiles": ["*"],
+      "profiles": [
+        "*"
+      ],
       "script": "handoff-inject.py",
       "timeout": 5,
-      "tools": ["any"],
-      "vendors": ["codex"]
+      "tools": [
+        "any"
+      ],
+      "vendors": [
+        "codex"
+      ]
+    },
+    {
+      "id": "session-status-running",
+      "event": "SessionStart",
+      "tools": [
+        "any"
+      ],
+      "script": "session-status.py",
+      "args": [
+        "--state",
+        "running"
+      ],
+      "timeout": 5,
+      "vendors": [
+        "claude",
+        "codex"
+      ],
+      "profiles": [
+        "*"
+      ]
+    },
+    {
+      "id": "session-status-waiting",
+      "event": "PermissionRequest",
+      "tools": [
+        "any"
+      ],
+      "script": "session-status.py",
+      "args": [
+        "--state",
+        "waiting-approval"
+      ],
+      "timeout": 5,
+      "vendors": [
+        "claude",
+        "codex"
+      ],
+      "profiles": [
+        "*"
+      ]
+    },
+    {
+      "id": "session-status-idle",
+      "event": "Stop",
+      "tools": [
+        "any"
+      ],
+      "script": "session-status.py",
+      "args": [
+        "--state",
+        "idle"
+      ],
+      "timeout": 5,
+      "vendors": [
+        "claude",
+        "codex"
+      ],
+      "profiles": [
+        "*"
+      ]
+    },
+    {
+      "id": "session-status-stopped",
+      "event": "SessionEnd",
+      "tools": [
+        "any"
+      ],
+      "script": "session-status.py",
+      "args": [
+        "--state",
+        "stopped"
+      ],
+      "timeout": 5,
+      "vendors": [
+        "claude",
+        "codex"
+      ],
+      "profiles": [
+        "*"
+      ]
     }
   ],
   "schema": 1

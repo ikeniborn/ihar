@@ -700,6 +700,20 @@ KINDS: dict[str, dict[str, Any]] = {
         },
         "rules": [],
     },
+    # LLD 13.2. Written by the status hook, read by the sidebar. Keyed by the payload's
+    # own session id, so it needs none of the launch-claim machinery of 10.3 and cannot
+    # attribute a state to the wrong session under a shared Codex daemon.
+    "session-status": {
+        "fields": {
+            "schema": {"type": int, "const": 1},
+            "vendor": {"type": str, "enum": _VENDOR},
+            "vendor_session_id": {"type": str, "min_len": 1},
+            "state": {"type": str,
+                      "enum": ("running", "waiting-approval", "idle", "stopped")},
+            "at": {"type": str, "pattern": _TS},
+        },
+        "rules": [],
+    },
     # LLD 13.2
     "console-daemon": {
         "fields": {

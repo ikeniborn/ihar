@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 
 from .. import ids, jsonio
+from . import sidebar as side
 from . import supervisor as sup
 
 MAX_SESSIONS = 8
@@ -77,6 +78,7 @@ class Broker:
         # Tabs this broker started. A record is written by its supervisor a moment later,
         # so counting only records would let two quick requests both pass the cap.
         self.spawned: dict[str, subprocess.Popen] = {}
+        self.sidebar = side.Sidebar(state_root)
 
     # --------------------------------------------------------------- startup
     def claim(self) -> None:
@@ -191,6 +193,20 @@ class Broker:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return {"sid": sid, "ihar_id": launch_id, "vendor": vendor, "profile": profile,
                 "project_root": str(root)}
+
+    def rename(self, state_id: str, ihar_id: str, title: str) -> bool:
+        """Push a title to the vendor through the CLI, so native pickers agree (LLD 13.2)."""
+        marker = side._read_json(self.directory.parent / state_id / "home.json") or {}
+        root = marker.get("project_root")
+        if not root or not os.path.isdir(root):
+            return False
+        result = subprocess.run([self.cli(), "sessions", "name", ihar_id, title],
+                                cwd=root, env=self.tab_environment(ihar_id),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return result.returncode == 0
+
+    def thread(self, state_id: str, ihar_id: str) -> dict:
+        return side.thread(self.directory.parent / state_id, ihar_id)
 
     def stop_tab(self, sid: str) -> bool:
         path = self.sessions / f"{sid}.json"
@@ -311,6 +327,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json_reply(200, {"schema": 1, "port": self.broker.port,
                                   "max_sessions": self.broker.max_sessions,
                                   "sessions": self.broker.live()})
+        elif path == "/api/sidebar":
+            tabs = self.broker.live()
+            self.json_reply(200, self.broker.sidebar.build(tabs, force=query == "refresh=1"))
+        elif path.startswith("/api/thread/"):
+            parts = path[len("/api/thread/"):].split("/")
+            if len(parts) != 2 or not all(parts):
+                self.reply(404, b"a thread is addressed as /api/thread/<state-id>/<ihar-id>\n")
+                return
+            self.json_reply(200, self.broker.thread(parts[0], parts[1]))
         else:
             self.reply(404, b"no such route\n")
 
@@ -330,6 +355,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.path == "/api/tabs":
             self.create_tab(body)
+        elif self.path.startswith("/api/sessions/") and self.path.endswith("/name"):
+            parts = self.path[len("/api/sessions/"):-len("/name")].split("/")
+            title = str(body.get("title") or "").strip()
+            if len(parts) != 2 or not all(parts) or not title:
+                self.reply(400, b"a rename needs a state id, an ihar id and a title\n")
+                return
+            renamed = self.broker.rename(parts[0], parts[1], title)
+            self.json_reply(200 if renamed else 404, {"ihar_id": parts[1], "title": title})
         elif self.path.startswith("/api/tabs/") and self.path.endswith("/stop"):
             sid = self.path[len("/api/tabs/"):-len("/stop")]
             self.json_reply(200 if self.broker.stop_tab(sid) else 404, {"sid": sid})

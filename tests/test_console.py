@@ -48,6 +48,7 @@ def fake_root(tmp: Path) -> Path:
     script = root / "ihar.sh"
     script.write_text(
         "#!/usr/bin/env bash\n"
+        'if [[ "$1" == sessions ]]; then printf "%s\\n" "$*" >> "$HOME/rename.log"; exit 0; fi\n'
         'env > "$HOME/env-dump.$$"\n'
         'printf "tab-ready vendor=%s\\n" "$1"\n'
         "sleep 30\n", encoding="utf-8")
@@ -277,6 +278,101 @@ def main():
             status, _, _ = request(port, "POST", "/api/tabs", cookie=token,
                                    body={"project_root": str(extra), "vendor": "claude"})
         check("the session cap refuses the third tab", status == 409)
+
+        # The sidebar is every project state on the machine, not this one's.
+        other = tmp / "other-project"
+        other.mkdir()
+        other_state = state_root / "beefcafe"
+        (other_state / "st" / "claude").mkdir(parents=True)
+        (other_state / "st" / "codex").mkdir(parents=True)
+        (other_state / "home.json").write_text(json.dumps({
+            "schema": 3, "project_root": str(other), "created": "2026-09-22T06:00:00Z",
+            "vendors": ["claude"], "runtimes": {}, "migrated_from": {}}), encoding="utf-8")
+        first = "0199f3a1-7c2e-7a41-9b0d-3f9a1cbd2e51"
+        second = "0199f3a1-7c2e-7a41-9b0d-3f9a1cbd2e52"
+        index = other_state / "sessions.jsonl"
+        with index.open("w", encoding="utf-8") as stream:
+            for row in (
+                {"schema": 1, "ihar_id": first, "vendor": "claude",
+                 "vendor_session_id": "claude-one", "project": "other", "cwd": str(other),
+                 "git_branch": None, "title": "first leg", "model": None, "profile": "standard",
+                 "started_at": "2026-09-22T06:00:00Z", "updated_at": "2026-09-22T06:00:00Z",
+                 "parent_ihar_id": None, "handoff_from": None, "handoff_to": second,
+                 "tags": [], "source": "launch"},
+                {"schema": 1, "ihar_id": second, "vendor": "codex",
+                 "vendor_session_id": "codex-two", "project": "other", "cwd": str(other),
+                 "git_branch": None, "title": "second leg", "model": None, "profile": "standard",
+                 "started_at": "2026-09-22T06:05:00Z", "updated_at": "2026-09-22T06:05:00Z",
+                 "parent_ihar_id": first, "handoff_from": first, "handoff_to": None,
+                 "tags": [], "source": "launch"},
+            ):
+                stream.write(json.dumps(row) + "\n")
+
+        # Two vendor transcripts, one on each side of the handoff.
+        claude_home = other_state / "st" / "claude" / "projects" / "x"
+        claude_home.mkdir(parents=True)
+        (claude_home / "claude-one.jsonl").write_text("\n".join(json.dumps(record) for record in (
+            {"timestamp": "2026-09-22T06:01:00Z", "message": {"role": "user", "content": "start here"}},
+            {"timestamp": "2026-09-22T06:02:00Z", "message": {"role": "assistant", "content": "done the first half"}},
+        )), encoding="utf-8")
+        codex_home = other_state / "st" / "codex" / "sessions"
+        codex_home.mkdir(parents=True)
+        (codex_home / "rollout-codex-two.jsonl").write_text(json.dumps(
+            {"timestamp": "2026-09-22T06:06:00Z",
+             "message": {"role": "assistant", "content": "continued after the handoff"}}), encoding="utf-8")
+        (other_state / "handoff").mkdir()
+        (other_state / "handoff" / f"{first}.json").write_text(json.dumps({
+            "bytes": 4096, "masking_level": "standard", "target_vendor": "codex",
+            "history": {"mode": "transcript", "file": "/dev/null"}}), encoding="utf-8")
+
+        # A badge the status hook would have written.
+        (other_state / "status").mkdir()
+        (other_state / "status" / "codex-codex-two.json").write_text(json.dumps({
+            "schema": 1, "vendor": "codex", "vendor_session_id": "codex-two",
+            "state": "waiting-approval", "at": "2026-09-22T06:07:00Z"}), encoding="utf-8")
+
+        status, _, payload = request(port, "GET", "/api/sidebar?refresh=1", cookie=token)
+        view = json.loads(payload) if status == 200 else {}
+        check("the sidebar answers", status == 200)
+        listed = {project["state_id"]: project for project in view.get("projects", [])}
+        check("the sidebar spans every project state", "beefcafe" in listed)
+        rows = {row["ihar_id"]: row for row in listed.get("beefcafe", {}).get("sessions", [])}
+        check("the sidebar lists both legs", {first, second} <= set(rows))
+        check("the badge reaches the sidebar",
+              rows.get(second, {}).get("status") == "waiting-approval")
+        check("a session with no badge is unknown, not running",
+              rows.get(first, {}).get("status") == "unknown")
+
+        status, _, payload = request(port, "GET", f"/api/thread/beefcafe/{second}", cookie=token)
+        projection = json.loads(payload) if status == 200 else {}
+        items = projection.get("items", [])
+        kinds = [item["kind"] for item in items]
+        texts = [item.get("text") for item in items if item["kind"] == "message"]
+        check("the projection answers", status == 200)
+        check("the projection walks back to the first leg",
+              projection.get("sessions") == [first, second])
+        check("the projection orders both vendors",
+              texts[:1] == ["start here"] and texts[-1:] == ["continued after the handoff"])
+        check("the projection marks the handoff", "handoff" in kinds)
+        marker_item = next((item for item in items if item["kind"] == "handoff"), {})
+        check("the marker says what the package carried", marker_item.get("bytes") == 4096)
+        check("the projection keeps nothing on disk",
+              not list((other_state / "handoff").glob("*-projection*")))
+
+        # A rotated vendor session is a labelled gap, never invented content.
+        (claude_home / "claude-one.jsonl").unlink()
+        status, _, payload = request(port, "GET", f"/api/thread/beefcafe/{second}", cookie=token)
+        projection = json.loads(payload)
+        check("a missing transcript is reported as a gap",
+              any(gap["ihar_id"] == first for gap in projection.get("gaps", [])))
+
+        # Renaming goes through the CLI, which is where the adapters live.
+        status, _, _ = request(port, "POST", f"/api/sessions/beefcafe/{second}/name",
+                               cookie=token, body={"title": "renamed leg"})
+        check("a rename is accepted", status == 200)
+        log = (tmp / "home" / "rename.log")
+        check("the rename reached the CLI",
+              log.is_file() and "sessions name" in log.read_text(encoding="utf-8"))
 
         broker.terminate()
         broker.wait(timeout=10)
