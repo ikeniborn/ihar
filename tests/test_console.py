@@ -45,10 +45,19 @@ def fake_root(tmp: Path) -> Path:
             "remote": ["claude", "codex"], "mcp": {"strict": False}, "acp": "allow",
             "console": console, "env_passthrough": [], "handoff": {"system_prompt": False},
         }), encoding="utf-8")
+    real = Path(__file__).resolve().parent.parent
+    (root / "console" / "vendor").mkdir(parents=True)
+    for name in ("index.html", "app.js", "app.css"):
+        (root / "console" / name).write_bytes((real / "console" / name).read_bytes())
+    for name in ("xterm.js", "xterm.css"):
+        (root / "console" / "vendor" / name).write_bytes(
+            (real / "console" / "vendor" / name).read_bytes())
+    (root / ".ihar-lockfile.json").write_bytes((real / ".ihar-lockfile.json").read_bytes())
     script = root / "ihar.sh"
     script.write_text(
         "#!/usr/bin/env bash\n"
         'if [[ "$1" == sessions ]]; then printf "%s\\n" "$*" >> "$HOME/rename.log"; exit 0; fi\n'
+        'if [[ "$1" == check ]]; then printf "profile      standard\\nconsole      running\\n"; exit 0; fi\n'
         'env > "$HOME/env-dump.$$"\n'
         'printf "tab-ready vendor=%s\\n" "$1"\n'
         "sleep 30\n", encoding="utf-8")
@@ -373,6 +382,59 @@ def main():
         log = (tmp / "home" / "rename.log")
         check("the rename reached the CLI",
               log.is_file() and "sessions name" in log.read_text(encoding="utf-8"))
+
+        # The window and its assets are served from the pinned tree, never from a network.
+        status, headers, page = request(port, "GET", "/", cookie=token)
+        check("the window is served", status == 200 and b"ihar console" in page)
+        check("the window loads its terminal locally", b'src="/static/xterm.js"' in page)
+        check("the window fetches nothing remote",
+              b"//cdn." not in page and b"https://" not in page)
+        status, headers, script = request(port, "GET", "/static/xterm.js", cookie=token)
+        check("the terminal asset is served", status == 200 and len(script) > 100000)
+        check("the terminal asset is javascript",
+              headers.get("Content-Type", "").startswith("text/javascript"))
+        status, _, _ = request(port, "GET", "/static/xterm.js")
+        check("an asset needs the cookie too", status == 401)
+        status, _, _ = request(port, "GET", "/static/../etc/passwd", cookie=token)
+        check("an asset outside the map is refused", status == 404)
+        status, _, app = request(port, "GET", "/static/app.js", cookie=token)
+        check("the window script is served", status == 200)
+        check("the window script fetches nothing remote",
+              b"http://" not in app.replace(b"http://${location.host}", b"") and
+              b"https://" not in app)
+
+        # A terminal that is not the reviewed one is refused rather than served.
+        tampered = root / "console" / "vendor" / "xterm.js"
+        original = tampered.read_bytes()
+        tampered.write_bytes(original + b"\n/* tampered */\n")
+        status, _, refusal = request(port, "GET", "/static/xterm.js", cookie=token)
+        check("a tampered terminal asset is refused", status == 503)
+        check("the refusal names the digest", b"reviewed digest" in refusal)
+        tampered.write_bytes(original)
+        status, _, _ = request(port, "GET", "/static/xterm.js", cookie=token)
+        check("restoring the asset restores the service", status == 200)
+
+        # The check panel reads the project's own report through the CLI.
+        status, _, payload = request(port, "GET", "/api/check/beefcafe", cookie=token)
+        report = json.loads(payload) if status == 200 else {}
+        check("the check panel answers", status == 200)
+        check("the check panel carries the project's report",
+              "console      running" in (report.get("text") or ""))
+
+        # The handoff button runs `ihar switch` in a tab rather than reimplementing it.
+        status, _, payload = request(port, "POST", f"/api/sessions/beefcafe/{second}/switch",
+                                     cookie=token, body={"to": "claude", "history": "transcript"})
+        check("a switch tab is created", status == 201)
+        switch_sid = json.loads(payload)["sid"] if status == 201 else ""
+        switch_record = wait_for(state_root / "console" / "s" / f"{switch_sid}.json") if switch_sid else None
+        check("the switch tab names the source session",
+              bool(switch_record) and switch_record["ihar_id"] == second)
+        status, _, payload = request(port, "POST", f"/api/sessions/beefcafe/{second}/switch",
+                                     cookie=token, body={"to": "gemini", "history": "summary"})
+        check("an unknown vendor is refused", status == 400)
+        status, _, payload = request(port, "POST", f"/api/sessions/beefcafe/{second}/switch",
+                                     cookie=token, body={"to": "claude", "history": "everything"})
+        check("an unknown history mode is refused", status == 400)
 
         broker.terminate()
         broker.wait(timeout=10)

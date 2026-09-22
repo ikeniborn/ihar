@@ -41,6 +41,15 @@ from . import sidebar as side
 from . import supervisor as sup
 
 MAX_SESSIONS = 8
+# What the window is allowed to load, and nothing else. A name outside this map is a
+# refusal rather than a path join, so no request can walk out of the asset directory.
+STATIC = {
+    "app.js": ("console/app.js", "text/javascript; charset=utf-8", False),
+    "app.css": ("console/app.css", "text/css; charset=utf-8", False),
+    "xterm.js": ("console/vendor/xterm.js", "text/javascript; charset=utf-8", True),
+    "xterm.css": ("console/vendor/xterm.css", "text/css; charset=utf-8", True),
+}
+CHECK_SECONDS = 30.0
 MAX_BODY = 64 * 1024
 _GUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11F"
 _CONFIG_LINE = re.compile(r"^(IHAR_[A-Z0-9_]+)=(.*)$")
@@ -79,6 +88,70 @@ class Broker:
         # so counting only records would let two quick requests both pass the cap.
         self.spawned: dict[str, subprocess.Popen] = {}
         self.sidebar = side.Sidebar(state_root)
+        self._checks: dict[str, tuple[float, dict]] = {}
+        self.pins = self._pins()
+
+    def _pins(self) -> dict:
+        """The reviewed digests of the pinned terminal asset (LLD 13.2, §14.1).
+
+        The lockfile is the release's own record, so a build serving a different
+        `xterm.js` than the one that was reviewed refuses rather than serves it.
+        """
+        try:
+            lock = json.loads((self.root / ".ihar-lockfile.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return (lock.get("console") or {}).get("assets") or {}
+
+    def asset(self, name: str) -> tuple[bytes, str]:
+        """Read one served file, verifying a pinned one before it leaves the process."""
+        relative, kind, pinned = STATIC[name]
+        data = (self.root / relative).read_bytes()
+        if pinned:
+            digest = hashlib.sha256(data).hexdigest()
+            expected = self.pins.get(name)
+            if not expected:
+                raise PermissionError(f"{name} is not pinned in the release lockfile")
+            if digest != expected:
+                raise PermissionError(f"{name} does not match its reviewed digest")
+        return data, kind
+
+    def check(self, state_id: str) -> dict:
+        """`ihar check` for one project, cached: it starts processes of its own."""
+        now = time.monotonic()
+        cached = self._checks.get(state_id)
+        if cached and now - cached[0] < CHECK_SECONDS:
+            return cached[1]
+        marker = side._read_json(self.directory.parent / state_id / "home.json") or {}
+        root = marker.get("project_root")
+        if not root or not os.path.isdir(root):
+            return {"state_id": state_id, "text": "this project state has no readable marker"}
+        result = subprocess.run([self.cli(), "check"], cwd=root,
+                                env=self.tab_environment(state_id), text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        report = {"state_id": state_id, "project_root": root, "exit_code": result.returncode,
+                  "text": result.stdout}
+        self._checks[state_id] = (now, report)
+        return report
+
+    def open_switch_tab(self, state_id: str, ihar_id: str, to: str, history: str) -> dict:
+        """Run `ihar switch` in a tab, so the handoff button reimplements nothing.
+
+        The CLI refuses a switch outside a session, and identity is what it reads from
+        `IHAR_LAUNCH_ID`; the broker therefore names the source session and lets the
+        command do the rest, including its own profile and masking gates.
+        """
+        if to not in ("claude", "codex"):
+            raise ValueError(f"unknown vendor: {to}")
+        if history not in ("summary", "transcript"):
+            raise ValueError(f"unknown history mode: {history}")
+        marker = side._read_json(self.directory.parent / state_id / "home.json") or {}
+        root = marker.get("project_root")
+        if not root or not os.path.isdir(root):
+            raise ValueError(f"no such project state: {state_id}")
+        return self.spawn_tab(Path(root), to, self.profile_of(Path(root), None),
+                              [self.cli(), "switch", "--to", to, "--history", history],
+                              launch_id=ihar_id)
 
     # --------------------------------------------------------------- startup
     def claim(self) -> None:
@@ -179,17 +252,21 @@ class Broker:
         profile = self.profile_of(root, requested)
         if not self.console_allowed(profile):
             raise PermissionError(f"profile '{profile}' sets console: refuse")
-        launch_id = str(ids.uuid7())
-        sid = launch_id.replace("-", "")[:12]
-        command = [sys.executable, "-m", "ihar.console.supervisor",
-                   "--sid", sid, "--record", str(self.sessions / f"{sid}.json"),
-                   "--socket", str(self.sessions / f"{sid}.sock"),
-                   "--project", str(root), "--vendor", vendor, "--profile", profile,
-                   "--launch-id", launch_id, "--", self.cli(), vendor]
+        return self.spawn_tab(root, vendor, profile, [self.cli(), vendor])
+
+    def spawn_tab(self, root: Path, vendor: str, profile: str, command: list[str],
+                  launch_id: str | None = None) -> dict:
+        launch_id = launch_id or str(ids.uuid7())
+        sid = str(ids.uuid7()).replace("-", "")[:12]
+        supervisor = [sys.executable, "-m", "ihar.console.supervisor",
+                      "--sid", sid, "--record", str(self.sessions / f"{sid}.json"),
+                      "--socket", str(self.sessions / f"{sid}.sock"),
+                      "--project", str(root), "--vendor", vendor, "--profile", profile,
+                      "--launch-id", launch_id, "--", *command]
         environment = self.tab_environment(launch_id)
         environment["PYTHONPATH"] = os.environ.get("PYTHONPATH", "")
         self.spawned[sid] = subprocess.Popen(
-            command, env=environment, start_new_session=True,
+            supervisor, env=environment, start_new_session=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return {"sid": sid, "ihar_id": launch_id, "vendor": vendor, "profile": profile,
                 "project_root": str(root)}
@@ -322,7 +399,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(401, b"unauthorised\n")
             return
         if path == "/":
-            self.reply(200, b"ihar console\n", "text/html; charset=utf-8")
+            try:
+                body = (self.broker.root / "console" / "index.html").read_bytes()
+            except OSError:
+                self.reply(503, b"the console window is not installed\n")
+                return
+            self.reply(200, body, "text/html; charset=utf-8")
+        elif path.startswith("/static/"):
+            name = path[len("/static/"):]
+            if name not in STATIC:
+                self.reply(404, b"no such asset\n")
+                return
+            try:
+                body, kind = self.broker.asset(name)
+            except PermissionError as error:
+                # Fail-closed: a terminal that is not the reviewed one is not served.
+                self.reply(503, str(error).encode() + b"\n")
+                return
+            except OSError:
+                self.reply(503, b"the console assets are not installed\n")
+                return
+            self.reply(200, body, kind)
         elif path == "/api/state":
             self.json_reply(200, {"schema": 1, "port": self.broker.port,
                                   "max_sessions": self.broker.max_sessions,
@@ -330,6 +427,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/sidebar":
             tabs = self.broker.live()
             self.json_reply(200, self.broker.sidebar.build(tabs, force=query == "refresh=1"))
+        elif path.startswith("/api/check/"):
+            self.json_reply(200, self.broker.check(path[len("/api/check/"):]))
         elif path.startswith("/api/thread/"):
             parts = path[len("/api/thread/"):].split("/")
             if len(parts) != 2 or not all(parts):
@@ -363,6 +462,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             renamed = self.broker.rename(parts[0], parts[1], title)
             self.json_reply(200 if renamed else 404, {"ihar_id": parts[1], "title": title})
+        elif self.path.startswith("/api/sessions/") and self.path.endswith("/switch"):
+            parts = self.path[len("/api/sessions/"):-len("/switch")].split("/")
+            if len(parts) != 2 or not all(parts):
+                self.reply(400, b"a switch needs a state id and an ihar id\n")
+                return
+            try:
+                tab = self.broker.open_switch_tab(parts[0], parts[1],
+                                                  str(body.get("to") or ""),
+                                                  str(body.get("history") or "summary"))
+            except PermissionError as error:
+                self.json_reply(403, {"error": str(error)})
+            except RuntimeError as error:
+                self.json_reply(409, {"error": str(error)})
+            except (ValueError, FileNotFoundError) as error:
+                self.json_reply(400, {"error": str(error)})
+            else:
+                self.json_reply(201, tab)
         elif self.path.startswith("/api/tabs/") and self.path.endswith("/stop"):
             sid = self.path[len("/api/tabs/"):-len("/stop")]
             self.json_reply(200 if self.broker.stop_tab(sid) else 404, {"sid": sid})

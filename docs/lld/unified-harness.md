@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 17 (console status hook, sidebar assembly and thread projection implemented) |
+| Status | revision 18 (console front end served from a pinned terminal asset; the asset decision is closed) |
 | Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -930,7 +930,13 @@ Keyed by the payload's `session_id`, so it needs none of the launch-claim machin
 
 **Tab kinds.** `kind: "pty"` is the shipped one and carries every guarantee of the resolved profile. `kind: "acp"` (S13) runs `ihar acp <vendor>` and renders ACP updates as a chat; the broker offers it only when the project profile has `acp: allow`, and the UI labels it with the two gaps §13.3 names, because two tab kinds that look alike and guarantee differently is the confusion this labelling exists to prevent. A vendor change is never implicit in either kind: the handoff button runs `ihar switch --to <vendor>` (§11.4) and opens the resulting session as a new tab, linked in the sidebar.
 
-**Check panel.** The console renders `ihar check --json` per project through the closed schema of §12.4 and adds one console block: `{state, port, live_sessions, token_present, reach}`, where `reach` names the project states this broker can launch into. It is read-only and fail-soft; a project whose check fails is shown as failing, not omitted.
+**Check panel.** The console runs `ihar check` in the project and shows what it printed, cached for thirty seconds because the command starts processes of its own; `GET /api/check/<state-id>` is the route. The report already carries the console block of §12.4 — `{state, port, live_sessions, token_present, reach}` — so the window states the token's reach in the same words the terminal does. Read-only and fail-soft: a project whose check fails is shown as failing, not omitted.
+
+**The window and its assets.** `GET /` serves `console/index.html`; `GET /static/<name>` serves exactly four files named in a closed map — the window's own script and stylesheet, and the pinned `xterm.js` and `xterm.css`. A name outside the map is 404 rather than a path join, so no request can walk out of the asset directory, and every asset needs the same cookie as the rest of the surface.
+
+**The terminal is pinned, and a mismatch is a refusal.** `xterm.js` 5.5.0 is vendored under `console/vendor/`, and its digest is recorded in the release lockfile beside every other release input. The broker hashes the bytes before serving them: a build whose terminal is not the reviewed one answers 503 naming the digest rather than serving it. The window loads nothing else — no CDN, no network at runtime — because a local tool that needs the internet to draw a terminal is not a local tool.
+
+**The handoff button reimplements nothing.** `POST /api/sessions/<state-id>/<ihar-id>/switch` opens a tab running `ihar switch --to <vendor> --history <mode>` with `IHAR_CONSOLE_LAUNCH_ID` naming the source session, so the package, its sanitisation and its profile gates are the ones of §11. An unknown vendor or history mode is 400 before any tab exists.
 
 ### 13.3 ACP launcher mode
 
@@ -1085,6 +1091,9 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | console | no status record for a session | fail-soft, badge shown as unknown | 0 |
 | console | a project state whose index or vendor store cannot be read | fail-soft, that project reports its error and the window keeps its other projects | 0 |
 | console | adapter read fails while projecting a thread | fail-soft, labelled gap in the pane | 0 |
+| console | served terminal asset does not match its reviewed digest | fail-closed per request | 503 |
+| console | console assets absent from the checkout or store | fail-closed per request | 503 |
+| console | static name outside the served map | fail-closed per request | 404 |
 | handoff | transcript render or its masking fails | fail-soft, degrade to `summary` with a warning | 0 |
 
 ## 18. Delivery plan
@@ -1133,9 +1142,8 @@ S12 depends on S7 for the index reader and on S8 for the handoff button; S13 dep
 
 Revision 12 records only choices supported by the approved artifacts and reviewed implementation. Vendor timeout behavior is an executable mandatory case in §6.6 rather than a prose assumption; future pinned-version changes must earn new evidence before activation. Any question not supported by that evidence remains open rather than being closed by this reconciliation.
 
-Revision 13 opens three, each owned by the slice that must measure it rather than assume it:
+Revision 13 opened three. The terminal asset pin is now answered and closed: `xterm.js` 5.5.0 is vendored at `console/vendor/xterm.js`, sha256 `1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495`, with its stylesheet at `ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6`; both digests were taken from the installed files and are recorded in the release lockfile, which the broker verifies before serving. Two remain, each owned by the slice that must measure it rather than assume it:
 
-- **Terminal asset pin (S12, front-end slice).** The browser terminal needs a pinned `xterm.js` build in `manifests/assets.json` with its digest; the version and digest are recorded when the asset is first installed, never from memory, and the console refuses to serve a mismatched one. The boundary slice ships no front end, so the broker currently serves a placeholder page behind the same cookie.
 - **Masking throughput on a transcript (S14).** The 2 MB default budget assumes the masking engine finishes a large render in a time a user will wait for. Presidio's rate on this class of input is unmeasured; S14 measures it and either keeps the default, lowers it, or streams the render, and records the number here.
 - **ACP tab promotion (S13).** claude-agent-acp #144 and codex-acp #310/#477 decide whether an ACP tab can ever be offered under an enforced profile. Until a measurement says they are closed, the tab exists only where `acp: allow` already stands.
 

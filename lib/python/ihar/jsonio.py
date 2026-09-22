@@ -835,6 +835,16 @@ KINDS: dict[str, dict[str, Any]] = {
             "managedHooks": {"type": dict, "values": {"type": str, "pattern": _SHA256}},
             "acp": {"type": dict, "values": {"type": str, "min_len": 1}},
             "microvm": {"type": dict, "values": {"type": str, "pattern": _SHA256}},
+            # The console's third-party terminal, pinned like every other release input:
+            # the broker refuses to serve a build whose bytes differ from the reviewed
+            # ones, so the digest has to live where a release records what it reviewed.
+            "console": {
+                "type": dict,
+                "fields": {
+                    "version": {"type": dict, "values": {"type": str, "min_len": 1}},
+                    "assets": {"type": dict, "values": {"type": str, "pattern": _SHA256}},
+                },
+            },
         },
         "rules": [],
     },

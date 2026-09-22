@@ -186,10 +186,20 @@ rather than invented text, because ihar keeps no copy. States come from a hook o
 four lifecycle events both agents share — running, waiting for approval, idle, stopped
 — so the list can say which agent is waiting for you.
 
+Open the printed URL and the window shows all of it: a sidebar of every project and
+its sessions, a tab per running agent with the vendor's own terminal in it, a history
+pane that reads a chain across a `switch`, a panel with that project's `ihar check`,
+and buttons to rename a session or hand it to the other agent. Browser notifications,
+if you allow them, tell you when a session starts waiting for you.
+
+Everything the page loads is served by the broker from a pinned copy — the terminal is
+`xterm.js` 5.5.0, vendored with its digest in the release lockfile, and a build whose
+bytes do not match is refused rather than served. Nothing is fetched from the network,
+so the console works with the machine offline.
+
 One caveat worth stating plainly: a console token starts launches in every project
 state on this machine, which is wider than a single launch. `ihar check` prints that
-reach. The browser interface itself lands in the next slice; today the broker serves
-that data and the terminal sockets.
+reach, and so does the window.
 
 ## Configure
 
