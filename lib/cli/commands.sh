@@ -32,6 +32,10 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
       *) ihar_die 2 "profile '$IHAR_PROFILE' does not allow ${vendor^} web" ;;
     esac
   fi
+  if [[ "$vendor" == codex && "${IHAR_PROFILE_SANDBOX:-}" == microvm &&
+        "$IHAR_FLAG_DRY_RUN" != true ]]; then
+    ihar_die 3 "Codex isolated launch requires a credential-owner lease; guest handoff is not yet available"
+  fi
 
   # 3. store integrity, at the severity the profile asks for
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR
@@ -45,6 +49,15 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
     verify_receipt=false
   fi
   ihar_store_verify "$vendor" "$native_binary" "$verify_receipt"
+
+  local auth_verb=""
+  if [[ "$vendor" == codex ]]; then
+    auth_verb="$(ihar_codex_auth_verb)" || auth_verb=""
+    if [[ -n "$auth_verb" ]]; then
+      ihar_codex_auth_command "$auth_verb"
+      return $?
+    fi
+  fi
 
   # 4. project state. Called directly rather than in a command substitution: the
   # setup exports IHAR_STATE, and a subshell would drop that export while still
@@ -175,8 +188,15 @@ run 'ihar install'"
     return 0
   fi
 
+  local codex_auth_store="$IHAR_STORE" codex_auth_root="$IHAR_ROOT"
+
   if [[ "${IHAR_ACP_MODE:-false}" == true ]]; then
     ihar_env_apply
+    if [[ "$vendor" == codex ]]; then
+      ihar_codex_auth_run "$codex_auth_store" "$codex_auth_root" \
+        "$runtime" "$hash" foreground "${IHAR_ARGV[@]}"
+      return $?
+    fi
     if (( ${#IHAR_ENV[@]} )); then
       exec env -i "${IHAR_ENV[@]}" "${IHAR_ARGV[@]}"
     fi
@@ -195,6 +215,13 @@ run 'ihar install'"
   fi
 
   ihar_env_apply
+  if [[ "$vendor" == codex ]]; then
+    local owner_mode=foreground
+    [[ "$IHAR_FLAG_WEB" == true ]] && owner_mode=attached
+    ihar_codex_auth_run "$codex_auth_store" "$codex_auth_root" \
+      "$runtime" "$hash" "$owner_mode" "${IHAR_ARGV[@]}"
+    return $?
+  fi
   if (( ${#IHAR_ENV[@]} )); then
     exec env -i "${IHAR_ENV[@]}" "${IHAR_ARGV[@]}"
   fi

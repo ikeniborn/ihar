@@ -79,6 +79,12 @@ assert_exit "a stale record is removed" 1 test -f "$STATE/daemons/codex.json"
 stub version "$RUNNING"
 assert_eq "a foreign daemon is refused" "3" "$(daemon_exit reconcile)"
 assert_contains "and the reason names it" "$(daemon reconcile)" "no record of"
+leased_reconcile_status=0
+leased_reconcile="$(python3 -m ihar.codex.daemon reconcile --binary "$FAKE" \
+  --home "$HOME_DIR" --state "$STATE" --config-hash aabbccdd \
+  --auth-store "$IHAR_STORE" 2>&1)" || leased_reconcile_status=$?
+assert_eq "a running daemon without its auth owner is refused" "3" "$leased_reconcile_status"
+assert_contains "the missing lease is named" "$leased_reconcile" "no verified Codex auth owner"
 
 # --- a running daemon ihar started, matching -------------------------------------------
 

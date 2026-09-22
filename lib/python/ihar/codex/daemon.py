@@ -34,8 +34,10 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 from .. import jsonio
+from . import auth_owner
 
 RECORD_NAME = "codex.json"
 STANDALONE_RELATIVE = os.path.join("packages", "standalone", "current", "codex")
@@ -89,12 +91,45 @@ def status(binary: str, home: str) -> dict:
     return _daemon_call(binary, home, "version", timeout=30.0)
 
 
-def start(binary: str, home: str) -> dict:
-    return _daemon_call(binary, home, "start")
+def start(binary: str, home: str, *, auth_store: str | None = None,
+          config_hash: str = "") -> dict:
+    owner_id = None
+    if auth_store is not None:
+        auth_owner.require_descendant_supervision()
+        auth_owner.verify_runtime_link(home, auth_store)
+        owner_id = auth_owner.acquire(home, "daemon", store=auth_store,
+                                      config_hash=config_hash)
+    answer = _daemon_call(binary, home, "start")
+    if owner_id is not None:
+        if not running(answer):
+            auth_owner.release(owner_id, store=auth_store)
+        else:
+            socket_path = answer.get("socketPath", "")
+            for _ in range(60):
+                if os.path.exists(socket_path):
+                    break
+                time.sleep(0.05)
+            auth_owner.bind_daemon(owner_id, int(answer.get("pid", 0) or 0),
+                                   socket_path, binary, store=auth_store)
+            auth_owner.verify_runtime_link(home, auth_store)
+    return answer
 
 
-def stop(binary: str, home: str) -> dict:
-    return _daemon_call(binary, home, "stop", timeout=60.0)
+def stop(binary: str, home: str, *, auth_store: str | None = None) -> dict:
+    owner_id = (auth_owner.daemon_owner_id(home, store=auth_store)
+                if auth_store is not None else None)
+    answer = _daemon_call(binary, home, "stop", timeout=60.0)
+    if owner_id is not None:
+        auth_owner.verify_runtime_link(home, auth_store)
+        for _ in range(60):
+            try:
+                auth_owner.release(owner_id, store=auth_store)
+                break
+            except auth_owner.AuthBusy:
+                time.sleep(0.05)
+        else:
+            raise auth_owner.AuthBusy("Codex daemon did not become quiescent after stop")
+    return answer
 
 
 def running(answer: dict) -> bool:
@@ -174,7 +209,8 @@ RESTART = "restart"
 REFUSE = "refuse"
 
 
-def reconcile(binary: str, home: str, state: str, config_hash: str) -> dict:
+def reconcile(binary: str, home: str, state: str, config_hash: str,
+              *, auth_store: str | None = None) -> dict:
     """What this launch must do about whatever daemon is running.
 
     `none` — no daemon, or one that already matches.
@@ -188,6 +224,13 @@ def reconcile(binary: str, home: str, state: str, config_hash: str) -> dict:
         # Nothing is listening, so a record is a leftover rather than a claim.
         clear_record(state)
         return {"action": NOTHING_TO_DO, "reason": "no daemon is running", "status": answer}
+
+    if auth_store is not None:
+        try:
+            auth_owner.daemon_owner_id(home, store=auth_store)
+        except auth_owner.AuthOwnerError:
+            return {"action": REFUSE, "reason": "running daemon has no verified Codex auth owner",
+                    "status": answer}
 
     record = read_record(state)
     ours = record is not None and alive(int(record.get("pid", 0) or 0))
@@ -223,13 +266,14 @@ def _cli_version(binary: str) -> str:
     return (completed.stdout or "").strip().split()[-1] if completed.stdout.strip() else ""
 
 
-def apply(binary: str, home: str, state: str, config_hash: str, decision: dict) -> dict:
+def apply(binary: str, home: str, state: str, config_hash: str, decision: dict,
+          *, auth_store: str | None = None) -> dict:
     """Carry out a `restart`. `none` and `refuse` are the caller's to act on."""
     if decision["action"] != RESTART:
         return decision
-    stop(binary, home)
+    stop(binary, home, auth_store=auth_store)
     clear_record(state)
-    answer = start(binary, home)
+    answer = start(binary, home, auth_store=auth_store, config_hash=config_hash)
     if not running(answer):
         return {"action": REFUSE, "reason": f"the daemon did not restart: {answer}", "status": answer}
     write_record(state, pid=int(answer.get("pid", 0) or 0),
@@ -256,7 +300,7 @@ def _home_of(record: dict) -> str:
     return os.path.dirname(os.path.dirname(socket_path)) if socket_path else ""
 
 
-def stop_all(binary: str, state_root: str) -> list[dict]:
+def stop_all(binary: str, state_root: str, *, auth_store: str | None = None) -> list[dict]:
     """Stop every daemon ihar recorded, and leave a note of what to put back.
 
     The note is written before anything is stopped and removed only once everything
@@ -282,12 +326,12 @@ def stop_all(binary: str, state_root: str) -> list[dict]:
         with open(pending, "w", encoding="utf-8") as handle:
             json.dump(stopped, handle)
     for item in stopped:
-        stop(binary, item["home"])
+        stop(binary, item["home"], auth_store=auth_store)
         clear_record(item["state"])
     return stopped
 
 
-def start_pending(binary: str, state_root: str) -> list[dict]:
+def start_pending(binary: str, state_root: str, *, auth_store: str | None = None) -> list[dict]:
     """Restart exactly the daemons `stop_all` took down, and nothing else."""
     pending = os.path.join(state_root, PENDING_NAME)
     if not os.path.exists(pending):
@@ -301,7 +345,8 @@ def start_pending(binary: str, state_root: str) -> list[dict]:
 
     restarted = []
     for item in items if isinstance(items, list) else []:
-        answer = start(binary, item["home"])
+        answer = start(binary, item["home"], auth_store=auth_store,
+                       config_hash=item.get("config_hash", "00000000"))
         if running(answer):
             write_record(item["state"], pid=int(answer.get("pid", 0) or 0),
                          socket_path=answer.get("socketPath", ""), binary=binary,
@@ -327,13 +372,19 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--state")
     parser.add_argument("--state-root")
     parser.add_argument("--config-hash", default="00000000")
+    parser.add_argument("--auth-store")
     args = parser.parse_args(argv)
 
     if args.action in ("stop-all", "start-pending"):
         if not args.state_root:
             parser.error(f"{args.action} needs --state-root")
         worker = stop_all if args.action == "stop-all" else start_pending
-        json.dump(worker(args.binary, args.state_root), sys.stdout)
+        try:
+            result = worker(args.binary, args.state_root, auth_store=args.auth_store)
+        except auth_owner.AuthOwnerError as error:
+            print(str(error), file=sys.stderr)
+            return 3
+        json.dump(result, sys.stdout)
         sys.stdout.write("\n")
         return 0
 
@@ -342,8 +393,10 @@ def main(argv: list[str]) -> int:
 
     if args.action == "mark-remote":
         try:
+            if args.auth_store is not None:
+                auth_owner.daemon_owner_id(args.home, store=args.auth_store)
             answer = mark_remote(args.state)
-        except ValueError as error:
+        except (ValueError, auth_owner.AuthOwnerError) as error:
             print(str(error), file=sys.stderr)
             return 3
         json.dump(answer, sys.stdout)
@@ -358,17 +411,26 @@ def main(argv: list[str]) -> int:
         return 0 if running(answer) else 1
 
     if args.action == "stop":
-        answer = stop(args.binary, args.home)
+        try:
+            answer = stop(args.binary, args.home, auth_store=args.auth_store)
+        except auth_owner.AuthOwnerError as error:
+            print(str(error), file=sys.stderr)
+            return 3
         clear_record(args.state)
         json.dump(answer, sys.stdout)
         sys.stdout.write("\n")
         return 0
 
     if args.action in ("start", "restart"):
-        if args.action == "restart":
-            stop(args.binary, args.home)
-            clear_record(args.state)
-        answer = start(args.binary, args.home)
+        try:
+            if args.action == "restart":
+                stop(args.binary, args.home, auth_store=args.auth_store)
+                clear_record(args.state)
+            answer = start(args.binary, args.home, auth_store=args.auth_store,
+                           config_hash=args.config_hash)
+        except auth_owner.AuthOwnerError as error:
+            print(str(error), file=sys.stderr)
+            return 3
         if not running(answer):
             json.dump(answer, sys.stdout)
             sys.stdout.write("\n")
@@ -381,9 +443,15 @@ def main(argv: list[str]) -> int:
         sys.stdout.write("\n")
         return 0
 
-    decision = reconcile(args.binary, args.home, args.state, args.config_hash)
+    decision = reconcile(args.binary, args.home, args.state, args.config_hash,
+                         auth_store=args.auth_store)
     if decision["action"] == RESTART:
-        decision = apply(args.binary, args.home, args.state, args.config_hash, decision)
+        try:
+            decision = apply(args.binary, args.home, args.state, args.config_hash, decision,
+                             auth_store=args.auth_store)
+        except auth_owner.AuthOwnerError as error:
+            print(str(error), file=sys.stderr)
+            return 3
     json.dump(decision, sys.stdout)
     sys.stdout.write("\n")
     return 3 if decision["action"] == REFUSE else 0

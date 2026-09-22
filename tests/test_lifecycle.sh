@@ -59,6 +59,12 @@ assert_exit "a profile needing an undelivered gateway is fail-closed" 3 \
   bash -c "cd '$PROJECT' && IHAR_STORE='$IHAR_STORE' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' \
            '$ROOT/ihar.sh' --profile protected --dry-run claude"
 
+isolated_codex_status=0
+isolated_codex_output="$(ihar --profile isolated codex)" || isolated_codex_status=$?
+assert_eq "isolated Codex refuses before an unleased guest can start" "3" "$isolated_codex_status"
+assert_contains "isolated refusal names missing auth ownership" "$isolated_codex_output" \
+  "Codex isolated launch requires a credential-owner lease"
+
 # --- the configuration hash reaches the runtime home ---------------------------------
 
 first="$(ihar --dry-run claude | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
@@ -156,5 +162,43 @@ receipt_out="$(cd "$PROJECT" && \
 assert_eq "an enforced receipt mismatch exits fail-closed" "3" "$receipt_status"
 assert_contains "the launch names receipt verification" "$receipt_out" "install receipt"
 assert_exit "receipt failure occurs before the vendor starts" 1 test -e "$START_MARKER"
+
+# Account verbs bypass runtime materialization and use the protected staging home.
+FAKE_CODEX_AUTH="$IHAR_TEST_TMP/fake-auth-codex"
+AUTH_STARTS="$IHAR_TEST_TMP/auth-starts"
+cat > "$FAKE_CODEX_AUTH" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == --version ]]; then printf 'codex-cli 0.154.0\n'; exit 0; fi
+if [[ "${1:-}" == login && "${2:-}" == status ]]; then
+  [[ "$(cat "$CODEX_HOME/auth.json")" == synthetic-first ]]
+  exit $?
+fi
+printf 'started\n' >> "$AUTH_STARTS"
+printf '%s' "$IHAR_TEST_CREDENTIAL" > "$CODEX_HOME/auth.json"
+SH
+chmod +x "$FAKE_CODEX_AUTH"
+export AUTH_STARTS
+auth_status=0
+IHAR_CODEX_BIN="$FAKE_CODEX_AUTH" IHAR_TEST_CREDENTIAL=synthetic-first \
+  ihar codex -- login >/dev/null 2>&1 || auth_status=$?
+assert_eq "first Codex login publishes through protected staging" "0" "$auth_status"
+assert_eq "the shared canonical receives the staged credential" "synthetic-first" \
+  "$(cat "$IHAR_STORE/auth/codex/auth.json")"
+status_status=0
+IHAR_CODEX_BIN="$FAKE_CODEX_AUTH" ihar codex -- login status >/dev/null 2>&1 || status_status=$?
+assert_eq "Codex login status reads protected canonical copy" "0" "$status_status"
+reauth_status=0
+IHAR_CODEX_BIN="$FAKE_CODEX_AUTH" IHAR_TEST_CREDENTIAL=synthetic-second \
+  ihar --assume-yes codex -- login >/dev/null 2>&1 || reauth_status=$?
+assert_eq "assume-yes cannot approve shared credential replacement" "3" "$reauth_status"
+assert_eq "unapproved reauthentication preserves canonical bytes" "synthetic-first" \
+  "$(cat "$IHAR_STORE/auth/codex/auth.json")"
+assert_eq "unapproved reauthentication never starts vendor" "1" \
+  "$(wc -l < "$AUTH_STARTS")"
+logout_status=0
+IHAR_CODEX_BIN="$FAKE_CODEX_AUTH" ihar --assume-yes codex -- logout >/dev/null 2>&1 || logout_status=$?
+assert_eq "assume-yes cannot approve shared logout" "3" "$logout_status"
+assert_eq "unapproved logout preserves canonical bytes" "synthetic-first" \
+  "$(cat "$IHAR_STORE/auth/codex/auth.json")"
 
 finish

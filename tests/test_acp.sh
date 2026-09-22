@@ -79,7 +79,10 @@ assert_exit "Claude ACP receives no native CLI arguments" 1 \
   bash -c "grep -q \$'^arg\\t' '$RECORD'"
 
 rm -f "$RECORD"
-ihar acp codex >/dev/null
+codex_acp_status=0
+codex_acp_output="$(ihar acp codex)" || codex_acp_status=$?
+assert_eq "Codex ACP obtains its credential lease" "0" "$codex_acp_status"
+[[ "$codex_acp_status" == 0 ]] || printf '%s\n' "$codex_acp_output"
 codex_record="$(cat "$RECORD")"
 assert_contains "Codex ACP receives CODEX_HOME" "$codex_record" $'env\tCODEX_HOME'
 assert_contains "Codex ACP receives the pinned CLI path" "$codex_record" $'env\tCODEX_PATH'

@@ -56,7 +56,8 @@ _ihar_codex_daemon_reconcile() {
   local runtime="$1" hash="$2" out status=0
   out="$(ihar_python ihar.codex.daemon reconcile \
           --binary "$IHAR_CODEX_BIN" --home "$runtime" \
-          --state "$IHAR_STATE" --config-hash "$hash" 2>&1)" || status=$?
+          --state "$IHAR_STATE" --config-hash "$hash" \
+          --auth-store "$IHAR_STORE" 2>&1)" || status=$?
 
   case "$status" in
     0)
@@ -88,15 +89,14 @@ _ihar_daemon_field() {
 # ihar_codex_daemon_stop_all — take down every daemon ihar recorded, before the
 # binary they are running is replaced (LLD 5.5, plan task S6.4).
 #
-# Fail-soft: an update that cannot reach a daemon still has to replace the binary,
-# and the next launch's reconciliation catches whatever was left behind.
+# A daemon whose owner cannot be verified blocks replacement of its binary.
 ihar_codex_daemon_stop_all() {
   [[ -x "$IHAR_CODEX_BIN" ]] || return 0
   [[ -d "$IHAR_STATE_ROOT" ]] || return 0
   local out
   out="$(ihar_python ihar.codex.daemon stop-all --binary "$IHAR_CODEX_BIN" \
-          --state-root "$IHAR_STATE_ROOT" 2>&1)" \
-    || { ihar_warn "could not stop the managed Codex daemons: ${out:-no output}"; return 0; }
+          --state-root "$IHAR_STATE_ROOT" --auth-store "$IHAR_STORE" 2>&1)" \
+    || ihar_die 3 "could not stop the managed Codex daemons: ${out:-no output}"
   [[ "$out" == "[]" ]] || ihar_info "stopped the managed Codex daemons for the update"
 }
 
@@ -106,8 +106,8 @@ ihar_codex_daemon_start_pending() {
   [[ -d "$IHAR_STATE_ROOT" ]] || return 0
   local out
   out="$(ihar_python ihar.codex.daemon start-pending --binary "$IHAR_CODEX_BIN" \
-          --state-root "$IHAR_STATE_ROOT" 2>&1)" \
-    || { ihar_warn "could not restart the managed Codex daemons: ${out:-no output}"; return 0; }
+          --state-root "$IHAR_STATE_ROOT" --auth-store "$IHAR_STORE" 2>&1)" \
+    || ihar_die 3 "could not restart the managed Codex daemons: ${out:-no output}"
   [[ "$out" == "[]" ]] || ihar_info "restarted the managed Codex daemons"
 }
 
@@ -121,20 +121,27 @@ _ihar_codex_remote_start() {
   local runtime="$1" hash="$2" out
   if [[ -S "$runtime/app-server-control/app-server-control.sock" ]]; then
     out="$(ihar_python ihar.codex.daemon reconcile --binary "$IHAR_CODEX_BIN" \
-      --home "$runtime" --state "$IHAR_STATE" --config-hash "$hash" 2>&1)" \
+      --home "$runtime" --state "$IHAR_STATE" --config-hash "$hash" \
+      --auth-store "$IHAR_STORE" 2>&1)" \
       || ihar_die 3 "cannot reconcile the Codex Remote Control daemon: ${out:-no output}"
   else
     out="$(ihar_python ihar.codex.daemon start --binary "$IHAR_CODEX_BIN" \
-      --home "$runtime" --state "$IHAR_STATE" --config-hash "$hash" 2>&1)" \
+      --home "$runtime" --state "$IHAR_STATE" --config-hash "$hash" \
+      --auth-store "$IHAR_STORE" 2>&1)" \
       || ihar_die 3 "cannot start the Codex app-server daemon: ${out:-no output}"
   fi
 
-  CODEX_HOME="$runtime" "$IHAR_CODEX_BIN" app-server daemon enable-remote-control \
+  CODEX_HOME="$runtime" ihar_python ihar.codex.auth_owner run \
+    "$IHAR_STORE" "$runtime" "$hash" attached -- \
+    "$IHAR_CODEX_BIN" app-server daemon enable-remote-control \
     >/dev/null || ihar_die 3 "cannot enable Codex Remote Control"
-  CODEX_HOME="$runtime" "$IHAR_CODEX_BIN" remote-control pair \
+  CODEX_HOME="$runtime" ihar_python ihar.codex.auth_owner run \
+    "$IHAR_STORE" "$runtime" "$hash" attached -- \
+    "$IHAR_CODEX_BIN" remote-control pair \
     || ihar_die 3 "cannot create a Codex Remote Control pairing code"
   ihar_python ihar.codex.daemon mark-remote --binary "$IHAR_CODEX_BIN" \
-    --home "$runtime" --state "$IHAR_STATE" --config-hash "$hash" >/dev/null \
+    --home "$runtime" --state "$IHAR_STATE" --config-hash "$hash" \
+    --auth-store "$IHAR_STORE" >/dev/null \
     || ihar_die 3 "cannot record the Codex Remote Control daemon"
 }
 
@@ -185,7 +192,8 @@ run 'ihar install'"
 
   local out status=0
   out="$(ihar_python ihar.codex.daemon "$action" \
-          --binary "$IHAR_CODEX_BIN" --home "$home" --state "$IHAR_STATE" 2>&1)" || status=$?
+          --binary "$IHAR_CODEX_BIN" --home "$home" --state "$IHAR_STATE" \
+          --auth-store "$IHAR_STORE" 2>&1)" || status=$?
 
   if [[ "$IHAR_FLAG_JSON" == true ]]; then
     printf '%s\n' "$out"
