@@ -61,6 +61,12 @@ ihar_init() {
 # machine without a built venv can still validate, while anything needing a
 # dependency fails on the import rather than silently degrading.
 #
+# `ihar_python -c <script> [args...]` runs an inline script instead, because `-m -c`
+# is not a Python invocation at all: it asks for a module named `-c` and fails with
+# "No module named -c". Four call sites on the `ihar switch` path used that form and
+# only worked under a test stub that branched on `-c`, so the shipped switch assembled
+# empty JSON. The stub encoded the intended contract; this is production catching up.
+#
 # ihar_python_bin — the interpreter path alone. A caller that must `exec` the
 # interpreter, so that `$!` is the process it later signals, cannot go through the
 # function: `exec` takes a program, never a shell function.
@@ -74,6 +80,11 @@ ihar_python_bin() {
 ihar_python() {
   local interpreter
   interpreter="$(ihar_python_bin)" || return 3
+  if [[ "${1:-}" == -c ]]; then
+    PYTHONPATH="${IHAR_ROOT:?IHAR_ROOT is not set}/lib/python${PYTHONPATH:+:$PYTHONPATH}" \
+      "$interpreter" "$@"
+    return
+  fi
   PYTHONPATH="${IHAR_ROOT:?IHAR_ROOT is not set}/lib/python${PYTHONPATH:+:$PYTHONPATH}" \
     "$interpreter" -m "$@"
 }
