@@ -28,6 +28,7 @@ _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 _CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _MARKER = ".ihar-stage"
 _PENDING = ".auth-publish-pending"
+_COMPLETE = ".auth-publish-complete"
 
 
 def _open_store(store: Path, stack: ExitStack) -> int:
@@ -130,11 +131,12 @@ def _write_marker(stage_fd: int, record: dict) -> None:
 
 
 def _guard_no_pending(owner: int) -> None:
-    try:
-        os.stat(_PENDING, dir_fd=owner, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    raise AuthOwnerError("Codex auth publication needs manual recovery")
+    for name in (_PENDING, _COMPLETE):
+        try:
+            os.stat(name, dir_fd=owner, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        raise AuthOwnerError("Codex auth publication needs manual recovery")
 
 
 def _write_pending(owner: int, token: str) -> None:
@@ -224,17 +226,35 @@ def _same_published_file(owner: int, published: os.stat_result) -> bool:
     return (current.st_dev, current.st_ino) == (published.st_dev, published.st_ino)
 
 
-def _rollback(owner: int, recovery: int | None, token: str, published: os.stat_result) -> None:
+def _rollback(
+    owner: int,
+    recovery: int | None,
+    token: str,
+    published: os.stat_result,
+    baseline: dict[str, int | str] | None,
+) -> None:
     if not _same_published_file(owner, published):
         raise AuthOwnerError("Codex auth owner changed; manual recovery required")
     if recovery is None:
         os.unlink("auth.json", dir_fd=owner)
     else:
         rollback_name = f".auth-rollback-{token}"
-        os.link(
-            "auth.json", rollback_name,
-            src_dir_fd=recovery, dst_dir_fd=owner, follow_symlinks=False,
-        )
+        source = os.open("auth.json", _FILE_FLAGS, dir_fd=recovery)
+        try:
+            source_identity = _identity(source)
+            if baseline is None or any(
+                source_identity[field] != baseline[field] for field in ("size", "sha256")
+            ):
+                raise AuthOwnerError("Codex auth recovery copy changed")
+            target = os.open(rollback_name, _CREATE_FLAGS, 0o600, dir_fd=owner)
+            try:
+                _copy_file(source, target)
+            finally:
+                os.close(target)
+            if _identity(source) != source_identity:
+                raise AuthOwnerError("Codex auth recovery copy changed during rollback")
+        finally:
+            os.close(source)
         os.replace(rollback_name, "auth.json", src_dir_fd=owner, dst_dir_fd=owner)
     os.fsync(owner)
 
@@ -323,7 +343,7 @@ def publish(
             except OSError as error:
                 if committed:
                     try:
-                        _rollback(owner, recovery_fd, token, published)
+                        _rollback(owner, recovery_fd, token, published, baseline)
                     except (OSError, AuthOwnerError) as rollback_error:
                         raise AuthOwnerError(
                             "Codex auth publication and rollback failed; recovery retained"
@@ -332,8 +352,11 @@ def publish(
                     "Codex auth publication failed; staged and recovery bytes retained"
                 ) from error
             try:
-                os.unlink(_PENDING, dir_fd=owner)
+                os.replace(_PENDING, _COMPLETE, src_dir_fd=owner, dst_dir_fd=owner)
                 os.fsync(owner)
+                # A crash after this unlink may resurrect the marker, which
+                # fails closed. Canonical publication is already durable.
+                os.unlink(_COMPLETE, dir_fd=owner)
             except OSError as error:
                 raise AuthOwnerError(
                     "Codex credential published; transaction cleanup needs manual review"

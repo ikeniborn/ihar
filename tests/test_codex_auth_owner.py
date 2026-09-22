@@ -125,10 +125,37 @@ class AuthOwnerTests(unittest.TestCase):
 
         self.assertTrue(interrupted)
         self.assertEqual(self.canonical.read_text(encoding="utf-8"), "synthetic-old")
+        self.assertEqual(self.canonical.stat().st_nlink, 1)
         self.assertEqual((staged / "auth.json").read_text(encoding="utf-8"), "synthetic-new")
         recovered = list((self.canonical.parent / "recovery").glob("*/auth.json"))
         self.assertEqual(len(recovered), 1)
         self.assertEqual(recovered[0].read_text(encoding="utf-8"), "synthetic-old")
+        self.assertNotEqual(self.canonical.stat().st_ino, recovered[0].stat().st_ino)
+        with self.assertRaises(AuthOwnerError):
+            stage(self.store)
+
+    def test_cleanup_sync_failure_keeps_reuse_blocked(self) -> None:
+        from ihar.codex import auth_owner
+
+        staged = stage(self.store)
+        (staged / "auth.json").write_text("synthetic-new", encoding="utf-8")
+        real_fsync = auth_owner.os.fsync
+        interrupted = False
+
+        def interrupt_cleanup_sync(fd: int) -> None:
+            nonlocal interrupted
+            pending = self.canonical.parent / ".auth-publish-pending"
+            if not interrupted and self.canonical.exists() and not pending.exists():
+                interrupted = True
+                raise OSError("synthetic cleanup sync failure")
+            real_fsync(fd)
+
+        with mock.patch.object(auth_owner.os, "fsync", side_effect=interrupt_cleanup_sync):
+            with self.assertRaises(AuthOwnerError):
+                publish(staged, self.store, approve_existing=False)
+
+        self.assertTrue(interrupted)
+        self.assertEqual(self.canonical.read_text(encoding="utf-8"), "synthetic-new")
         with self.assertRaises(AuthOwnerError):
             stage(self.store)
 
