@@ -7,9 +7,12 @@ Usage:
     python3 -m ihar.lockfile --get <dotted.path> <lockfile>
     python3 -m ihar.lockfile --verify-map <key> <lockfile> <store>
 
-`--verify-map` prints the first path whose digest does not match, and nothing when
-every entry agrees. A file the lockfile pins but the store does not have counts as a
-mismatch: a pinned hook that is missing is not a hook that passed.
+`--verify-map` prints the first path that does not satisfy its pin, prefixed by what is
+wrong with it — `missing` or `changed` — and nothing when every entry agrees. A file the
+lockfile pins but the store does not have counts as a mismatch: a pinned hook that is
+missing is not a hook that passed. The two are told apart because they are different
+situations for whoever reads the refusal: a missing file means this store predates the
+pin, a changed one means something rewrote it.
 """
 
 from __future__ import annotations
@@ -49,10 +52,10 @@ def verify_map(key: str, path: str, store: str) -> int:
     for relative, pinned in sorted(entries.items()):
         target = os.path.join(store, relative)
         if not os.path.isfile(target):
-            print(target)
+            print(f"missing {target}")
             return 1
         if _digest(target) != pinned:
-            print(target)
+            print(f"changed {target}")
             return 1
     return 0
 
