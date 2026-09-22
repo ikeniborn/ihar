@@ -422,6 +422,8 @@ The Codex app-server daemon is long-lived and shared. Its README states that cli
 
 The auth-owner record binds the daemon's process start identity, socket identity, runtime and generation. Attached clients use that exact owner and never create an independent credential writer. Its guardian continues to hold the lease after the initiating CLI exits; daemon stop releases it only after the daemon and plausible descendants are quiescent. A stale or unverifiable owner record is not permission to start another daemon.
 
+The vendor `codex --remote` TUI is not trusted as protocol-only from its argv. Attachment is Linux-only and runs as a child of the existing auth guardian inside a new user/mount namespace. Before vendor exec, ihar bind-mounts the exact verified runtime and `$IHAR_STORE/auth/codex` read-only at their original absolute paths, exposes only the bounded non-credential client-state directory as writable, drops mount capability, applies `no_new_privs`, and performs destructive refusal probes against temporary sentinels adjacent to both credential views. The probes must prove write, truncate, unlink, rename-over and symlink replacement are denied while the daemon socket and declared client state remain usable. Only then does the guardian release the exec gate, pass the caller's standard-I/O descriptors, and bind the exact client PID/start identity and descendants to the existing daemon owner. User/mount namespaces unavailable, any mount or probe failure, retained privilege, unsupported platform, or uncertain teardown is exit 3 before vendor code starts; there is no file-mode-only or unprotected fallback.
+
 `ihar daemon status|stop|restart` exposes the same machinery.
 
 ## 6. Hooks (slice S3)
@@ -880,8 +882,10 @@ happens immediately after resolution, before store or gateway work. Claude adds 
 native flag before its prompt and passthrough separator. Codex starts and records the
 managed daemon when absent, enables Remote Control, prints the vendor pairing code,
 marks the daemon record `remote_control: true`, and execs the TUI with `--remote
-unix://<runtime>/app-server-control/app-server-control.sock`. Dry-run renders this
-final argv but performs none of the daemon or pairing side effects.
+unix://<runtime>/app-server-control/app-server-control.sock`. The TUI starts only through
+the guardian's verified read-only namespace from §5.5; unsupported enforcement is exit 3
+before vendor exec. Dry-run renders this final argv but performs none of the daemon,
+pairing, namespace, or attachment side effects.
 
 ### 13.2 Multi-session console (slices S12, S13)
 
