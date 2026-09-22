@@ -674,6 +674,7 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
             os.close(descriptor)
         return True
     daemon_action = None
+    guest_action = False
     try:
         if (not message or len(message) > _MAX_MESSAGE
             or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
@@ -683,6 +684,7 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
         if not isinstance(payload, dict) or not isinstance(payload.get("fields"), dict):
             raise auth_owner.AuthOwnerError("Codex guardian request is invalid")
         operation, fields = payload.get("operation"), payload["fields"]
+        guest_action = isinstance(operation, str) and operation.startswith("guest-")
         if external and operation not in ("daemon-stop", "daemon-restart",
                                           "attach", "attach-status", "attach-signal"):
             raise auth_owner.AuthOwnerError("Codex external guardian operation is invalid")
@@ -740,6 +742,28 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                     record["guest"] = identity
                     record["guest_reconciled"] = False
                 record["state"] = "active"
+            elif operation == "guest-register-bundle" and set(fields) == {
+                    "bundle", "image", "seed"}:
+                if any(not isinstance(fields[name], str) or not os.path.isabs(fields[name])
+                       for name in fields):
+                    raise auth_owner.AuthOwnerError("Codex guest bundle paths are invalid")
+                auth_owner.register_guarded_guest_bundle(
+                    fields["bundle"], fields["image"], fields["seed"], owner, record)
+            elif operation == "guest-starting" and not fields:
+                auth_owner.mark_guarded_guest_starting(record)
+            elif operation == "guest-bind-vm" and set(fields) == {"pid", "binary"}:
+                if not isinstance(fields["binary"], str):
+                    raise auth_owner.AuthOwnerError("Codex guest VM binding is invalid")
+                identity = _identity(fields["pid"], fields["binary"], guardian_pid, table)
+                auth_owner.bind_guarded_guest_vm(identity, record)
+            elif operation == "guest-quiescent" and not fields:
+                auth_owner.mark_guarded_guest_quiescent(record)
+            elif operation == "guest-publish" and set(fields) == {"bundle"}:
+                if not isinstance(fields["bundle"], str) or not os.path.isabs(fields["bundle"]):
+                    raise auth_owner.AuthOwnerError("Codex guest bundle path is invalid")
+                auth_owner.publish_guarded_guest(fields["bundle"], store, owner, record)
+            elif operation == "guest-abort" and not fields:
+                auth_owner.abort_guarded_guest_prelaunch(owner, record)
             elif operation == "release" and set(fields) <= {"guest_reconciled"}:
                 if credentials[0] != child_pid:
                     raise auth_owner.AuthOwnerError("Codex release caller is invalid")
@@ -898,7 +922,7 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
             _clear_auth_stage(store, staged)
     except (auth_owner.AuthOwnerError, OSError, ValueError, TypeError, KeyError,
             subprocess.SubprocessError):
-        if daemon_action is not None:
+        if daemon_action is not None or guest_action:
             with ExitStack() as stack:
                 owner = auth_owner._locked_owner(store, stack)
                 record = auth_owner._read_owner(owner)
@@ -942,12 +966,13 @@ def _release_when_quiescent(store: Path, child: subprocess.Popen) -> bool:
             or auth_owner._descendants_active(os.getpid())):
             return False
         if record["state"] == "blocked":
-            raise auth_owner.AuthOwnerError("Codex daemon outcome remains unverified")
+            raise auth_owner.AuthOwnerError("Codex guarded outcome remains unverified")
         if record.get("auth_stage") is not None:
             record["state"] = "blocked"
             auth_owner._write_owner(owner, record)
             raise auth_owner.AuthOwnerError("Codex auth stage cleanup remains unverified")
-        if record["guest"] is not None and not record["guest_reconciled"]:
+        if ((record["guest"] is not None or record.get("guest_bundle") is not None)
+            and not record["guest_reconciled"]):
             record["state"] = "blocked"
             auth_owner._write_owner(owner, record)
             raise auth_owner.AuthOwnerError("Codex guest return remains unverified")
@@ -998,7 +1023,8 @@ def run(store: Path, argv: list[str]) -> int:
             raise auth_owner.AuthBusy("external Codex consumer may own the shared login")
         record = {"schema": 2, "state": "pending", "guardian": auth_owner._identity_for(os.getpid()),
                   "child": None, "children": [], "daemon": None, "guest": None,
-                  "guest_reconciled": False, "runtime": None, "config_hash": None}
+                  "guest_bundle": None, "guest_reconciled": False,
+                  "runtime": None, "config_hash": None}
         auth_owner._write_owner(owner, record)
     with ExitStack() as sockets:
         server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -1215,6 +1241,23 @@ def _main(arguments: list[str]) -> int:
         request(int(arguments[1]), "bind-runtime",
                 {"runtime": arguments[2], "config_hash": arguments[3]})
         return 0
+    if arguments and arguments[0].startswith("guest-"):
+        action = arguments[0]
+        if action == "guest-register" and len(arguments) == 5:
+            request(int(arguments[1]), "guest-register-bundle", {
+                "bundle": arguments[2], "image": arguments[3], "seed": arguments[4]})
+            return 0
+        if action in ("guest-starting", "guest-quiescent", "guest-abort") and len(arguments) == 2:
+            request(int(arguments[1]), action, {})
+            return 0
+        if action == "guest-bind-vm" and len(arguments) == 4:
+            request(int(arguments[1]), action,
+                    {"pid": int(arguments[2]), "binary": arguments[3]})
+            return 0
+        if action == "guest-publish" and len(arguments) == 3:
+            request(int(arguments[1]), action, {"bundle": arguments[2]})
+            return 0
+        raise auth_owner.AuthOwnerError("Codex guest guardian invocation is invalid")
     if len(arguments) >= 6 and arguments[0] == "attach" and arguments[4] == "--":
         return attach(Path(arguments[1]), arguments[2], arguments[3], arguments[5:], (0, 1, 2))
     if len(arguments) >= 5 and arguments[:1] == ["auth"] and arguments[2] == "--":

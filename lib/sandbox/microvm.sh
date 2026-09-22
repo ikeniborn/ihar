@@ -1190,21 +1190,16 @@ ihar_microvm_launch() {
     || ihar_die 3 "microVM session parent is unsafe"
   session="$(mktemp -d "$IHAR_STATE_ROOT/microvm/${IHAR_LAUNCH_ID:-$$}.XXXXXX")" \
     || ihar_die 3 "cannot create microVM session directory"
-  local codex_runtime="$runtime" guest_owner_id="" guest_owner_file="$session/guest-owner-id" old_umask
-  [[ "$vendor" == codex ]] || codex_runtime="${IHAR_OTHER_RUNTIME:?Codex guest runtime is absent}"
-  old_umask="$(umask)"
-  umask 077
-  local guest_vm_started=false early_cleanup_done=false
+  [[ "$vendor" == codex || -n "${IHAR_OTHER_RUNTIME:-}" ]] \
+    || ihar_die 3 "Codex guest runtime is absent"
+  [[ -n "${IHAR_GUARD_FD:-}" ]] \
+    || ihar_die 3 "Codex guest guardian channel is unavailable"
+  local guest_vm_started=false guest_bundle_registered=false early_cleanup_done=false
   _ihar_microvm_early_cleanup() {
     [[ "$early_cleanup_done" != true ]] || return 0
     early_cleanup_done=true
-    if [[ "$guest_vm_started" != true ]]; then
-      if [[ -z "$guest_owner_id" && -f "$guest_owner_file" ]]; then
-        IFS= read -r guest_owner_id < "$guest_owner_file" || true
-      fi
-      if [[ "$guest_owner_id" =~ ^[a-f0-9]{32}$ ]]; then
-        ihar_codex_guest_owner abort "$guest_owner_id" >/dev/null 2>&1 || true
-      fi
+    if [[ "$guest_vm_started" != true && "$guest_bundle_registered" == true ]]; then
+      ihar_codex_guest_owner abort >/dev/null 2>&1 || true
     fi
     ihar_microvm_release_slot
     ihar_launch_state_leave
@@ -1212,13 +1207,6 @@ ihar_microvm_launch() {
   }
   trap _ihar_microvm_early_cleanup EXIT
   trap '_ihar_microvm_early_cleanup; exit 130' INT TERM
-  ihar_codex_guest_owner acquire "$codex_runtime" "$guest_owner_file" \
-    || ihar_die 3 "Codex guest credential owner is unavailable"
-  umask "$old_umask"
-  IFS= read -r guest_owner_id < "$guest_owner_file" \
-    || ihar_die 3 "Codex guest credential owner handoff is unavailable"
-  [[ "$guest_owner_id" =~ ^[a-f0-9]{32}$ ]] \
-    || ihar_die 3 "Codex guest credential owner handoff is invalid"
   ihar_microvm_reserve_slot
   tap="$IHAR_MICROVM_TAP"
 
@@ -1262,9 +1250,10 @@ ihar_microvm_launch() {
     || ihar_die 3 "cannot build the writable vendor state image"
   _ihar_microvm_image_auth_matches "$state_img" "$state_seed/.ihar-guest-codex-home/auth.json" \
     "$guest_auth_bundle" || ihar_die 3 "Codex guest credential image differs from private seed"
-  ihar_codex_guest_owner register "$guest_owner_id" "$guest_auth_bundle" "$state_img" \
+  ihar_codex_guest_owner register "$guest_auth_bundle" "$state_img" \
     "$state_seed/.ihar-guest-codex-home/auth.json" \
     || ihar_die 3 "cannot register Codex guest bundle"
+  guest_bundle_registered=true
   local size_mib=$(( $(du -sm "$bundle" | awk '{print $1}') + 64 ))
   _ihar_microvm_make_image "$policy" "$bundle" "$size_mib" \
     || ihar_die 3 "cannot build the read-only policy image"
@@ -1302,7 +1291,7 @@ ihar_microvm_launch() {
   manifest="$(ihar_microvm_launch_manifest_write "$config")" \
     || ihar_die 3 "cannot capture the microVM prelaunch manifest"
   : > "$log"
-  ihar_codex_guest_owner starting "$guest_owner_id" \
+  ihar_codex_guest_owner starting \
     || ihar_die 3 "cannot mark Codex guest start boundary"
   guest_vm_started=true
   setsid "$IHAR_STORE/bin/firecracker" --api-sock "$socket" --config-file "$config" --log-path "$log" --level Warn \
@@ -1314,7 +1303,7 @@ ihar_microvm_launch() {
     (( group_ticks++ < 40 )) || ihar_die 3 "Codex guest VM process group cannot be verified"
     sleep 0.05
   done
-  ihar_codex_guest_owner bind-vm "$guest_owner_id" "$pid" "$IHAR_STORE/bin/firecracker" \
+  ihar_codex_guest_owner bind-vm "$pid" "$IHAR_STORE/bin/firecracker" \
     || ihar_die 3 "cannot bind Codex guest VM identity"
   local key="${IHAR_MICROVM_SSH_KEY:-$IHAR_STORE/microvm/current/client_key}" ticks=0 ssh_user=root
   local known_hosts="$session/known_hosts"
@@ -1374,13 +1363,11 @@ ihar_microvm_launch() {
   done
   wait "$pid" 2>/dev/null || true
   pid=""
-  ihar_codex_guest_owner quiescent "$guest_owner_id" \
+  ihar_codex_guest_owner quiescent \
     || ihar_die 3 "Codex guest quiescence cannot be verified; credential bundle retained"
   _ihar_microvm_extract_guest_auth "$state_img" "$guest_auth_bundle" \
     || ihar_die 3 "Codex guest credential cannot be extracted; state image retained"
-  ihar_codex_guest_owner publish "$guest_owner_id" "$guest_auth_bundle" \
+  ihar_codex_guest_owner publish "$guest_auth_bundle" \
     || ihar_die 3 "Codex guest credential cannot be reconciled; bundle retained"
-  ihar_codex_guest_owner release "$guest_owner_id" "$codex_runtime" \
-    || ihar_die 3 "Codex guest owner release cannot be verified"
   _ihar_microvm_cleanup; trap - EXIT INT TERM; return "$status"
 }

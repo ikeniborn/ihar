@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -16,10 +18,98 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib", "python"))
 
 from ihar.codex import auth_owner
-from ihar.codex.auth_owner import (
-    AuthOwnerError, acquire, bind_guest_vm, bundle_identity_matches,
-    mark_guest_quiescent, publish_guest, register_guest_bundle, release,
-)
+from ihar.codex.auth_owner import AuthOwnerError
+
+
+def _update_guarded(store: Path, update):
+    with ExitStack() as stack:
+        owner = auth_owner._locked_owner(auth_owner._lease_store(store), stack)
+        record = auth_owner._read_owner(owner)
+        result = update(owner, record)
+        auth_owner._write_owner(owner, record)
+        return result
+
+
+def acquire(_runtime: Path, mode: str, *, store: Path) -> str | None:
+    if mode != "guest":
+        return auth_owner.acquire(_runtime, mode, store=store)
+    with ExitStack() as stack:
+        owner = auth_owner._locked_owner(store, stack)
+        auth_owner._write_owner(owner, {
+            "schema": 2,
+            "state": "active",
+            "guardian": auth_owner._identity_for(os.getpid()),
+            "child": None,
+            "children": [],
+            "daemon": None,
+            "guest": None,
+            "guest_bundle": None,
+            "guest_reconciled": False,
+            "runtime": None,
+            "config_hash": None,
+        })
+
+
+def register_guest_bundle(bundle: Path, image: Path, store: Path,
+                          _owner: None, seed: Path) -> dict:
+    def update(owner, record):
+        auth_owner.register_guarded_guest_bundle(bundle, image, seed, owner, record)
+        return record["guest_bundle"]["baseline"]
+    return _update_guarded(store, update)
+
+
+def bind_guest_vm(_owner: None, pid: int, binary: str, *, store: Path) -> None:
+    def update(_descriptor, record):
+        auth_owner.mark_guarded_guest_starting(record)
+        auth_owner.bind_guarded_guest_vm(auth_owner._identity_for(pid, binary), record)
+    _update_guarded(store, update)
+
+
+def mark_guest_quiescent(_owner: None, *, store: Path) -> None:
+    _update_guarded(store, lambda _descriptor, record:
+                    auth_owner.mark_guarded_guest_quiescent(record))
+
+
+def publish_guest(bundle: Path, _baseline: dict, store: Path, _owner: None) -> None:
+    _update_guarded(store, lambda descriptor, record:
+                    auth_owner.publish_guarded_guest(bundle, store, descriptor, record))
+
+
+def release(_owner: None, *, store: Path) -> None:
+    if _owner is not None:
+        auth_owner.release(_owner, store=store)
+        return
+    with ExitStack() as stack:
+        owner = auth_owner._locked_owner(store, stack)
+        record = auth_owner._read_owner(owner)
+        if record.get("guest_bundle") is not None and not record.get("guest_reconciled"):
+            raise AuthOwnerError("Codex guest credential return is incomplete; bundle retained")
+        os.unlink(auth_owner._OWNER_RECORD, dir_fd=owner)
+        os.fsync(owner)
+
+
+def bundle_identity_matches(bundle: Path, _owner: None, *, store: Path) -> bool:
+    try:
+        with ExitStack() as stack:
+            owner = auth_owner._locked_owner(store, stack)
+            auth_owner._guest_record(auth_owner._read_owner(owner), bundle.resolve())
+        return True
+    except (OSError, KeyError, AuthOwnerError):
+        return False
+
+
+def abort_guest_prelaunch(store: Path) -> None:
+    with ExitStack() as stack:
+        owner = auth_owner._locked_owner(store, stack)
+        record = auth_owner._read_owner(owner)
+        auth_owner.abort_guarded_guest_prelaunch(owner, record)
+        os.unlink(auth_owner._OWNER_RECORD, dir_fd=owner)
+        os.fsync(owner)
+
+
+def mark_guest_starting(store: Path) -> None:
+    _update_guarded(store, lambda _descriptor, record:
+                    auth_owner.mark_guarded_guest_starting(record))
 
 
 class GuestAuthTests(unittest.TestCase):
@@ -54,6 +144,25 @@ class GuestAuthTests(unittest.TestCase):
         process.terminate()
         process.wait()
         mark_guest_quiescent(self.owner_id, store=self.store)
+
+    def test_process_disappearing_during_status_read_is_not_ambiguity(self) -> None:
+        class VanishingProcess:
+            name = "424242"
+
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def __truediv__(self, _name: str):
+                return self
+
+            def read_text(self) -> str:
+                self.reads += 1
+                if self.reads == 1:
+                    return "424242 (synthetic) S 1 424242 " + "0 " * 18
+                raise ProcessLookupError("synthetic vanished process")
+
+        with mock.patch.object(Path, "iterdir", return_value=[VanishingProcess()]):
+            self.assertEqual(auth_owner._process_table(), {})
 
     def test_unchanged_guest_is_noop_and_owner_can_release(self) -> None:
         self.quiesce()
@@ -180,7 +289,7 @@ class GuestAuthTests(unittest.TestCase):
         self.assertEqual(self.guest_candidate.read_text(), "synthetic-refresh")
 
     def test_prelaunch_abort_releases_registered_owner_without_vm(self) -> None:
-        auth_owner.abort_guest_prelaunch(self.owner_id, store=self.store)
+        abort_guest_prelaunch(self.store)
         self.assertTrue(self.guest_candidate.is_file())
         next_id = acquire(self.root / "next-runtime", "foreground", store=self.store)
         release(next_id, store=self.store)
@@ -190,25 +299,15 @@ class GuestAuthTests(unittest.TestCase):
         self.addCleanup(lambda: process.poll() is None and (process.terminate(), process.wait()))
         bind_guest_vm(self.owner_id, process.pid, "/usr/bin/sleep", store=self.store)
         with self.assertRaises(AuthOwnerError):
-            auth_owner.abort_guest_prelaunch(self.owner_id, store=self.store)
+            abort_guest_prelaunch(self.store)
         with self.assertRaises(AuthOwnerError):
             acquire(self.root / "next-runtime", "foreground", store=self.store)
 
     def test_start_marker_blocks_abort_before_vm_binding(self) -> None:
-        auth_owner.mark_guest_starting(self.owner_id, store=self.store)
+        mark_guest_starting(self.store)
         with self.assertRaises(AuthOwnerError):
-            auth_owner.abort_guest_prelaunch(self.owner_id, store=self.store)
+            abort_guest_prelaunch(self.store)
         self.assertTrue(self.guest_candidate.is_file())
-
-    def test_unregistered_prelaunch_abort_releases_owner(self) -> None:
-        other = self.root / "other-store"
-        (other / "auth" / "codex").mkdir(parents=True, mode=0o700)
-        (other / "auth").chmod(0o700)
-        (other / "auth" / "codex" / "auth.json").write_text("synthetic-other", encoding="utf-8")
-        owner_id = acquire(self.root / "other-runtime", "guest", store=other)
-        auth_owner.abort_guest_prelaunch(owner_id, store=other)
-        next_id = acquire(self.root / "next-runtime", "foreground", store=other)
-        release(next_id, store=other)
 
     def test_candidate_file_sync_failure_preserves_temporary_bytes(self) -> None:
         self.guest_candidate.unlink()
@@ -246,18 +345,18 @@ class GuestAuthTests(unittest.TestCase):
         self.assertEqual(temporary.read_text(), "synthetic-fresh")
         self.assertEqual(self.guest_candidate.read_text(), "synthetic-fresh")
 
-    def test_cli_guest_publication_never_prints_candidate_bytes(self) -> None:
+    def test_owner_id_guest_publish_cli_is_not_a_capability(self) -> None:
         self.guest_candidate.write_text("synthetic-cli-secret", encoding="utf-8")
         self.quiesce()
         environment = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "lib", "python"))
         result = subprocess.run(
             [sys.executable, "-m", "ihar.codex.auth_owner", "guest-publish",
-             str(self.store), self.owner_id, str(self.bundle)],
+             str(self.store), "legacy-owner-id", str(self.bundle)],
             capture_output=True, text=True, env=environment, check=False,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 3)
         self.assertNotIn("synthetic-cli-secret", result.stdout + result.stderr)
-        self.assertEqual(self.canonical.read_text(), "synthetic-cli-secret")
+        self.assertEqual(self.canonical.read_text(), "synthetic-old")
 
     def test_cli_guest_refusal_never_prints_candidate_bytes(self) -> None:
         self.guest_candidate.write_text("synthetic-cli-secret", encoding="utf-8")
@@ -266,12 +365,148 @@ class GuestAuthTests(unittest.TestCase):
         environment = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "lib", "python"))
         result = subprocess.run(
             [sys.executable, "-m", "ihar.codex.auth_owner", "guest-publish",
-             str(self.store), self.owner_id, str(self.bundle)],
+             str(self.store), "legacy-owner-id", str(self.bundle)],
             capture_output=True, text=True, env=environment, check=False,
         )
         self.assertEqual(result.returncode, 3)
         self.assertNotIn("synthetic-cli-secret", result.stdout + result.stderr)
         self.assertEqual(self.canonical.read_text(), "synthetic-other-writer")
+
+    def test_original_guardian_channel_reconciles_guest_without_second_lease(self) -> None:
+        channel_root = self.root / "channel"
+        channel_store = channel_root / "store"
+        channel_store.mkdir(parents=True, mode=0o700)
+        canonical = channel_store / "auth" / "codex" / "auth.json"
+        canonical.parent.mkdir(parents=True, mode=0o700)
+        canonical.parent.parent.chmod(0o700)
+        canonical.write_text("synthetic-channel-old", encoding="utf-8")
+        canonical.chmod(0o600)
+        bundle = channel_root / "bundle"
+        bundle.mkdir(mode=0o700)
+        image = bundle / "state.ext4"
+        image.write_bytes(b"synthetic-channel-image")
+        seed = bundle / "seed.json"
+        seed.write_text("synthetic-channel-old", encoding="utf-8")
+        seed.chmod(0o600)
+        candidate = bundle / "auth.json"
+        candidate.write_text("synthetic-channel-refresh", encoding="utf-8")
+        candidate.chmod(0o600)
+        sleep = shutil.which("sleep")
+        self.assertIsNotNone(sleep)
+        script = f"""import os, subprocess
+from ihar.codex import guardian
+fd = int(os.environ['IHAR_GUARD_FD'])
+guardian.request(fd, 'guest-register-bundle', {{
+    'bundle': {str(bundle)!r},
+    'image': {str(image)!r},
+    'seed': {str(seed)!r},
+}})
+guardian.request(fd, 'guest-starting', {{}})
+process = subprocess.Popen([{sleep!r}, '60'], start_new_session=True)
+guardian.request(fd, 'guest-bind-vm', {{'pid': process.pid, 'binary': {sleep!r}}})
+process.terminate()
+process.wait()
+guardian.request(fd, 'guest-quiescent', {{}})
+guardian.request(fd, 'guest-publish', {{'bundle': {str(bundle)!r}}})
+"""
+        environment = dict(
+            os.environ,
+            PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "lib", "python"),
+        )
+        result = subprocess.run(
+            [sys.executable, "-m", "ihar.codex.guardian", str(channel_store), "--",
+             sys.executable, "-c", script],
+            capture_output=True, text=True, env=environment, timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(canonical.read_text(encoding="utf-8"), "synthetic-channel-refresh")
+        self.assertFalse((canonical.parent / ".owner.json").exists())
+
+    def test_guest_acquire_cli_is_not_an_owner_id_capability(self) -> None:
+        legacy = self.root / "legacy"
+        store = legacy / "store"
+        canonical = store / "auth" / "codex" / "auth.json"
+        canonical.parent.mkdir(parents=True, mode=0o700)
+        canonical.parent.parent.chmod(0o700)
+        canonical.write_text("synthetic-legacy", encoding="utf-8")
+        canonical.chmod(0o600)
+        runtime = legacy / "runtime"
+        runtime.mkdir()
+        (runtime / "auth.json").symlink_to(canonical)
+        handoff = legacy / "owner-id"
+        environment = dict(
+            os.environ,
+            PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "lib", "python"),
+        )
+        result = subprocess.run(
+            [sys.executable, "-m", "ihar.codex.auth_owner", "guest-acquire",
+             str(store), str(runtime), str(handoff)],
+            capture_output=True, text=True, env=environment, check=False,
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertFalse(handoff.exists())
+        self.assertFalse((canonical.parent / ".owner.json").exists())
+
+    def test_guardian_baseline_drift_retains_candidate_and_blocks_next_writer(self) -> None:
+        channel_root = self.root / "drift-channel"
+        channel_store = channel_root / "store"
+        channel_store.mkdir(parents=True, mode=0o700)
+        canonical = channel_store / "auth" / "codex" / "auth.json"
+        canonical.parent.mkdir(parents=True, mode=0o700)
+        canonical.parent.parent.chmod(0o700)
+        canonical.write_text("synthetic-drift-old", encoding="utf-8")
+        canonical.chmod(0o600)
+        bundle = channel_root / "bundle"
+        bundle.mkdir(mode=0o700)
+        image = bundle / "state.ext4"
+        image.write_bytes(b"synthetic-drift-image")
+        seed = bundle / "seed.json"
+        seed.write_text("synthetic-drift-old", encoding="utf-8")
+        seed.chmod(0o600)
+        candidate = bundle / "auth.json"
+        candidate.write_text("synthetic-drift-secret", encoding="utf-8")
+        candidate.chmod(0o600)
+        sleep = shutil.which("sleep")
+        self.assertIsNotNone(sleep)
+        script = f"""import os, subprocess
+from pathlib import Path
+from ihar.codex import guardian
+fd = int(os.environ['IHAR_GUARD_FD'])
+guardian.request(fd, 'guest-register-bundle', {{
+    'bundle': {str(bundle)!r},
+    'image': {str(image)!r},
+    'seed': {str(seed)!r},
+}})
+guardian.request(fd, 'guest-starting', {{}})
+process = subprocess.Popen([{sleep!r}, '60'], start_new_session=True)
+guardian.request(fd, 'guest-bind-vm', {{'pid': process.pid, 'binary': {sleep!r}}})
+process.terminate()
+process.wait()
+guardian.request(fd, 'guest-quiescent', {{}})
+Path({str(canonical)!r}).write_text('synthetic-other-writer', encoding='utf-8')
+guardian.request(fd, 'guest-publish', {{'bundle': {str(bundle)!r}}})
+"""
+        environment = dict(
+            os.environ,
+            PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "lib", "python"),
+        )
+        result = subprocess.run(
+            [sys.executable, "-m", "ihar.codex.guardian", str(channel_store), "--",
+             sys.executable, "-c", script],
+            capture_output=True, text=True, env=environment, timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertNotIn("synthetic-drift-secret", result.stdout + result.stderr)
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "synthetic-drift-secret")
+        self.assertEqual(canonical.read_text(encoding="utf-8"), "synthetic-other-writer")
+        record = json.loads((canonical.parent / ".owner.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["state"], "blocked")
+        contender = subprocess.run(
+            [sys.executable, "-m", "ihar.codex.guardian", str(channel_store), "--",
+             sys.executable, "-c", "raise SystemExit(0)"],
+            capture_output=True, text=True, env=environment, timeout=5, check=False,
+        )
+        self.assertEqual(contender.returncode, 3)
 
 
 if __name__ == "__main__":

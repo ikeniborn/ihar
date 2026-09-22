@@ -66,7 +66,7 @@ def _process_table() -> dict[int, dict]:
                     argv = (entry / "cmdline").read_bytes().split(b"\0")
                 except PermissionError:
                     exe, argv = "", []
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 continue
             except (OSError, ValueError, IndexError) as error:
                 raise AuthOwnerError("Codex process identity cannot be verified") from error
@@ -287,33 +287,12 @@ def _write_owner(owner: int, record: dict) -> None:
     os.fsync(owner)
 
 
-def _write_guest_handoff(path: str | os.PathLike[str], owner_id: str) -> None:
-    """Persist the cleanup ID before publishing a guest owner record."""
-    handoff = Path(os.path.abspath(path))
-    if handoff.name != "guest-owner-id":
-        raise AuthOwnerError("Codex guest owner handoff path is invalid")
-    _guest_directory_identity(handoff.parent)
-    with ExitStack() as stack:
-        directory = _open_store(handoff.parent, stack)
-        descriptor = os.open(handoff.name, _CREATE_FLAGS, 0o600, dir_fd=directory)
-        try:
-            _write_all(descriptor, (owner_id + "\n").encode("ascii"))
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        os.fsync(directory)
-
-
 def acquire(runtime: str | os.PathLike[str], mode: str, *,
             store: str | os.PathLike[str] | None = None,
-            attached_daemon_id: str | None = None, config_hash: str = "",
-            guardian_pid: int | None = None,
-            guest_handoff: str | os.PathLike[str] | None = None) -> str:
+            attached_daemon_id: str | None = None, config_hash: str = "") -> str:
     """Admit one writer, or attach only to the exact verified daemon owner."""
-    if mode not in ("foreground", "daemon", "attached", "auth", "guest"):
+    if mode not in ("foreground", "daemon", "attached", "auth"):
         raise AuthOwnerError("Codex auth lease mode is invalid")
-    if guardian_pid is not None and (mode != "guest" or guardian_pid not in (os.getpid(), os.getppid())):
-        raise AuthOwnerError("Codex guest guardian is invalid")
     runtime_path = os.path.abspath(runtime)
     with ExitStack() as stack:
         owner = _locked_owner(_lease_store(store), stack)
@@ -347,15 +326,9 @@ def acquire(runtime: str | os.PathLike[str], mode: str, *,
         owner_id = secrets.token_hex(16)
         record = {"schema": 1, "id": owner_id, "runtime": runtime_path,
                   "config_hash": config_hash, "mode": mode,
-                  "guardian": _identity_for(guardian_pid or os.getpid()), "child": None, "daemon": None,
+                  "guardian": _identity_for(os.getpid()), "child": None, "daemon": None,
                   "attached_guardian": None,
                   "state": "active"}
-        if mode == "guest":
-            record["guest_baseline"] = _canonical_identity(owner)
-            if record["guest_baseline"] is None:
-                raise AuthOwnerError("Codex shared credential is absent")
-            if guest_handoff is not None:
-                _write_guest_handoff(guest_handoff, owner_id)
         _write_owner(owner, record)
         return owner_id
 
@@ -450,8 +423,6 @@ def mark_daemon_quiescent(owner_id: str, *,
 
 def release(owner_id: str, *, store: str | os.PathLike[str] | None = None) -> None:
     def update(record: dict, owner: int) -> None:
-        if record.get("mode") == "guest" and record.get("guest", {}).get("state") != "returned":
-            raise AuthOwnerError("Codex guest credential return is incomplete; bundle retained")
         if record.get("daemon") and record.get("state") != "quiescent":
             raise AuthBusy("Codex daemon quiescence has not been verified")
         if record.get("attached_guardian"):
@@ -681,50 +652,9 @@ def _main(arguments: list[str]) -> int:
         return _daemon_guardian(arguments[1:])
     if arguments and arguments[0].startswith("guest-"):
         action = arguments[0]
-        if action == "guest-acquire" and len(arguments) == 4:
-            store, runtime, handoff = arguments[1:]
-            verify_runtime_link(runtime, store)
-            acquire(runtime, "guest", store=store, guardian_pid=os.getppid(),
-                    guest_handoff=handoff)
-            return 0
-        if action == "guest-register" and len(arguments) == 6:
-            store, owner_id, bundle, image, seed = arguments[1:]
-            register_guest_bundle(bundle, image, store, owner_id, seed)
-            return 0
-        if action == "guest-abort" and len(arguments) == 3:
-            store, owner_id = arguments[1:]
-            abort_guest_prelaunch(owner_id, store=store)
-            return 0
-        if action == "guest-starting" and len(arguments) == 3:
-            store, owner_id = arguments[1:]
-            mark_guest_starting(owner_id, store=store)
-            return 0
         if action == "guest-commit-candidate" and len(arguments) == 3:
             bundle, temporary = arguments[1:]
             commit_guest_candidate(temporary, bundle)
-            return 0
-        if action == "guest-bind-vm" and len(arguments) == 5:
-            store, owner_id, pid, binary = arguments[1:]
-            bind_guest_vm(owner_id, int(pid), binary, store=store)
-            return 0
-        if action == "guest-quiescent" and len(arguments) == 3:
-            store, owner_id = arguments[1:]
-            mark_guest_quiescent(owner_id, store=store)
-            return 0
-        if action == "guest-publish" and len(arguments) == 4:
-            store, owner_id, bundle = arguments[1:]
-            with ExitStack() as stack:
-                owner = _locked_owner(_lease_store(store), stack)
-                record = _read_owner(owner)
-                if record is None or record.get("id") != owner_id:
-                    raise AuthOwnerError("Codex guest owner ID does not match")
-                baseline = _guest_record(record)["baseline"]
-            publish_guest(bundle, baseline, store, owner_id)
-            return 0
-        if action == "guest-release" and len(arguments) == 4:
-            store, owner_id, runtime = arguments[1:]
-            verify_runtime_link(runtime, store)
-            release(owner_id, store=store)
             return 0
         raise AuthOwnerError("Codex guest owner invocation is invalid")
     if len(arguments) < 6 or arguments[0] not in ("run", "auth") or "--" not in arguments:
@@ -1177,8 +1107,8 @@ def commit_guest_candidate(temporary: str | os.PathLike[str],
 
 
 def _guest_record(record: dict, bundle: Path | None = None) -> dict:
-    guest = record.get("guest")
-    if record.get("mode") != "guest" or not isinstance(guest, dict):
+    guest = record.get("guest_bundle") if record.get("schema") == 2 else None
+    if not isinstance(guest, dict):
         raise AuthOwnerError("Codex guest owner is not registered")
     if bundle is not None:
         if str(bundle) != guest.get("bundle") or _guest_directory_identity(bundle) != guest.get("identity"):
@@ -1196,120 +1126,108 @@ def _guest_guardian(record: dict) -> None:
         raise AuthOwnerError("Codex guest guardian cannot be verified")
 
 
-def register_guest_bundle(bundle: str | os.PathLike[str], image: str | os.PathLike[str],
-                          store: str | os.PathLike[str], owner_id: str,
-                          seed: str | os.PathLike[str]) -> dict:
-    """Register exact private bundle and state image before Firecracker starts."""
+def register_guarded_guest_bundle(bundle: str | os.PathLike[str],
+                                  image: str | os.PathLike[str],
+                                  seed: str | os.PathLike[str],
+                                  owner: int, record: dict) -> None:
+    """Bind exact guest recovery inputs to an authenticated schema-2 guardian."""
+    if (record.get("schema") != 2 or record.get("guest_bundle") is not None
+        or record.get("guest") is not None):
+        raise AuthOwnerError("Codex guest bundle is already registered")
+    _guest_guardian(record)
+    baseline = _canonical_identity(owner)
+    if baseline is None:
+        raise AuthOwnerError("Codex shared credential is absent")
     bundle_path = Path(os.path.abspath(bundle))
     image_path = Path(os.path.abspath(image))
-    with ExitStack() as stack:
-        owner = _locked_owner(_lease_store(store), stack)
-        record = _read_owner(owner)
-        if record is None or record.get("id") != owner_id or record.get("mode") != "guest":
-            raise AuthOwnerError("Codex guest owner ID does not match")
-        _guest_guardian(record)
-        if record.get("guest") is not None:
-            raise AuthOwnerError("Codex guest bundle is already registered")
-        baseline = _canonical_identity(owner)
-        if baseline is None:
-            raise AuthOwnerError("Codex shared credential is absent")
-        if baseline != record.get("guest_baseline"):
-            raise AuthOwnerError("Codex credential owner changed before guest registration")
-        seed_path = Path(os.path.abspath(seed))
-        _guest_directory_identity(seed_path.parent)
-        if _guest_file_identity(seed_path)["sha256"] != baseline["sha256"]:
-            raise AuthOwnerError("Codex guest seed differs from canonical credential")
-        identity = _guest_image_key(image_path)
-        record["guest"] = {
-            "bundle": str(bundle_path), "identity": _guest_directory_identity(bundle_path),
-            "image": str(image_path), "image_identity": identity,
-            "baseline": baseline, "vm": None, "state": "registered",
-        }
-        _write_owner(owner, record)
-        return baseline
+    seed_path = Path(os.path.abspath(seed))
+    _guest_directory_identity(seed_path.parent)
+    if _guest_file_identity(seed_path)["sha256"] != baseline["sha256"]:
+        raise AuthOwnerError("Codex guest seed differs from canonical credential")
+    record["guest_bundle"] = {
+        "bundle": str(bundle_path),
+        "identity": _guest_directory_identity(bundle_path),
+        "image": str(image_path),
+        "image_identity": _guest_image_key(image_path),
+        "baseline": baseline,
+        "vm": None,
+        "state": "registered",
+    }
+    record["guest_reconciled"] = False
+    record["state"] = "active"
 
 
-def abort_guest_prelaunch(owner_id: str, *,
-                          store: str | os.PathLike[str] | None = None) -> None:
-    """Release only a guardian whose guest could not have produced new bytes."""
-    def update(record: dict, owner: int) -> None:
-        _guest_guardian(record)
-        guest = record.get("guest")
-        if (record.get("mode") != "guest"
-            or (guest is not None and (guest.get("state") != "registered" or guest.get("vm") is not None))):
-            raise AuthOwnerError("Codex guest start is ambiguous; owner retained")
-        if _canonical_identity(owner) != record.get("guest_baseline"):
-            raise AuthOwnerError("Codex credential owner changed before guest abort")
-        _guard_no_pending(owner)
-        os.unlink(_OWNER_RECORD, dir_fd=owner)
-        os.fsync(owner)
-    _update_owner(owner_id, update, store=store)
+def abort_guarded_guest_prelaunch(owner: int, record: dict) -> None:
+    """Forget only a registered bundle that cannot have produced guest bytes."""
+    _guest_guardian(record)
+    guest = _guest_record(record)
+    if guest["state"] != "registered" or guest["vm"] is not None or record.get("guest") is not None:
+        raise AuthOwnerError("Codex guest start is ambiguous; owner retained")
+    if _canonical_identity(owner) != guest["baseline"]:
+        raise AuthOwnerError("Codex credential owner changed before guest abort")
+    _guard_no_pending(owner)
+    record["guest_bundle"] = None
+    record["guest_reconciled"] = True
 
 
-def mark_guest_starting(owner_id: str, *,
-                        store: str | os.PathLike[str] | None = None) -> None:
-    def update(record: dict, owner: int) -> None:
-        _guest_guardian(record)
-        guest = _guest_record(record)
-        if guest["state"] != "registered":
-            raise AuthOwnerError("Codex guest start state is invalid")
-        guest["state"] = "starting"
-        _write_owner(owner, record)
-    _update_owner(owner_id, update, store=store)
+def mark_guarded_guest_starting(record: dict) -> None:
+    _guest_guardian(record)
+    guest = _guest_record(record)
+    if guest["state"] != "registered" or record.get("guest") is not None:
+        raise AuthOwnerError("Codex guest start state is invalid")
+    guest["state"] = "starting"
 
 
-def bundle_identity_matches(bundle: str | os.PathLike[str], owner_id: str, *,
-                            store: str | os.PathLike[str] | None = None) -> bool:
-    try:
-        with ExitStack() as stack:
-            owner = _locked_owner(_lease_store(store), stack)
-            record = _read_owner(owner)
-            if record is None or record.get("id") != owner_id:
-                return False
-            _guest_record(record, Path(os.path.abspath(bundle)))
-            return True
-    except (OSError, KeyError, AuthOwnerError):
-        return False
+def bind_guarded_guest_vm(identity: dict, record: dict) -> None:
+    _guest_guardian(record)
+    guest = _guest_record(record)
+    if guest["state"] != "starting" or guest["vm"] is not None or record.get("guest") is not None:
+        raise AuthOwnerError("Codex guest VM is already bound")
+    if identity["pgrp"] != identity["pid"]:
+        raise AuthOwnerError("Codex guest VM process group is not isolated")
+    guest["vm"] = identity
+    guest["state"] = "running"
+    record["guest"] = identity
 
 
-def bind_guest_vm(owner_id: str, pid: int, binary: str | os.PathLike[str], *,
-                  store: str | os.PathLike[str] | None = None) -> None:
-    def update(record: dict, owner: int) -> None:
-        _guest_guardian(record)
-        guest = _guest_record(record)
-        if guest["state"] not in ("registered", "starting"):
-            raise AuthOwnerError("Codex guest VM is already bound")
-        identity = _identity_for(pid, binary)
-        if identity["pgrp"] != pid:
-            raise AuthOwnerError("Codex guest VM process group is not isolated")
-        guest["vm"] = identity
-        guest["state"] = "running"
-        _write_owner(owner, record)
-    _update_owner(owner_id, update, store=store)
-
-
-def vm_is_active(owner_id: str, *, store: str | os.PathLike[str] | None = None) -> bool:
-    with ExitStack() as stack:
-        owner = _locked_owner(_lease_store(store), stack)
-        record = _read_owner(owner)
-        if record is None or record.get("id") != owner_id:
-            raise AuthOwnerError("Codex guest owner ID does not match")
-        return vm_is_active_unlocked(_guest_record(record))
-
-
-def mark_guest_quiescent(owner_id: str, *, store: str | os.PathLike[str] | None = None) -> None:
-    if vm_is_active(owner_id, store=store):
+def mark_guarded_guest_quiescent(record: dict) -> None:
+    _guest_guardian(record)
+    guest = _guest_record(record)
+    if (guest["state"] != "running" or guest["vm"] is None
+        or record.get("guest") != guest["vm"]):
+        raise AuthOwnerError("Codex guest VM quiescence is unproven")
+    if vm_is_active_unlocked(guest):
         raise AuthBusy("Codex guest VM is still active")
-    def update(record: dict, owner: int) -> None:
-        _guest_guardian(record)
-        guest = _guest_record(record)
-        if guest["state"] != "running" or guest["vm"] is None:
-            raise AuthOwnerError("Codex guest VM quiescence is unproven")
-        if vm_is_active_unlocked(guest):
-            raise AuthBusy("Codex guest VM is still active")
-        guest["state"] = "quiescent"
-        _write_owner(owner, record)
-    _update_owner(owner_id, update, store=store)
+    guest["state"] = "quiescent"
+
+
+def publish_guarded_guest(bundle: str | os.PathLike[str], store: Path,
+                          owner: int, record: dict) -> None:
+    """Publish only the authenticated guardian's stopped, retained candidate."""
+    bundle_path = Path(os.path.abspath(bundle))
+    _guest_guardian(record)
+    try:
+        guest = _guest_record(record, bundle_path)
+    except (OSError, KeyError, AuthOwnerError) as error:
+        raise AuthOwnerError("guest ownership or quiescence is unproven") from error
+    if (guest["state"] != "quiescent" or vm_is_active_unlocked(guest)
+        or record.get("guest") != guest["vm"]):
+        raise AuthOwnerError("guest ownership or quiescence is unproven")
+    baseline = guest["baseline"]
+    if _canonical_identity(owner) != baseline:
+        raise AuthOwnerError("Codex credential owner changed since guest launch")
+    candidate = bundle_path / "auth.json"
+    try:
+        candidate_identity = _guest_file_identity(candidate)
+    except FileNotFoundError as error:
+        raise AuthOwnerError("guest credential missing; canonical owner retained") from error
+    except OSError as error:
+        raise AuthOwnerError("guest credential topology is unsafe") from error
+    if candidate_identity["sha256"] != baseline["sha256"]:
+        _publish_verified_refresh_locked(candidate, store, baseline, owner, record)
+    guest["state"] = "returned"
+    record["guest"] = None
+    record["guest_reconciled"] = True
 
 
 def vm_is_active_unlocked(guest: dict) -> bool:
@@ -1324,10 +1242,11 @@ def vm_is_active_unlocked(guest: dict) -> bool:
                 or (vm["pgrp"] == vm["pid"] and _group_active(vm)))
 
 
-def _publish_verified_refresh_locked(candidate: Path, store: Path, owner_id: str,
+def _publish_verified_refresh_locked(candidate: Path, store: Path,
                                      expected_baseline: dict, owner: int, record: dict) -> None:
     _guest_guardian(record)
-    guest = _guest_record(record, Path(record["guest"]["bundle"]))
+    guest = _guest_record(record)
+    guest = _guest_record(record, Path(guest["bundle"]))
     if guest["state"] != "quiescent" or vm_is_active_unlocked(guest):
         raise AuthOwnerError("guest ownership or quiescence is unproven")
     if expected_baseline != guest["baseline"] or _canonical_identity(owner) != expected_baseline:
@@ -1347,51 +1266,6 @@ def _publish_verified_refresh_locked(candidate: Path, store: Path, owner_id: str
         if _identity(source) != candidate_before or _canonical_identity(owner) != expected_baseline:
             raise AuthOwnerError("Codex guest candidate or canonical baseline changed")
     publish(staged, store, approve_existing=True)
-
-
-def publish_verified_refresh(candidate: str | os.PathLike[str], store: str | os.PathLike[str],
-                             owner_id: str, expected_baseline: dict) -> None:
-    store_path = _lease_store(store)
-    with ExitStack() as stack:
-        owner = _locked_owner(store_path, stack)
-        record = _read_owner(owner)
-        if record is None or record.get("id") != owner_id:
-            raise AuthOwnerError("Codex guest owner ID does not match")
-        _publish_verified_refresh_locked(Path(os.path.abspath(candidate)), store_path,
-                                         owner_id, expected_baseline, owner, record)
-
-
-def publish_guest(bundle: str | os.PathLike[str], baseline: dict,
-                  store: str | os.PathLike[str], owner_id: str) -> None:
-    """Return this owner's candidate only after verified VM exit; retain on refusal."""
-    bundle_path = Path(os.path.abspath(bundle))
-    store_path = _lease_store(store)
-    with ExitStack() as stack:
-        owner = _locked_owner(store_path, stack)
-        record = _read_owner(owner)
-        if record is None or record.get("id") != owner_id:
-            raise AuthOwnerError("guest ownership or quiescence is unproven")
-        _guest_guardian(record)
-        try:
-            guest = _guest_record(record, bundle_path)
-        except (OSError, KeyError, AuthOwnerError) as error:
-            raise AuthOwnerError("guest ownership or quiescence is unproven") from error
-        if guest["state"] != "quiescent" or vm_is_active_unlocked(guest):
-            raise AuthOwnerError("guest ownership or quiescence is unproven")
-        if baseline != guest["baseline"] or _canonical_identity(owner) != baseline:
-            raise AuthOwnerError("Codex credential owner changed since guest launch")
-        candidate = bundle_path / "auth.json"
-        try:
-            candidate_identity = _guest_file_identity(candidate)
-        except FileNotFoundError as error:
-            raise AuthOwnerError("guest credential missing; canonical owner retained") from error
-        except OSError as error:
-            raise AuthOwnerError("guest credential topology is unsafe") from error
-        if candidate_identity["sha256"] != baseline["sha256"]:
-            _publish_verified_refresh_locked(candidate, store_path, owner_id,
-                                             baseline, owner, record)
-        guest["state"] = "returned"
-        _write_owner(owner, record)
 
 
 if __name__ == "__main__":

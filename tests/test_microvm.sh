@@ -209,8 +209,12 @@ early_status=0
 (
   export IHAR_STORE="$early_store" IHAR_STATE_ROOT="$session/early-state-root"
   export IHAR_STATE="$session/early-state"
+  export IHAR_GUARD_FD=41
   source "$ROOT/lib/codex/auth.sh"
   ihar_microvm_preflight() { :; }
+  ihar_codex_guest_owner() {
+    printf '%s\n' "$*" >> "$IHAR_TEST_TMP/early-guest-actions"
+  }
   ihar_gateway_release() { printf x >> "$IHAR_TEST_TMP/early-release-count"; }
   ihar_microvm_reserve_slot() {
     _ihar_microvm_early_cleanup
@@ -219,56 +223,26 @@ early_status=0
   ihar_microvm_launch codex "$early_runtime"
 ) > "$session/early-stdout" 2> "$session/early-stderr" || early_status=$?
 assert_eq "synthetic prelaunch failure exits closed" "3" "$early_status"
-assert_exit "early failure releases unregistered guest owner" 1 \
-  test -e "$early_store/auth/codex/.owner.json"
+assert_exit "slot failure happens before guest bundle registration" 1 \
+  test -e "$IHAR_TEST_TMP/early-guest-actions"
 assert_eq "early failure preserves canonical credential" "synthetic-early-owner" \
   "$(cat "$early_store/auth/codex/auth.json")"
 assert_eq "early cleanup releases gateway only once" "x" \
   "$(cat "$IHAR_TEST_TMP/early-release-count")"
 
-handoff_store="$session/handoff-store"
-handoff_runtime="$session/handoff-runtime"
-mkdir -p "$handoff_store/auth/codex" "$handoff_runtime" "$session/handoff-state"
-chmod 700 "$handoff_store/auth" "$handoff_store/auth/codex"
-printf '%s' synthetic-handoff-owner > "$handoff_store/auth/codex/auth.json"
-chmod 600 "$handoff_store/auth/codex/auth.json"
-ln -s "$handoff_store/auth/codex/auth.json" "$handoff_runtime/auth.json"
-handoff_status=0
+guardian_call="$(
 (
-  export IHAR_STORE="$handoff_store" IHAR_STATE_ROOT="$session/handoff-state-root"
-  export IHAR_STATE="$session/handoff-state"
+  export IHAR_GUARD_FD=42
   source "$ROOT/lib/codex/auth.sh"
-  ihar_microvm_preflight() { :; }
-  ihar_codex_guest_owner() {
-    local action="$1"
-    shift
-    if [[ "$action" == acquire ]]; then
-      local cli_output
-      cli_output="$(ihar_python ihar.codex.auth_owner "guest-$action" "$IHAR_STORE" "$@")" || return
-      printf '%s' "$cli_output" > "$IHAR_TEST_TMP/handoff-cli-output"
-      if ihar_python ihar.codex.auth_owner guest-acquire "$IHAR_STORE" "$@" \
-          > "$IHAR_TEST_TMP/handoff-second-stdout" 2> "$IHAR_TEST_TMP/handoff-second-stderr"; then
-        printf '%s' admitted > "$IHAR_TEST_TMP/handoff-second-result"
-      else
-        printf '%s' blocked > "$IHAR_TEST_TMP/handoff-second-result"
-      fi
-      return 77
-    fi
-    ihar_python ihar.codex.auth_owner "guest-$action" "$IHAR_STORE" "$@"
+  ihar_python() {
+    printf '%s\n' "$*"
   }
-  ihar_microvm_launch codex "$handoff_runtime"
-) > "$session/handoff-stdout" 2> "$session/handoff-stderr" || handoff_status=$?
-assert_eq "post-acquire CLI failure exits closed" "3" "$handoff_status"
-assert_eq "competing writer is blocked during failed handoff" "blocked" \
-  "$(cat "$IHAR_TEST_TMP/handoff-second-result")"
-assert_exit "failed handoff releases unregistered guest owner" 1 \
-  test -e "$handoff_store/auth/codex/.owner.json"
-assert_eq "failed handoff preserves canonical credential" "synthetic-handoff-owner" \
-  "$(cat "$handoff_store/auth/codex/auth.json")"
-assert_eq "guest acquire CLI emits no owner ID" "" "$(cat "$IHAR_TEST_TMP/handoff-cli-output")"
-assert_eq "failed handoff does not print owner ID" "" "$(cat "$session/handoff-stdout")"
-assert_exit "failed handoff does not print credential bytes" 1 \
-  grep -q synthetic-handoff-owner "$session/handoff-stdout" "$session/handoff-stderr"
+  ihar_codex_guest_owner register /private/bundle /private/state.ext4 /private/seed.json
+)
+)"
+assert_eq "guest bundle registration uses the inherited guardian channel" \
+  "ihar.codex.guardian guest-register 42 /private/bundle /private/state.ext4 /private/seed.json" \
+  "$guardian_call"
 
 # --- host-side deny-by-default policy -------------------------------------------------
 

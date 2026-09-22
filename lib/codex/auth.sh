@@ -33,5 +33,7 @@ ihar_codex_guard_drop() {
 ihar_codex_guest_owner() { # <guest-action> <action-arguments...>
   local action="$1"
   shift
-  ihar_python ihar.codex.auth_owner "guest-$action" "$IHAR_STORE" "$@"
+  [[ -n "${IHAR_GUARD_FD:-}" ]] \
+    || ihar_die 3 "Codex guest guardian channel is unavailable"
+  ihar_python ihar.codex.guardian "guest-$action" "$IHAR_GUARD_FD" "$@"
 }
