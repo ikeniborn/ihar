@@ -579,6 +579,10 @@ The result is written to `$IHAR_STORE/verification/<vendor>-<version>.json` with
 hook enforcement unproven for <vendor> <version>; run ihar check --conformance
 ```
 
+**The argv is measured, and a test keeps it measured.** `codex exec` on 0.154.0 has no `--ask-for-approval`: it answers `error: unexpected argument` and exits 2. The runner passed it anyway, so every Codex case reported `failed` as though a policy had not held, through two sessions of looking at authentication instead. The approval policy is configuration, so the turn now passes `-c approval_policy="never"`, which was measured by running the turn: it completes with `agent_message` and `turn.completed`. `tests/test_conformance_argv.py` reads the argv the runner builds and asserts every long flag appears in that binary's own `--help`, skipping cleanly where a vendor is not installed — a fixture cannot catch this class, only the binary can.
+
+**A failed case says why.** Each case already computed a reason and the record stored `name: status` instead, so the printed line carried nothing. The record now keeps the case's own sentence, clipped to 200 characters, and the runner prints it. Those sentences are the runner's words — an exit code, a missing sentinel, a decision that was not recorded — never vendor or model output, which stays out of the record as §14 requires.
+
 ## 7. MCP and its egress (slice S4)
 
 ### 7.1 Registry
@@ -986,6 +990,10 @@ Measured on 2026-09-22 and recorded so the next reader does not repeat it by han
 The tracked lockfile is immutable release input. It merges iclaude's version fields with icodex's release version, asset and published archive digest. Normal install and launch operations never rewrite it.
 
 Machine-local evidence lives in `$IHAR_STORE/install-receipt.json`: installation time, the release-lock digest, installed versions, and SHA-256 digests of the produced Claude and Codex executables. The receipt is validated and atomically replaced only after a successful install transaction. `codex.sha256` remains in the release lockfile because it is the published archive digest checked before extraction.
+
+**Codex is pinned to its npm platform package, not to the GitHub release archive.** Measured on 2026-09-22: the release asset `codex-x86_64-unknown-linux-musl.tar.gz`, whose digest matches this lockfile, contains exactly one file — the `codex` executable. The CLI then answers every tool call with `Code Mode is unavailable because failed to spawn code-mode host …/codex-code-mode-host: host executable was not found`, and disabling `code_mode_host` does not restore a classic shell tool: the model replies that the execution tool is disabled. An install from that archive can hold a conversation and never run a command, which made every live conformance case fail for a reason no message named.
+
+`@openai/codex@0.154.0-linux-x64` carries `bin/codex`, `bin/codex-code-mode-host`, the `bwrap` sandbox helper, `rg` and a shell. The lockfile therefore pins `{version, tarball, prefix, sha256}`, the installer extracts that prefix preserving the package's own geometry — `bin/` into the store's `bin/`, `codex-path/` and `codex-resources/` beside it — and `IHAR_CODEX_BIN` stays where it was. Verified end to end: a turn run from a store built this way executed its tool and wrote the sentinel in 26 seconds, where the release-archive install produced no file at all.
 
 ### 14.2 Verification at launch
 

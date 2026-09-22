@@ -18,7 +18,7 @@ IHAR_CODEX_RELEASE_URL="${IHAR_CODEX_RELEASE_URL:-https://github.com/openai/code
 IHAR_NPM_PACKAGE="${IHAR_NPM_PACKAGE:-@anthropic-ai/claude-code}"
 IHAR_NPM_BIN="${IHAR_NPM_BIN:-$IHAR_NVM/bin/npm}"
 # Mutable auth, plugins and unknown vendor data stay at their stable active paths.
-_IHAR_INSTALL_STORE_PATHS=(bin verification venv acp microvm)
+_IHAR_INSTALL_STORE_PATHS=(bin codex-path codex-resources verification venv acp microvm)
 
 # ihar_download <url> <target> — one seam for every fetch.
 ihar_download() {
@@ -454,45 +454,69 @@ ihar_install_python() {
 # version stamped beside the binary, so bumping the lockfile is what upgrades, and a
 # second run with an unchanged lockfile does nothing.
 ihar_install_codex() {
-  local version asset archive actual pinned
+  local version tarball prefix archive actual pinned
 
   version="$(ihar_lockfile_get codex.version)"
-  asset="$(ihar_lockfile_get codex.asset)"
+  tarball="$(ihar_lockfile_get codex.tarball)"
+  prefix="$(ihar_lockfile_get codex.prefix)"
   pinned="$(ihar_lockfile_get codex.sha256)"
 
-  if [[ -z "$version" || -z "$asset" ]]; then
-    ihar_warn "the lockfile pins no Codex release; skipping"
+  if [[ -z "$version" || -z "$tarball" || -z "$prefix" ]]; then
+    ihar_warn "the lockfile pins no Codex package; skipping"
     return 0
   fi
 
+  # The whole vendor tree, not one executable. Measured on 0.154.0: the GitHub release
+  # archive contains only `codex`, and the CLI answers "failed to spawn code-mode host
+  # …/codex-code-mode-host: host executable was not found" for every tool call, so an
+  # install from that archive can hold a session but never run a command. The npm
+  # platform package carries `bin/codex`, `bin/codex-code-mode-host`, the `bwrap`
+  # sandbox helper, `rg` and a shell, which is the runtime the vendor expects.
+  # The package's own geometry is preserved: `bin/codex` beside `bin/codex-code-mode-host`,
+  # with `codex-path/` and `codex-resources/` as siblings of `bin/`, because that is where
+  # the CLI looks for its helper, its ripgrep and its shell.
   local stamp="$IHAR_STORE/bin/.codex-version"
   if [[ -x "$IHAR_STORE/bin/codex" && "$(cat "$stamp" 2>/dev/null)" == "$version" ]]; then
     ihar_info "codex $version already installed"
     return 0
   fi
 
-  archive="$IHAR_STORE/bin/.$asset"
-  ihar_download "$IHAR_CODEX_RELEASE_URL/$version/$asset" "$archive" \
-    || ihar_die 1 "cannot download the Codex release $version"
+  archive="$IHAR_STORE/.codex-package.tgz"
+  ihar_download "$tarball" "$archive" \
+    || ihar_die 1 "cannot download the Codex package $version"
 
   actual="$(ihar_sha256 "$archive")"
   if [[ -n "$pinned" && "$actual" != "$pinned" ]]; then
     rm -f "$archive"
     # Outside an explicit update a digest mismatch is tampering or a moved tag, and
     # either way installing it would defeat every later integrity check.
-    ihar_die 3 "the Codex archive digest does not match the lockfile
+    ihar_die 3 "the Codex package digest does not match the lockfile
 expected $pinned
 got      $actual"
   fi
 
-  tar -xzf "$archive" -C "$IHAR_STORE/bin" 2>/dev/null \
-    || ihar_die 1 "cannot extract $archive"
+  local stage
+  stage="$(mktemp -d "$IHAR_STORE/.codex-stage-XXXXXX")" || ihar_die 1 "cannot stage the Codex package"
+  tar -xzf "$archive" -C "$stage" 2>/dev/null || { rm -rf "$stage" "$archive"; ihar_die 1 "cannot extract $archive"; }
   rm -f "$archive"
+  [[ -x "$stage/$prefix/bin/codex" ]] \
+    || { rm -rf "$stage"; ihar_die 1 "the Codex package has no executable at $prefix/bin/codex"; }
 
-  local extracted
-  extracted="$(find "$IHAR_STORE/bin" -maxdepth 1 -name 'codex-*' -type f | head -1)"
-  [[ -n "$extracted" ]] && mv -f "$extracted" "$IHAR_STORE/bin/codex"
-  chmod +x "$IHAR_STORE/bin/codex" 2>/dev/null || true
+  local entry name
+  mkdir -p "$IHAR_STORE/bin"
+  for entry in "$stage/$prefix/bin/"*; do
+    [[ -e "$entry" ]] || continue
+    ihar_install_move "$entry" "$IHAR_STORE/bin/${entry##*/}" \
+      || { rm -rf "$stage"; ihar_die 1 "cannot place ${entry##*/}"; }
+  done
+  for name in codex-path codex-resources; do
+    [[ -d "$stage/$prefix/$name" ]] || continue
+    rm -rf "${IHAR_STORE:?}/$name"
+    ihar_install_move "$stage/$prefix/$name" "$IHAR_STORE/$name" \
+      || { rm -rf "$stage"; ihar_die 1 "cannot place $name"; }
+  done
+  rm -rf "$stage"
+  chmod +x "$IHAR_STORE/bin/codex" "$IHAR_STORE/bin/codex-code-mode-host" 2>/dev/null || true
   printf '%s\n' "$version" > "$stamp"
   ihar_info "codex $version installed"
 }

@@ -141,8 +141,17 @@ assert_exit "incomplete rollback preserves recoverable old hooks" 0 \
 # --- a stub release, and a stub fetcher that serves it --------------------------------
 
 RELEASE_DIR="$IHAR_TEST_TMP/releases"
-mkdir -p "$RELEASE_DIR/payload"
-printf '#!/bin/sh\necho stub codex\n' > "$RELEASE_DIR/payload/codex-x86_64-unknown-linux-musl"
+# The npm platform package's shape, because that is what the lockfile now pins: the
+# executable, the code-mode host the CLI needs beside it, and the sibling resource trees.
+CODEX_PREFIX="package/vendor/x86_64-unknown-linux-musl"
+mkdir -p "$RELEASE_DIR/payload/$CODEX_PREFIX/bin" \
+         "$RELEASE_DIR/payload/$CODEX_PREFIX/codex-path" \
+         "$RELEASE_DIR/payload/$CODEX_PREFIX/codex-resources"
+printf '#!/bin/sh\necho stub codex\n' > "$RELEASE_DIR/payload/$CODEX_PREFIX/bin/codex"
+printf '#!/bin/sh\necho stub host\n' > "$RELEASE_DIR/payload/$CODEX_PREFIX/bin/codex-code-mode-host"
+printf 'stub\n' > "$RELEASE_DIR/payload/$CODEX_PREFIX/codex-path/rg"
+printf 'stub\n' > "$RELEASE_DIR/payload/$CODEX_PREFIX/codex-resources/bwrap"
+chmod +x "$RELEASE_DIR/payload/$CODEX_PREFIX/bin/"*
 tar -czf "$RELEASE_DIR/codex.tar.gz" -C "$RELEASE_DIR/payload" . 2>/dev/null
 RELEASE_SHA="$(sha256sum "$RELEASE_DIR/codex.tar.gz" | cut -d' ' -f1)"
 
@@ -384,13 +393,13 @@ assert_eq "no install step invokes sudo" "0" \
 
 # --- a Codex release is verified before it is trusted -------------------------------------------
 
-write_lock '"codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
+write_lock '"codex":{"version":"0.154.0","tarball":"https://example.invalid/codex.tgz","prefix":"'"$CODEX_PREFIX"'","sha256":"'"$RELEASE_SHA"'"}'
 ihar_install_codex >/dev/null 2>&1
 assert_exit "the release is extracted" 0 test -x "$IHAR_STORE/bin/codex"
-assert_eq "and the version is stamped" "rust-v0.154.0" "$(cat "$IHAR_STORE/bin/.codex-version")"
+assert_eq "and the version is stamped" "0.154.0" "$(cat "$IHAR_STORE/bin/.codex-version")"
 
 rm -f "$IHAR_STORE/bin/codex" "$IHAR_STORE/bin/.codex-version"
-write_lock '"codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$(printf '0%.0s' {1..64})"'"}'
+write_lock '"codex":{"version":"0.154.0","tarball":"https://example.invalid/codex.tgz","prefix":"'"$CODEX_PREFIX"'","sha256":"'"$(printf '0%.0s' {1..64})"'"}'
 assert_exit "a digest mismatch is fail-closed" 3 \
   bash -c "source '$ROOT/lib/core/logging.sh'; source '$ROOT/lib/core/init.sh'
            source '$ROOT/lib/store/lockfile.sh'; source '$ROOT/lib/store/install.sh'
@@ -409,15 +418,15 @@ assert_contains "the refusal shows both digests" "$out" "expected"
 # Install used to skip on the binary merely existing, so bumping the lockfile upgraded
 # nothing and `ihar update` re-earned the conformance record with the old binary.
 
-write_lock '"codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
+write_lock '"codex":{"version":"0.154.0","tarball":"https://example.invalid/codex.tgz","prefix":"'"$CODEX_PREFIX"'","sha256":"'"$RELEASE_SHA"'"}'
 ihar_install_codex >/dev/null 2>&1
 out="$(ihar_install_codex 2>&1)"
 assert_contains "an unchanged lockfile makes the run a no-op" "$out" "already installed"
 
-write_lock '"codex":{"version":"rust-v0.155.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
+write_lock '"codex":{"version":"0.155.0","tarball":"https://example.invalid/codex.tgz","prefix":"'"$CODEX_PREFIX"'","sha256":"'"$RELEASE_SHA"'"}'
 out="$(ihar_install_codex 2>&1)"
-assert_contains "a bumped version reinstalls" "$out" "rust-v0.155.0 installed"
-assert_eq "and restamps" "rust-v0.155.0" "$(cat "$IHAR_STORE/bin/.codex-version")"
+assert_contains "a bumped version reinstalls" "$out" "0.155.0 installed"
+assert_eq "and restamps" "0.155.0" "$(cat "$IHAR_STORE/bin/.codex-version")"
 
 # --- ACP adapters use exactly the lockfile versions ---------------------------------------------
 
@@ -509,7 +518,7 @@ rm -f "$EXAMPLE"
 # --- install stages one generation and rolls every failure back ----------------------
 
 write_lock '"node":{"version":"22.23.1"},"claude":{"version":"2.1.274"},
-            "codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"'"$RELEASE_SHA"'"}'
+            "codex":{"version":"0.154.0","tarball":"https://example.invalid/codex.tgz","prefix":"'"$CODEX_PREFIX"'","sha256":"'"$RELEASE_SHA"'"}'
 OLD_RECEIPT='{"schema":1,"release_lock_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","installed_at":"2026-09-19T00:00:00Z","components":{}}'
 COMMAND_LEGACY_STORE="$IHAR_TEST_TMP/legacy-command-store"
 mkdir -p "$COMMAND_LEGACY_STORE/hooks"
@@ -1033,7 +1042,7 @@ assert_eq "receipt records release and executable evidence" \
   "$expected_lock_sha
 2.1.274
 $expected_claude_sha
-rust-v0.154.0
+0.154.0
 $expected_codex_sha" "$receipt_values"
 assert_eq "receipt is owner-only" "600" "$(stat -c '%a' "$IHAR_STORE/install-receipt.json")"
 assert_eq "successful install preserves release lock" "$before_lock" \
