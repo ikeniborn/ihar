@@ -6,7 +6,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/tests/helpers.sh"
 ihar_sandbox
 export PYTHONPATH="$ROOT/lib/python"
-ihar_python() { if [[ "$1" == -c ]]; then python3 "$@"; else python3 -m "$@"; fi; }
+# The real helper, not a stub: a stub that branched on `-c` is exactly what hid the
+# broken `python3 -m -c` invocation on this path from every earlier run.
+source "$ROOT/lib/core/logging.sh"
+source "$ROOT/lib/core/init.sh"
+IHAR_ROOT="$ROOT"
 
 project="$IHAR_TEST_TMP/project"
 mkdir -p "$project"

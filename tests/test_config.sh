@@ -99,4 +99,13 @@ store_in_checkout="$(in_shell "unset IHAR_STORE
                                case \"\$IHAR_STORE\" in \"\$IHAR_ROOT\"*) echo inside;; *) echo outside;; esac")"
 assert_eq "the store is never inside the checkout" "outside" "$store_in_checkout"
 
+# ihar_python routes an inline script to the interpreter rather than to `-m`, which
+# would ask Python for a module named `-c`. Four switch call sites depended on this.
+IHAR_ROOT="$ROOT" out="$(printf '{"a":1}' | ihar_python -c 'import json,sys; print(json.load(sys.stdin)["a"])' 2>&1)"
+assert_eq "an inline script runs under ihar_python" 1 "$out"
+IHAR_ROOT="$ROOT" out="$(ihar_python -c 'import ihar.jsonio as j; print(j.__name__)' 2>&1)"
+assert_eq "an inline script sees the package" ihar.jsonio "$out"
+IHAR_ROOT="$ROOT" out="$(ihar_python ihar.ids 2>&1)"; status=$?
+assert_eq "a module still runs as a module" 0 "$status"
+
 finish

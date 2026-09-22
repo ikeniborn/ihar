@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 14 (handoff history modes implemented: transcript export, budget, degradation, check reporting) |
+| Status | revision 15 (inline-script convention of the Python helper recorded after a shipped switch defect) |
 | Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -16,7 +16,7 @@ This document fixes names, file paths, schemas and algorithms so each slice can 
 ### 1.1 Languages and layout rules
 
 - Bash 5, `set -euo pipefail` in the entry point, modules sourced from `lib/<area>/<file>.sh`. Public functions are `ihar_<area>_<verb>`; private helpers are `_ihar_<area>_<verb>`. Every public function documents its stdout contract (text for humans, JSON lines for machines, nothing for side-effect functions) and its exit code.
-- Python 3.11+ for anything that parses JSON, JSONL, SQLite or TOML, speaks JSON-RPC, or terminates a connection. All Python lives in one package `lib/python/ihar/`, invoked as `"$IHAR_PY" -m ihar.<module>`. The interpreter is the store venv (§2.3), built with the pinned `uv`.
+- Python 3.11+ for anything that parses JSON, JSONL, SQLite or TOML, speaks JSON-RPC, or terminates a connection. All Python lives in one package `lib/python/ihar/`, invoked as `"$IHAR_PY" -m ihar.<module>`. The `ihar_python` helper carries both calling conventions, a module and `-c <script>` for the short inline readers the shell needs, because `-m -c` asks Python for a module named `-c`: the shipped `ihar switch` used that form at four call sites and assembled empty JSON, which only a test stub that branched on `-c` had been hiding. The interpreter is the store venv (§2.3), built with the pinned `uv`.
 - Hook scripts are the exception: they run under the system interpreter as `python3 -I <script>` so that neither a broken venv nor user site customisation can affect enforcement, and they import only the stdlib plus `_shared/` loaded from an absolute trusted path.
 - No `jq` dependency on correctness paths. iclaude degrades to a warning without it; ihar performs JSON merges in Python and fails closed when the interpreter is missing, because settings sync carries the hook block.
 - Configuration files are parsed, never sourced. `.ihar_config` follows icodex `load_config` (`lib/config/env.sh:6-27`): `KEY=value` lines, only `IHAR_[A-Z0-9_]+` keys accepted. This closes the code-execution path that sourcing `.claude_config` leaves open in iclaude.
