@@ -12,6 +12,24 @@ ihar_uuid() {
   ihar_python ihar.ids
 }
 
+# ihar_launch_is_authentication — whether this launch is only a vendor login.
+#
+# True for the exact passthrough spellings both vendors use for credentials and nothing
+# else: `codex login|logout` and `claude auth|setup-token`, with no other positional
+# argument. An interactive session is never one of these, even when the user intends to
+# type /login inside it, because the session itself runs hooks.
+# stdout: nothing. Exit 0 when this launch is an authentication command.
+ihar_launch_is_authentication() {
+  (( ${#IHAR_PASSTHROUGH[@]} >= 1 )) || return 1
+  (( ${#IHAR_ARGS[@]} == 0 )) || return 1
+  [[ -z "${IHAR_FLAG_RESUME:-}" && "${IHAR_FLAG_FORK:-false}" != true ]] || return 1
+  [[ "${IHAR_FLAG_WEB:-false}" != true && "${IHAR_ACP_MODE:-false}" != true ]] || return 1
+  case "${IHAR_PASSTHROUGH[0]}" in
+    login|logout|auth|setup-token) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # ihar_cmd_launch <vendor>
 ihar_cmd_launch() {
   local vendor="$1"
@@ -44,7 +62,19 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
   if [[ "$IHAR_FLAG_DRY_RUN" == true ]]; then
     verify_receipt=false
   fi
-  ihar_store_verify "$vendor" "$native_binary" "$verify_receipt"
+  if ihar_launch_is_authentication; then
+    # The bootstrap carve-out, and the only one. Store verification protects agent
+    # sessions: it refuses a launch whose hooks, binaries or conformance evidence do
+    # not match what was pinned. A vendor authentication subcommand starts no session,
+    # renders no prompt and fires no hook — and requiring it to pass made a machine with
+    # no credentials unrecoverable: the launch refused for drift, the fix was `ihar
+    # install`, that could not activate without conformance, and conformance needs an
+    # authenticated vendor. Skipping it here breaks the circle without widening anything
+    # else, and says so rather than passing quietly.
+    ihar_warn "skipping store verification: '$vendor ${IHAR_PASSTHROUGH[0]}' authenticates and starts no session"
+  else
+    ihar_store_verify "$vendor" "$native_binary" "$verify_receipt"
+  fi
 
   # 4. project state. Called directly rather than in a command substitution: the
   # setup exports IHAR_STATE, and a subshell would drop that export while still

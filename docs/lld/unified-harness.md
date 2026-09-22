@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 22 (the masking engine ships: two pinned language models, patterns first, named entities on top) |
+| Status | revision 23 (authentication is reachable on an unverified store; a missing pin is named as missing) |
 | Date | 2026-09-21 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -991,6 +991,12 @@ Machine-local evidence lives in `$IHAR_STORE/install-receipt.json`: installation
 
 Release-lock drift warns that install evidence is stale. `ihar_receipt_binary_status <vendor> <selected-binary>` validates `$IHAR_STORE/install-receipt.json`, its release-lock digest and the selected executable bytes, then returns exactly `verified`, `mismatched`, or `missing receipt`. Missing, malformed and unreadable receipt evidence all report `missing receipt`; a missing component, changed release lock or changed executable reports `mismatched`. Either non-verified state warns and continues under `standard`, and exits 3 before vendor execution under `protected` and `isolated`. Every ACP-allowed real launch runs the same selected-native-executable check before its adapter; the shipped `protected` and `isolated` profiles refuse ACP earlier at the profile gate. Dry-run alone skips this receipt comparison because it executes neither the native binary nor an adapter that delegates to it; hook and store integrity checks remain in force. ACP adapter version and digest integrity remain under the existing adapter verification and do not add fields to the install receipt. A hook or managed-hook hash mismatch is exit 3 in every profile. For enforced profiles, a pending recheck or a missing, stale or failing conformance record is exit 3.
 
+
+**Authentication is the one carve-out, and it exists because of a circle.** Store verification protects agent sessions: it refuses a launch whose hooks, binaries or conformance evidence do not match the pins. Observed on a machine with no vendor credentials: the launch refused because a pinned hook was absent from the store, the remedy was `ihar install`, that generation could not activate because live conformance failed, and conformance fails without an authenticated vendor — which is what the user was trying to obtain. Nothing in the design could break that circle from inside.
+
+`ihar <vendor> -- login|logout` and `-- auth|setup-token` therefore skip store verification, and only those: the check is refused for any other passthrough, for a bare interactive session, and whenever `--resume`, `--fork`, `--web` or ACP mode is in play, because each of those is a session and a session runs hooks. The skip prints a line naming itself rather than passing quietly.
+
+**A missing pin is named as missing.** `--verify-map` answers `missing <path>` or `changed <path>`, and the refusal repeats the distinction. A store that predates a pin and a file something rewrote are different situations for whoever reads the message, and calling both "differs" sent the first one looking for tampering.
 ### 14.3 Commands
 
 `ihar install [--acp] [--microvm] [--migrate-store]` validates tracked assets and mutable-source topology before building a generation, installs the Node tree and `claude`, the Codex tarball with icodex's tamper guard (`lib/binary/install.sh:184-259`), `uv` and the venv, shims, hooks, managed hooks and manifests into staged store/NVM trees, runs full live conformance, writes the new lock digest and receipt inside the stage, then activates the explicit installer-owned paths as one rollback-capable generation. A first bootstrap may activate after complete failed-case conformance records only; it discards failed staged records, emits bounded vendor/case diagnostics, and requires explicit post-auth `ihar check --conformance` before an enforced launch can pass its gate. A pre-record error, bad pin, incomplete record or missing case aborts even on bootstrap. Every existing-generation install or update requires passing conformance before activation, and a failure discards its stage while preserving the prior generation, receipt and conformance records. Mutable auth/plugin owners remain outside activation and existing bytes are preserved. There is no `--from-lockfile`: the release lockfile is the only source of installed versions. Install and update share this transaction. A matching component version stamp may skip downloading or reinstalling that vendor binary, but the command still recopies declared assets into the stage, reruns conformance, rebuilds the command-wide lock digest and receipt, and activates the staged generation. An unchanged lockfile therefore does not make the command a blanket no-op, and the receipt is not a per-component skip oracle.
@@ -1082,7 +1088,8 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | profile | override loosens the masking floor | usage | 2 |
 | profile | masking level above `off` with no gateway | usage | 2 |
 | state | socket path over the limit | usage | 2 |
-| store | hook or managed-hook sha256 mismatch | fail-closed | 3 |
+| store | pinned hook absent from the store | fail-closed, named as missing | 3 |
+| store | hook or managed-hook sha256 mismatch | fail-closed, named as changed | 3 |
 | store | executable receipt state is `mismatched` or `missing receipt`, `standard` / enforced | fail-soft / fail-closed | 0 / 3 |
 | store | conformance binary differs from the release pin; record is missing, stale, incomplete, skipped or failing under an enforced profile | fail-closed | 3 |
 | store | mutable-link manifest or canonical source topology is invalid | fail-closed | 3 |

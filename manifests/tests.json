@@ -3,6 +3,7 @@
     "tests/test_acp.sh",
     "tests/test_acp_promotion.py",
     "tests/test_adapters.sh",
+    "tests/test_auth_bootstrap.sh",
     "tests/test_concurrency.sh",
     "tests/test_config.sh",
     "tests/test_conformance.py",
