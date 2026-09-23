@@ -59,6 +59,10 @@ ihar_main() {
 
   ihar_args_parse "$@"
   ihar_guard_undelivered
+  if [[ "$IHAR_COMMAND" == codex && "$IHAR_FLAG_WEB" == true &&
+        -n "$IHAR_CODEX_AUTH_VERB" ]]; then
+    ihar_die 2 "--web cannot be combined with Codex authentication passthrough"
+  fi
   local needs_codex_guard=false joins_daemon_owner=false
   case "$IHAR_COMMAND:${IHAR_SUBCOMMAND:-}" in
     codex:*)

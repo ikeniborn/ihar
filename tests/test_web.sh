@@ -66,12 +66,15 @@ assert_contains "LAN keeps websocket auth arguments" "$lan" \
 # Actual Codex web launch: prove one live daemon and one namespace-confined remote TUI.
 FAKE="$IHAR_TEST_TMP/fake-codex"
 LOG="$IHAR_TEST_TMP/codex.calls"
+AUTH_MARKER="$IHAR_TEST_TMP/codex-auth-vendor.started"
 cat > "$FAKE" <<'EOF'
 #!/usr/bin/env python3
 import json, os, signal, socket, subprocess, sys, time
 home = os.environ["CODEX_HOME"]
 path = home + "/app-server-control/app-server-control.sock"
 pidfile = home + "/fake-daemon.pid"
+if sys.argv[1:2] in (["login"], ["logout"]):
+    open(os.environ["IHAR_AUTH_VENDOR_MARKER"], "w", encoding="utf-8").close()
 if not (len(sys.argv) == 3 and sys.argv[1] == "--remote"):
     with open(os.environ["IHAR_FAKE_LOG"], "a", encoding="utf-8") as log:
         log.write(" ".join(sys.argv[1:]) + "\n")
@@ -133,7 +136,8 @@ chmod 600 "$IHAR_STORE/auth/codex/auth.json"
 
 actual_status=0
 actual="$(cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
-  IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_LOG="$LOG" IHAR_DOWNLOAD="$FAIL_DOWNLOAD" \
+  IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_LOG="$LOG" IHAR_AUTH_VENDOR_MARKER="$AUTH_MARKER" \
+  IHAR_DOWNLOAD="$FAIL_DOWNLOAD" \
   "$ROOT/ihar.sh" codex --web 2>&1)" || actual_status=$?
 [[ "$actual_status" == 0 ]] || printf '%s\n' "$actual"
 calls="$(cat "$LOG")"
@@ -149,6 +153,29 @@ assert_eq "web preserves canonical credential bytes" "synthetic-credential" \
 record="$(find "$IHAR_STATE_ROOT" -path '*/daemons/codex.json' -print -quit)"
 assert_exit "the managed daemon is recorded" 0 test -f "$record"
 guardian_pid="$(python3 -c "import json; print(json.load(open('$IHAR_STORE/auth/codex/.owner.json'))['guardian']['pid'])")"
+credential_hash="$(sha256sum "$IHAR_STORE/auth/codex/auth.json" | cut -d ' ' -f 1)"
+credential_identity="$(stat -c '%d:%i' "$IHAR_STORE/auth/codex/auth.json")"
+
+assert_active_daemon_rejects_web_auth() {
+  local label="$1" status=0 output
+  shift
+  rm -f "$AUTH_MARKER"
+  output="$(cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
+    IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_LOG="$LOG" IHAR_AUTH_VENDOR_MARKER="$AUTH_MARKER" \
+    "$ROOT/ihar.sh" codex --web -- "$@" 2>&1)" || status=$?
+  assert_eq "$label is rejected as an ambiguous web/auth route" "2" "$status"
+  assert_contains "$label reports the web/auth usage boundary" "$output" \
+    "--web cannot be combined with Codex authentication passthrough"
+  assert_exit "$label starts no auth vendor work" 1 test -e "$AUTH_MARKER"
+  assert_eq "$label preserves canonical credential bytes" "$credential_hash" \
+    "$(sha256sum "$IHAR_STORE/auth/codex/auth.json" | cut -d ' ' -f 1)"
+  assert_eq "$label preserves canonical credential identity" "$credential_identity" \
+    "$(stat -c '%d:%i' "$IHAR_STORE/auth/codex/auth.json")"
+}
+
+assert_active_daemon_rejects_web_auth "web login" login
+assert_active_daemon_rejects_web_auth "web login status" login status
+assert_active_daemon_rejects_web_auth "web logout" logout
 
 second_status=0
 second="$(cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \

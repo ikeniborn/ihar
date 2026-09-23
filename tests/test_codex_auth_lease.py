@@ -48,6 +48,21 @@ class AuthLeaseTests(unittest.TestCase):
     def record(self) -> Path:
         return self.store / "auth" / "codex" / ".owner.json"
 
+    def test_join_route_classifies_web_semantics_and_rejects_auth_passthrough(self) -> None:
+        from ihar.codex import guardian
+        entry = "/opt/ihar/ihar.sh"
+        self.assertTrue(guardian._joined_route_allowed(
+            [entry, "codex", "--web", "--", "mcp", "list"], entry))
+        self.assertTrue(guardian._joined_route_allowed([entry, "web", "codex"], entry))
+        self.assertTrue(guardian._joined_route_allowed([entry, "update"], entry))
+        for arguments in (["codex", "--web", "--", "login"],
+                          ["codex", "--web", "--", "login", "status"],
+                          ["codex", "--web", "--", "logout"],
+                          ["web", "codex", "--", "login"]):
+            with self.subTest(arguments=arguments):
+                self.assertFalse(guardian._joined_route_allowed(
+                    [entry, *arguments], entry))
+
     def _guardian(self, script: str) -> subprocess.Popen:
         process = subprocess.Popen(
             [sys.executable, "-m", "ihar.codex.guardian", str(self.store), "--",

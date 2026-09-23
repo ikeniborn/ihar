@@ -694,6 +694,40 @@ def _poll_attachments(store: Path, attachments: dict[tuple[int, str], dict]) -> 
         entry["completed_at"] = now
 
 
+def _joined_codex_web_route(arguments: list[str], *, implicit_web: bool,
+                            allow_prompt: bool) -> bool:
+    web = implicit_web
+    prompt = False
+    passthrough: list[str] = []
+    index = 0
+    value_flags = {"--resume", "--name", "--model", "--effort", "--approval",
+                   "--mask-level"}
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            passthrough = arguments[index + 1:]
+            break
+        if argument in value_flags:
+            if index + 1 >= len(arguments):
+                return False
+            index += 2
+            continue
+        if argument.startswith("--resume="):
+            index += 1
+            continue
+        if argument in ("--fork", "--web"):
+            web = web or argument == "--web"
+            index += 1
+            continue
+        if argument.startswith("-") or not allow_prompt or prompt:
+            return False
+        prompt = True
+        index += 1
+    if passthrough[:1] in (["login"], ["logout"]):
+        return False
+    return web
+
+
 def _joined_route_allowed(argv: list[str], entry: str) -> bool:
     if (not argv or argv[0] != entry or not os.path.isabs(entry)
         or any(not isinstance(item, str) or not item or "\0" in item for item in argv)):
@@ -714,9 +748,10 @@ def _joined_route_allowed(argv: list[str], entry: str) -> bool:
     if routed == ["update"]:
         return True
     if routed[:1] == ["codex"]:
-        before_passthrough = routed[1:routed.index("--") if "--" in routed else len(routed)]
-        return "--web" in before_passthrough
-    return routed[:2] == ["web", "codex"]
+        return _joined_codex_web_route(routed[1:], implicit_web=False, allow_prompt=True)
+    if routed[:2] == ["web", "codex"]:
+        return _joined_codex_web_route(routed[2:], implicit_web=True, allow_prompt=False)
+    return False
 
 
 def _start_joined(store: Path, fields: dict, stdio_fds: list[int], guardian_pid: int,
