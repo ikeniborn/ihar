@@ -480,6 +480,13 @@ def test_the_record_validates_as_a_contract():
         },
     }
     jsonio.check("conformance", record)
+    api_error_record = json.loads(json.dumps(record))
+    api_error_record["cases"]["deny-blocks-the-tool"] = {
+        "status": "unmeasured",
+        "detail": "deny-blocks-the-tool: unmeasured",
+        "reason": "vendor-api-error",
+    }
+    jsonio.check("conformance", api_error_record)
 
     for broken in (
         {**record, "cases": {}},                                   # nothing proven
@@ -706,6 +713,106 @@ def test_failed_rewrite_has_a_closed_reason():
     assert conformance._reason_for(
         "failed", "the vendor executed the unrewritten secret"
     ) == "rewrite-not-applied"
+
+
+def test_claude_structured_api_error_is_environmental_without_reading_result_text():
+    payload = json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "terminal_reason": "api_error",
+        "api_error_status": 503,
+        "result": "SECRET-SENTINEL",
+    })
+
+    assert conformance._environment_reason(payload, "", 1) == "vendor-api-error"
+    assert conformance._environment_reason(
+        json.dumps({
+            "type": "result",
+            "is_error": True,
+            "terminal_reason": "turn_setup_failed",
+            "result": "SECRET-SENTINEL",
+        }),
+        "",
+        1,
+    ) == ""
+
+
+def test_claude_shell_records_structured_api_error_for_sandbox_cases():
+    real_run = conformance.subprocess.run
+
+    def fake_run(argv, **_kwargs):
+        payload = json.dumps({
+            "type": "result",
+            "is_error": True,
+            "terminal_reason": "api_error",
+            "result": "SECRET-SENTINEL",
+        })
+        return conformance.subprocess.CompletedProcess(argv, 1, payload, "")
+
+    conformance.subprocess.run = fake_run
+    conformance._LAST_TURN.clear()
+    try:
+        conformance._run_claude_shell(
+            "/pinned/claude", "/runtime", "/work", "printf measured"
+        )
+    finally:
+        conformance.subprocess.run = real_run
+
+    assert conformance._LAST_TURN == {"environment": "vendor-api-error"}
+
+
+def test_run_marks_only_api_stopped_cases_unmeasured():
+    store = tempfile.mkdtemp(prefix="ihar-conf-api-error-")
+    binary = os.path.join(store, "claude")
+    manifest = os.path.join(store, "manifest")
+    Path(binary).write_text("fixture\n", encoding="utf-8")
+    Path(manifest).write_text("fixture\n", encoding="utf-8")
+    original_cases = conformance.CASES
+    original_live_cases = conformance.LIVE_CASES
+    original_live_case = conformance._run_live_case
+    original_stage = conformance._stage
+    original_version = conformance.vendor_version
+    original_validate = conformance._validate_release_pin
+
+    def api_failure(*_args):
+        conformance._LAST_TURN["environment"] = "vendor-api-error"
+        return "failed", "Claude exited before the sandbox probe"
+
+    def hook_failure(*_args):
+        return "failed", "the vendor exited 1 without firing the probe hook"
+
+    conformance.CASES = {
+        "sandbox-direct-write": api_failure,
+        "real-hook-failure": hook_failure,
+    }
+    conformance.LIVE_CASES = frozenset({"deny-blocks-the-tool"})
+    conformance._run_live_case = api_failure
+    conformance._stage = lambda *_args, **_kwargs: None
+    conformance.vendor_version = lambda *_args: "2.1.274 (Claude Code)"
+    conformance._validate_release_pin = lambda *_args: None
+    try:
+        record = conformance.run(
+            "claude", binary, store, manifest,
+            auth_store=store, lockfile_path=LOCKFILE,
+        )
+    finally:
+        conformance.CASES = original_cases
+        conformance.LIVE_CASES = original_live_cases
+        conformance._run_live_case = original_live_case
+        conformance._stage = original_stage
+        conformance.vendor_version = original_version
+        conformance._validate_release_pin = original_validate
+        shutil.rmtree(store, ignore_errors=True)
+
+    assert record["cases"]["sandbox-direct-write"] == {
+        "status": "unmeasured",
+        "detail": "sandbox-direct-write: unmeasured",
+        "reason": "vendor-api-error",
+    }
+    assert record["cases"]["deny-blocks-the-tool"]["status"] == "unmeasured"
+    assert record["cases"]["real-hook-failure"]["status"] == "failed"
+    assert record["cases"]["real-hook-failure"]["reason"] == "hook-never-fired"
 
 
 def test_staged_vendor_home_uses_stable_login_without_exposing_codex_canonical():

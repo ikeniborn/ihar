@@ -357,11 +357,20 @@ _ENVIRONMENT_PHRASES = (
 )
 
 
-def _environment_reason(text: str, returncode: int) -> str:
+def _environment_reason(stdout: str, stderr: str, returncode: int) -> str:
     """One word when the environment stopped the turn, empty when it did not."""
     if returncode == 0:
         return ""
-    lowered = (text or "").lower()
+    try:
+        result = json.loads(stdout or "")
+    except (json.JSONDecodeError, TypeError):
+        result = None
+    if (isinstance(result, dict)
+            and result.get("type") == "result"
+            and result.get("is_error") is True
+            and result.get("terminal_reason") == "api_error"):
+        return "vendor-api-error"
+    lowered = ((stdout or "") + (stderr or "")).lower()
     for phrase, reason in _ENVIRONMENT_PHRASES:
         if phrase in lowered:
             return reason
@@ -416,7 +425,7 @@ def _vendor_turn(
     # honours a hook decision, and recording them as failures both hides the real state
     # and blocks an install that has nothing wrong with it.
     _LAST_TURN["environment"] = _environment_reason(
-        (result.stdout or "") + (result.stderr or ""), result.returncode)
+        result.stdout, result.stderr, result.returncode)
     _LAST_TURN["rejected_argv"] = bool(
         result.returncode != 0
         and ("unexpected argument" in (result.stderr or "")
@@ -454,6 +463,7 @@ REASONS = (
     "vendor-quota-exhausted",
     "vendor-unauthenticated",
     "vendor-unreachable",
+    "vendor-api-error",
     "vendor-rejected-argv",
     "vendor-exited-nonzero",
     "hook-never-fired",
@@ -638,7 +648,7 @@ def _run_claude_shell(binary: str, home: str, workdir: str, command: str):
         f"<ihar-conformance-command>{command}</ihar-conformance-command>"
     )
     env = {**os.environ, "CLAUDE_CONFIG_DIR": home}
-    return subprocess.run(
+    result = subprocess.run(
         [binary, "-p", prompt, "--output-format", "json", "--allowedTools", "Bash"],
         cwd=workdir,
         env=env,
@@ -646,6 +656,9 @@ def _run_claude_shell(binary: str, home: str, workdir: str, command: str):
         text=True,
         timeout=120,
     )
+    _LAST_TURN["environment"] = _environment_reason(
+        result.stdout, result.stderr, result.returncode)
+    return result
 
 
 def _remove_probe(path: str) -> None:
@@ -841,16 +854,22 @@ def run(
         for name, case in CASES.items():
             if name in CLAUDE_ONLY_CASES and vendor != "claude":
                 continue
+            _LAST_TURN.clear()
             try:
                 status, detail = case(vendor, binary, home, workdir)
             except Exception:                      # noqa: BLE001
                 status, detail = "failed", "the case raised"
+            environment = str(_LAST_TURN.get("environment") or "")
+            if status == "failed" and environment:
+                status, reason = "unmeasured", environment
+            else:
+                reason = _reason_for(status, detail)
             entry = {"status": status, "detail": f"{name}: {status}"}
-            reason = _reason_for(status, detail)
             if reason:
                 entry["reason"] = reason
             record["cases"][name] = entry
         for name in sorted(LIVE_CASES):
+            _LAST_TURN.clear()
             rejected = False
             environment = ""
             try:
