@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 23 (masking engine, continuous Codex guardian and recoverable guest return) |
+| Status | revision 24 (current Codex npm pin, bounded conformance diagnostics and 42-test inventory) |
 | Date | 2026-09-23 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
@@ -596,7 +596,7 @@ hook enforcement unproven for <vendor> <version>; run ihar check --conformance
 
 **The argv is measured, and a test keeps it measured.** `codex exec` on 0.154.0 has no `--ask-for-approval`: it answers `error: unexpected argument` and exits 2. The runner passed it anyway, so every Codex case reported `failed` as though a policy had not held, through two sessions of looking at authentication instead. The approval policy is configuration, so the turn now passes `-c approval_policy="never"`, which was measured by running the turn: it completes with `agent_message` and `turn.completed`. `tests/test_conformance_argv.py` reads the argv the runner builds and asserts every long flag appears in that binary's own `--help`, skipping cleanly where a vendor is not installed — a fixture cannot catch this class, only the binary can.
 
-**A failed case says why.** Each case already computed a reason and the record stored `name: status` instead, so the printed line carried nothing. The record now keeps the case's own sentence, clipped to 200 characters, and the runner prints it. Those sentences are the runner's words — an exit code, a missing sentinel, a decision that was not recorded — never vendor or model output, which stays out of the record as §14 requires.
+**A failed case says why without storing dynamic text.** Every case record keeps the fixed detail `<name>: <status>`. A failed case also carries one token from the closed reason vocabulary: `vendor-quota-exhausted`, `vendor-unauthenticated`, `vendor-unreachable`, `vendor-rejected-argv`, `vendor-exited-nonzero`, `hook-never-fired`, `sentinel-missing`, `decision-not-recorded`, `timeout`, `case-raised`, or `unclassified`. Human output prints only the status, case name and optional reason token. Case sentences, vendor output and model output are never persisted or printed, as §14 requires.
 
 **A case that could not be measured is not a case that failed.** A quota, a missing login and an unreachable endpoint say nothing about whether a vendor honours a hook decision. Recording them as failures blocked an install that had nothing wrong with it — observed when this project's own debugging exhausted a Codex quota — so those turns are recorded `unmeasured` with one word from the reason vocabulary. The vendor's text is read to classify and never kept.
 
@@ -1010,7 +1010,8 @@ Measured on 2026-09-22 and recorded so the next reader does not repeat it by han
 ```json
 {"schema": 1, "node": {"version": "…"},
  "claude": {"version": "2.1.274"},
- "codex": {"version": "rust-v0.154.0", "asset": "…", "sha256": "…"},
+ "codex": {"version": "0.154.0", "tarball": "https://registry.npmjs.org/@openai/codex/-/codex-0.154.0-linux-x64.tgz",
+           "prefix": "package/vendor/x86_64-unknown-linux-musl", "sha256": "…"},
  "uv": {"version": "…"}, "python": {"requirementsSha256": "…"},
  "hooks": {"hooks/security-pretool.py": "…", "hooks/_shared/hookio.py": "…"},
  "managedHooks": {"managed-hooks/codex/security-pretool.json": "…"},
@@ -1018,9 +1019,9 @@ Measured on 2026-09-22 and recorded so the next reader does not repeat it by han
  "microvm": {"firecracker": "…", "kernel": "…", "rootfs": "…"}}
 ```
 
-The tracked lockfile is immutable release input. It merges iclaude's version fields with icodex's release version, asset and published archive digest. Normal install and launch operations never rewrite it.
+The tracked lockfile is immutable release input. It merges iclaude's version fields with the Codex npm platform package version, tarball URL, internal package prefix and published tarball digest. Normal install and launch operations never rewrite it.
 
-Machine-local evidence lives in `$IHAR_STORE/install-receipt.json`: installation time, the release-lock digest, installed versions, and SHA-256 digests of the produced Claude and Codex executables. The receipt is validated and atomically replaced only after a successful install transaction. `codex.sha256` remains in the release lockfile because it is the published archive digest checked before extraction.
+Machine-local evidence lives in `$IHAR_STORE/install-receipt.json`: installation time, the release-lock digest, installed versions, and SHA-256 digests of the produced Claude and Codex executables. The receipt is validated and atomically replaced only after a successful install transaction. `codex.sha256` remains in the release lockfile because it is the published npm tarball digest checked before extraction.
 
 **Codex is pinned to its npm platform package, not to the GitHub release archive.** Measured on 2026-09-22: the release asset `codex-x86_64-unknown-linux-musl.tar.gz`, whose digest matches this lockfile, contains exactly one file — the `codex` executable. The CLI then answers every tool call with `Code Mode is unavailable because failed to spawn code-mode host …/codex-code-mode-host: host executable was not found`, and disabling `code_mode_host` does not restore a classic shell tool: the model replies that the execution tool is disabled. An install from that archive can hold a conversation and never run a command, which made every live conformance case fail for a reason no message named.
 
@@ -1116,7 +1117,7 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | guest auth | `tests/test_codex_auth_guest.py`, `tests/test_microvm.sh` | writable credential view separate from read-only policy; exact image descriptor; baseline and process quiescence; recoverable publish/rollback; lost response and acknowledgment; retained candidate without credential output |
 | diagnostics | `tests/test_contracts.sh`, `tests/test_mcp.sh`, `tests/test_state.sh`, `tests/test_lifecycle.sh`, `tests/test_claude_compare.py` | bounded generation/MCP/managed-setting/auth-owner categories; no secret values; materialized credential preservation; MCP-derived generation selection; top-level Claude `theme` exception with managed and unknown drift still closed |
 
-`manifests/tests.json` is the closed schema-1 inventory of the 38 test files that exist today. Paths are unique, repository-relative `tests/test_*.sh` or `tests/test_*.py` names. Before executing anything, `tests/run.sh` validates the manifest and fails with exit 3 for malformed, duplicate, unsafe, missing, unlisted-discovered, or listed-but-undiscovered paths. It then runs the inventory-equivalent discovered set and is the command each slice's verification names.
+`manifests/tests.json` is the closed schema-1 inventory of the 42 test files that exist today. Paths are unique, repository-relative `tests/test_*.sh` or `tests/test_*.py` names. Before executing anything, `tests/run.sh` validates the manifest and fails with exit 3 for malformed, duplicate, unsafe, missing, unlisted-discovered, or listed-but-undiscovered paths. It then runs the inventory-equivalent discovered set and is the command each slice's verification names.
 
 ## 17. Failure handling matrix
 
