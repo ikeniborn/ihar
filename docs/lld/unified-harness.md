@@ -500,11 +500,11 @@ read_event(argv) -> Event
 command_of(ev)   text_fields(ev)   paths_of(ev)   set_text(ev, pointer, value)
 allow()                      # exit 0
 deny(reason)                 # stderr + vendor-shaped JSON + exit 2
-update_input(ev)             # hookSpecificOutput.updatedInput, exit 0
+update_input(ev)             # vendor-shaped updatedInput decision, exit 0
 context(text)                # hookSpecificOutput.additionalContext, exit 0
 ```
 
-`deny` emits `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": r}}`, writes the same bounded reason to stderr, and exits 2. Both vendors block that exit-2 path from stderr; structured JSON decisions are consumed on exit 0. The conformance deny probe therefore exits 0 after emitting JSON so it proves that exact structured protocol instead of accidentally testing the separate stderr fallback. `update_input` emits `updatedInput`, which replaces iclaude's `toolInputOverride` and is accepted by both 2.1.274 and 0.154. There is no `ask`: a prompt a headless session cannot answer is a hang, not a control. `hookio` refuses keys outside the per-vendor allowlist, which matters because the Codex schema is `additionalProperties: false`.
+`deny` emits `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": r}}`, writes the same bounded reason to stderr, and exits 2. Both vendors block that exit-2 path from stderr; structured JSON decisions are consumed on exit 0. The conformance deny probe therefore exits 0 after emitting JSON so it proves that exact structured protocol instead of accidentally testing the separate stderr fallback. `update_input` emits `updatedInput`, which replaces iclaude's `toolInputOverride`; for Codex it also emits `permissionDecision: "allow"`. Codex 0.154.0 rejects `updatedInput` without that paired decision and fails open with no rewrite, while Claude keeps its existing `updatedInput` response shape. There is no `ask`: a prompt a headless session cannot answer is a hang, not a control. `hookio` refuses keys outside the per-vendor allowlist, which matters because the Codex schema is `additionalProperties: false`.
 
 Canonicalisation absorbed here: Codex `apply_patch` → `Edit`, `Shell` → `Bash`, the `tool_input` / `input` / `arguments` spelling, `command` against `cmd`, and patch headers `*** Add|Update|Delete File:` as paths.
 
@@ -579,7 +579,7 @@ Every required case drives a supported non-interactive vendor command through th
 | Claude and Codex | `deny-blocks-the-tool` | an explicit `PreToolUse` deny fires and the target command does not execute |
 | Claude and Codex | `rewrite-reaches-the-tool` | the hook rewrite reaches the command; the unrewritten fake secret does not |
 | Claude and Codex | `session-start-context` | `SessionStart` fires and its `additionalContext` reaches the model turn |
-| Claude and Codex | `mcp-matcher-fires` | the `mcp__ihar-conformance__prove` matcher fires and the stub MCP tool runs |
+| Claude and Codex | `mcp-matcher-fires` | the vendor-visible matcher fires and the stub MCP tool runs: Claude keeps `mcp__ihar-conformance__prove`; Codex 0.154.0 sanitizes the configured namespace to `mcp__ihar_conformance__prove` |
 | Claude and Codex | `timeout-behaviour` | the vendor terminates the over-time hook within the bounded tolerance and records whether the tool ran |
 | Claude | `sandbox-direct-write` | a direct shell write to every protected root is denied |
 | Claude | `sandbox-child-write` | a child-process write to every protected root is denied |
@@ -597,6 +597,8 @@ hook enforcement unproven for <vendor> <version>; run ihar check --conformance
 **The argv is measured, and a test keeps it measured.** `codex exec` on 0.154.0 has no `--ask-for-approval`: it answers `error: unexpected argument` and exits 2. The runner passed it anyway, so every Codex case reported `failed` as though a policy had not held, through two sessions of looking at authentication instead. The approval policy is configuration, so the turn now passes `-c approval_policy="never"`, which was measured by running the turn: it completes with `agent_message` and `turn.completed`. `tests/test_conformance_argv.py` reads the argv the runner builds and asserts every long flag appears in that binary's own `--help`, skipping cleanly where a vendor is not installed — a fixture cannot catch this class, only the binary can.
 
 Claude 2.1.274 declares `--allowedTools <tools...>` as a variadic option. A positional prompt placed after that option is consumed as another allowed-tool name, so no requested turn is measured. Both Claude turn builders place the prompt before `--allowedTools`, and the argv test fixes that ordering as part of the native CLI contract.
+
+Codex 0.154.0 derives hook matcher input from the model-visible MCP tool name, not the raw configured server key. Its MCP catalog sanitizes `ihar-conformance` to the namespace `mcp__ihar_conformance`, and the hook runtime joins that namespace with `prove`; the conformance matcher therefore uses `mcp__ihar_conformance__prove` for Codex while retaining Claude's hyphenated name. The same source contract requires `permissionDecision: "allow"` beside `updatedInput`; an unpaired rewrite is marked invalid and ignored before tool execution.
 
 Codex discovery and execution remain separate evidence. `hooks/list`, exact-digest trust, and tamper detection can all pass while a live `SessionStart` or `PreToolUse` probe never fires; this was observed with the pinned 0.154.0 binary under the active runtime. The three catalog cases never compensate for a failed live case. Such a record remains a real failure and blocks an existing-generation install or enforced launch; it is not reclassified as environmental or unmeasured.
 

@@ -559,12 +559,19 @@ def _run_live_case(vendor, binary, home, workdir, name):
     elif name == "mcp-matcher-fires":
         called = os.path.join(workdir, ".mcp-tool-called")
         _remove_probe(called)
+        # Codex normalizes model-visible MCP namespaces to the Responses API name
+        # alphabet before dispatch; Claude keeps the configured server spelling.
+        mcp_tool = (
+            "mcp__ihar_conformance__prove"
+            if vendor == "codex"
+            else "mcp__ihar-conformance__prove"
+        )
         _add_probe_hook(
             home, vendor, "PreToolUse", "observe", observed,
-            matcher="mcp__ihar-conformance__prove",
+            matcher=mcp_tool,
         )
         mcp_config = _configure_mcp(home, vendor, called)
-        allowed_tool = "mcp__ihar-conformance__prove"
+        allowed_tool = mcp_tool
         prompt = (
             "Call the ihar-conformance MCP server's prove tool exactly once with an empty object, "
             "then stop."

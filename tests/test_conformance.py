@@ -559,6 +559,52 @@ def test_fake_native_vendor_executes_every_mandatory_live_hook_protocol():
     assert all(status == "passed" for status, _ in results.values()), results
 
 
+def test_codex_mcp_case_uses_the_normalized_hook_tool_name():
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
+    real_reset = conformance._reset_probe_hooks
+    real_add = conformance._add_probe_hook
+    real_configure = conformance._configure_mcp
+    real_prepare = conformance._prepare_codex_hooks
+    real_turn = conformance._vendor_turn
+    seen = {}
+
+    def fake_add(_home, _vendor, _event, _mode, marker, *, matcher=None, **_kwargs):
+        seen["matcher"] = matcher
+        seen["marker"] = marker
+
+    def fake_configure(_home, _vendor, marker):
+        seen["target"] = marker
+
+    def fake_turn(_vendor, binary, _home, _workdir, _prompt, *, allowed_tool, **_kwargs):
+        seen["allowed_tool"] = allowed_tool
+        Path(seen["marker"]).write_text("observed\n", encoding="utf-8")
+        Path(seen["target"]).write_text("called\n", encoding="utf-8")
+        return conformance.subprocess.CompletedProcess([binary], 0, "{}", "")
+
+    conformance._reset_probe_hooks = lambda *_args: None
+    conformance._add_probe_hook = fake_add
+    conformance._configure_mcp = fake_configure
+    conformance._prepare_codex_hooks = lambda *_args: (True, "ready")
+    conformance._vendor_turn = fake_turn
+    try:
+        status, detail = conformance._run_live_case(
+            "codex", "/pinned/codex", home, workdir, "mcp-matcher-fires"
+        )
+    finally:
+        conformance._reset_probe_hooks = real_reset
+        conformance._add_probe_hook = real_add
+        conformance._configure_mcp = real_configure
+        conformance._prepare_codex_hooks = real_prepare
+        conformance._vendor_turn = real_turn
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    assert status == "passed", detail
+    assert seen["matcher"] == "mcp__ihar_conformance__prove", seen
+    assert seen["allowed_tool"] == "mcp__ihar_conformance__prove", seen
+
+
 def test_deny_needs_an_explicit_probe_decision_not_only_an_absent_sentinel():
     store = _store()
     binary = _fake_claude(store)

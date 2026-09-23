@@ -223,7 +223,13 @@ def deny(event, reason):
 
 
 def update_input(event):
-    _emit(event.event, {"updatedInput": event.input})
+    payload = {"updatedInput": event.input}
+    # Codex 0.154.0 treats updatedInput without an explicit allow decision as an
+    # invalid PreToolUse response and ignores the rewrite. Claude already consumes
+    # updatedInput on its own, so keep that vendor's output unchanged.
+    if event.vendor == "codex":
+        payload["permissionDecision"] = "allow"
+    _emit(event.event, payload)
     sys.exit(0)
 
 

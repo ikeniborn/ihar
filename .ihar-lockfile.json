@@ -22,7 +22,7 @@
     }
   },
   "hooks": {
-    "hooks/_shared/hookio.py": "6387e3392767482db33f6886102713025ae5acae47a609b73e866aca19c697c9",
+    "hooks/_shared/hookio.py": "822e00b79fe9e2aa2420df9bba4a9d1ed2c39e2004c074b14b11305ec3305f0f",
     "hooks/_shared/patterns.py": "8ee0cf9a7cf109f16e3c783516113b81b6addd241e10ee14e37826f19bcdf40e",
     "hooks/_shared/policy.py": "2b971fe08e6a1e59fb92582824b06b89c08bbb214c16dcfffc60908a72f86d0a",
     "hooks/chain-gate.py": "e68fc8f423fe4616b71d7e6145f152d39f57ac6304f660ace39f149734d49a40",
