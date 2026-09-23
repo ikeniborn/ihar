@@ -358,9 +358,11 @@ def _vendor_turn(
         argv.append(prompt)
     else:
         env["CODEX_HOME"] = home
+        # Measured against pinned Codex 0.154.0: `exec` accepts the approval policy
+        # as a configuration override, not as `--ask-for-approval`.
         argv = [
             binary, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
-            "--sandbox", "workspace-write", "--ask-for-approval", "never", prompt,
+            "--sandbox", "workspace-write", "-c", 'approval_policy="never"', prompt,
         ]
     return subprocess.run(
         argv,
