@@ -497,6 +497,8 @@ combined_output="$(IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
   IHAR_CODEX_BIN="$VENDOR_STUB" ihar --profile protected check --diff --conformance)" \
   || combined_status=$?
 assert_eq "clean diff retains failed conformance status" 1 "$combined_status"
+assert_contains "guarded diff recognizes its authenticated owner" "$combined_output" \
+  "codex mutable-link: valid; auth-owner: current command"
 assert_eq "combined flags still render the clean diff" "no differences" \
   "$(tail -n 1 <<<"$combined_output")"
 

@@ -129,7 +129,10 @@ ihar_check_diff() (
     if [[ "$vendor" == codex && -d "$active" ]]; then
       auth_diagnostic="$(ihar_python ihar.check_result auth-diff "$active" "$IHAR_STORE")" || return
       printf '%s\n' "$auth_diagnostic"
-      [[ "$auth_diagnostic" == 'codex mutable-link: valid; auth-owner: no recorded owner' ]] || found=true
+      case "$auth_diagnostic" in
+        'codex mutable-link: valid; auth-owner: no recorded owner'|'codex mutable-link: valid; auth-owner: current command') ;;
+        *) found=true ;;
+      esac
     fi
     while IFS= read -r -d '' file; do
       relative="${file#"$desired"/}"

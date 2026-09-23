@@ -432,7 +432,7 @@ def _receipt(argv: list[str]) -> int:
 
 def _auth_diff(runtime: str, store: str) -> int:
     """Report Codex link and lease categories without emitting credential bytes."""
-    from .codex import auth_owner
+    from .codex import auth_owner, guardian
 
     target = Path(runtime) / "auth.json"
     try:
@@ -468,7 +468,14 @@ def _auth_diff(runtime: str, store: str) -> int:
         elif not auth_owner.owner_identity_proven(record):
             status = "unverified"
         elif auth_owner.owner_is_active(record):
-            status = "busy"
+            guard_fd = os.environ.get("IHAR_GUARD_FD")
+            try:
+                if guard_fd is None:
+                    raise auth_owner.AuthOwnerError("No inherited Codex guardian")
+                guardian.request(int(guard_fd), "admit", {}, store=Path(store))
+                status = "current command"
+            except (auth_owner.AuthOwnerError, ValueError):
+                status = "busy"
         else:
             status = "quiescence unverified"
         print(f"codex mutable-link: valid; auth-owner: {status}")
