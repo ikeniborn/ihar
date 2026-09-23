@@ -14,6 +14,7 @@ ihar_session_claim() {
 ihar_session_append_launch() {
   local vendor="$1" vendor_id="$2"
   ihar_with_lock --best-effort "$IHAR_STATE/.ihar-sessions.lock" 5 \
+    env PYTHONPATH="${IHAR_ROOT:?IHAR_ROOT is not set}/lib/python" \
     "$IHAR_PY" -m ihar.sessions.index launch "$IHAR_STATE/sessions.jsonl" \
     "$IHAR_LAUNCH_ID" "$vendor" "$vendor_id" "$(basename "$IHAR_PROJECT_ROOT")" \
     "$IHAR_PROJECT_ROOT" "$IHAR_PROFILE" \

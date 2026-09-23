@@ -783,7 +783,7 @@ Before Firecracker starts, ihar writes a closed manifest over an immutable snaps
 
 ### 10.2 Writer
 
-`$IHAR_STATE/sessions.jsonl`, append-only, mode 600, appended under `ihar_with_lock --best-effort` with a 5-second timeout. A later record with the same `ihar_id` supersedes earlier ones field by field; null never overwrites a value; nothing is deleted.
+`$IHAR_STATE/sessions.jsonl`, append-only, mode 600, appended under `ihar_with_lock --best-effort` with a 5-second timeout. The launch writer passes an executable argv through the lock rather than the `ihar_python` shell function, so it sets `PYTHONPATH` to exactly `$IHAR_ROOT/lib/python`: the store interpreter can import the checkout package, and an ambient Python path is not inherited by this metadata helper. A later record with the same `ihar_id` supersedes earlier ones field by field; null never overwrites a value; nothing is deleted.
 
 ### 10.3 Registration and the daemon problem
 
