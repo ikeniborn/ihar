@@ -120,6 +120,12 @@ elif sys.argv[1:] == ["serve"]:
         time.sleep(1)
 EOF
 chmod +x "$FAKE"
+FAIL_DOWNLOAD="$IHAR_TEST_TMP/fail-download"
+cat > "$FAIL_DOWNLOAD" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$FAIL_DOWNLOAD"
 mkdir -p "$IHAR_STORE/auth/codex"
 chmod 700 "$IHAR_STORE/auth" "$IHAR_STORE/auth/codex"
 printf 'synthetic-credential' > "$IHAR_STORE/auth/codex/auth.json"
@@ -127,7 +133,8 @@ chmod 600 "$IHAR_STORE/auth/codex/auth.json"
 
 actual_status=0
 actual="$(cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
-  IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_LOG="$LOG" "$ROOT/ihar.sh" codex --web 2>&1)" || actual_status=$?
+  IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_LOG="$LOG" IHAR_DOWNLOAD="$FAIL_DOWNLOAD" \
+  "$ROOT/ihar.sh" codex --web 2>&1)" || actual_status=$?
 [[ "$actual_status" == 0 ]] || printf '%s\n' "$actual"
 calls="$(cat "$LOG")"
 assert_contains "Codex web starts the managed daemon" "$calls" \
@@ -141,6 +148,32 @@ assert_eq "web preserves canonical credential bytes" "synthetic-credential" \
 
 record="$(find "$IHAR_STATE_ROOT" -path '*/daemons/codex.json' -print -quit)"
 assert_exit "the managed daemon is recorded" 0 test -f "$record"
+guardian_pid="$(python3 -c "import json; print(json.load(open('$IHAR_STORE/auth/codex/.owner.json'))['guardian']['pid'])")"
+
+second_status=0
+second="$(cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
+  IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_LOG="$LOG" "$ROOT/ihar.sh" codex --web 2>&1)" \
+  || second_status=$?
+assert_eq "a second public Codex web invocation joins the daemon owner" "0" "$second_status"
+assert_contains "the second public web invocation runs its remote client" "$second" \
+  "namespace-attached"
+assert_eq "the second public web invocation starts no replacement daemon" "1" \
+  "$(grep -c '^app-server daemon start$' "$LOG")"
+
+update_status=0
+update_output="$(cd "$PROJECT" && IHAR_STORE="$IHAR_STORE" IHAR_STATE_ROOT="$IHAR_STATE_ROOT" \
+  IHAR_CODEX_BIN="$FAKE" IHAR_FAKE_LOG="$LOG" "$ROOT/ihar.sh" update 2>&1)" \
+  || update_status=$?
+[[ "$update_status" == 1 ]] || printf '%s\n' "$update_output"
+assert_eq "public update reaches its controlled download failure under the daemon owner" "1" \
+  "$update_status"
+assert_eq "public update restarts the daemon after its failed transaction" "2" \
+  "$(grep -c '^app-server daemon start$' "$LOG")"
+assert_eq "public update retains the exact original guardian" "$guardian_pid" \
+  "$(python3 -c "import json; print(json.load(open('$IHAR_STORE/auth/codex/.owner.json'))['guardian']['pid'])")"
+assert_eq "public update preserves canonical credential bytes" "synthetic-credential" \
+  "$(cat "$IHAR_STORE/auth/codex/auth.json")"
+
 assert_eq "the record does not claim remote control" "False" \
   "$(python3 -c "import json; print(json.load(open('$record'))['remote_control'])")"
 daemon_home="$(python3 -c "import json; print(json.load(open('$record'))['socket'].rsplit('/app-server-control/', 1)[0])")"

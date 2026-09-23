@@ -63,7 +63,8 @@ def _exchange(channel: socket.socket, store: Path, operation: str, fields: dict,
             stack.enter_context(reply)
             stack.enter_context(receiver)
             reply.settimeout({"daemon-start": 125, "daemon-stop": 65,
-                              "daemon-restart": 190, "attach": 30}.get(operation, 5))
+                              "daemon-restart": 190, "attach": 30,
+                              "join": 30}.get(operation, 5))
             rights = array.array("i", [receiver.fileno(), *descriptors])
             channel.sendmsg([message], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
             answer = reply.recv(_MAX_MESSAGE + 1)
@@ -174,6 +175,41 @@ def attach(store: Path, runtime: str, config_hash: str, argv: list[str],
                 status = observed.get("status")
                 if not isinstance(status, int):
                     raise auth_owner.AuthOwnerError("Codex remote attachment result is invalid")
+                return status
+            time.sleep(0.05)
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def join(store: Path, cwd: str, argv: list[str], stdio_fds: tuple[int, int, int]) -> int:
+    """Run one allowlisted ihar route as a child of the surviving daemon owner."""
+    if (len(stdio_fds) != 3 or any(not isinstance(fd, int) or fd < 0 for fd in stdio_fds)
+        or not isinstance(argv, list)):
+        raise auth_owner.AuthOwnerError("Codex guardian join request is invalid")
+    answer = call_owner(store, "join", {"cwd": cwd, "argv": argv}, descriptors=stdio_fds)
+    joined = answer.get("answer")
+    if (not isinstance(joined, dict) or set(joined) != {"pid", "start"}
+        or not isinstance(joined["pid"], int) or not isinstance(joined["start"], str)):
+        raise auth_owner.AuthOwnerError("Codex guardian join proof is invalid")
+    interrupted = 0
+    def forward(number: int, _frame: object) -> None:
+        nonlocal interrupted
+        interrupted = number
+    previous = {number: signal.signal(number, forward)
+                for number in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        while True:
+            if interrupted:
+                call_owner(store, "join-signal", dict(joined, signal=interrupted))
+                interrupted = 0
+            observed = call_owner(store, "join-status", joined).get("answer")
+            if not isinstance(observed, dict) or not isinstance(observed.get("done"), bool):
+                raise auth_owner.AuthOwnerError("Codex guardian join status is invalid")
+            if observed["done"]:
+                status = observed.get("status")
+                if not isinstance(status, int):
+                    raise auth_owner.AuthOwnerError("Codex guardian join result is invalid")
                 return status
             time.sleep(0.05)
     finally:
@@ -348,8 +384,17 @@ def _start_daemon(store: Path, runtime: str, config_hash: str, binary: str,
     return answer
 
 
+def _unexpected_guardian_descendant(
+        guardian_pid: int, table: dict[int, dict], ignored_pgrps: set[int]) -> bool:
+    return any(item["pid"] != guardian_pid and item["status"] != "Z"
+               and item["pgrp"] not in ignored_pgrps
+               and _descendant(item["pid"], guardian_pid, table)
+               for item in table.values())
+
+
 def _stop_daemon(store: Path, runtime: str, binary: str, guardian_pid: int,
-                 *, next_config_hash: str | None = None) -> dict:
+                 *, next_config_hash: str | None = None,
+                 ignored_pgrps: set[int] | None = None) -> dict:
     from . import daemon
 
     answer = daemon._daemon_call(binary, runtime, "stop", timeout=60.0)
@@ -382,7 +427,8 @@ def _stop_daemon(store: Path, runtime: str, binary: str, guardian_pid: int,
                     raise auth_owner.AuthOwnerError("Codex daemon socket changed")
                 socket_gone = False
             if (socket_gone and not auth_owner._group_active(identity)
-                and not auth_owner._descendants_active(guardian_pid)):
+                and not _unexpected_guardian_descendant(
+                    guardian_pid, table, ignored_pgrps or set())):
                 record["daemon"] = None
                 if next_config_hash is not None:
                     auth_owner.verify_runtime_link(runtime, store)
@@ -648,9 +694,190 @@ def _poll_attachments(store: Path, attachments: dict[tuple[int, str], dict]) -> 
         entry["completed_at"] = now
 
 
+def _joined_route_allowed(argv: list[str], entry: str) -> bool:
+    if (not argv or argv[0] != entry or not os.path.isabs(entry)
+        or any(not isinstance(item, str) or not item or "\0" in item for item in argv)):
+        return False
+    arguments = argv[1:]
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--profile":
+            if index + 1 >= len(arguments):
+                return False
+            index += 2
+        elif argument.startswith("--profile=") or argument in ("--assume-yes", "--dry-run"):
+            index += 1
+        else:
+            break
+    routed = arguments[index:]
+    if routed == ["update"]:
+        return True
+    if routed[:1] == ["codex"]:
+        before_passthrough = routed[1:routed.index("--") if "--" in routed else len(routed)]
+        return "--web" in before_passthrough
+    return routed[:2] == ["web", "codex"]
+
+
+def _start_joined(store: Path, fields: dict, stdio_fds: list[int], guardian_pid: int,
+                  joined: dict[tuple[int, str], dict]) -> dict:
+    gate_read = gate_write = -1
+    process = None
+    server = client = None
+    identity = None
+    registered = False
+    try:
+        server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
+        environment = dict(os.environ, IHAR_STORE=str(store),
+                           **{_FD_ENV: str(client.fileno())})
+        environment.pop(_REPORT_ENV, None)
+        environment.pop("IHAR_CODEX_GUARD_FD", None)
+        process = subprocess.Popen(
+            [sys.executable, "-c", _BOOT, str(gate_read), *fields["argv"]],
+            cwd=fields["cwd"], env=environment, stdin=stdio_fds[0], stdout=stdio_fds[1],
+            stderr=stdio_fds[2], pass_fds=(client.fileno(), gate_read), start_new_session=True)
+        with ExitStack() as stack:
+            owner = auth_owner._locked_owner(store, stack)
+            record = auth_owner._read_owner(owner)
+            table = auth_owner._process_table()
+            daemon = record.get("daemon") if isinstance(record, dict) else None
+            if (record is None or record.get("schema") != 2 or daemon is None
+                or record["guardian"]["pid"] != guardian_pid
+                or not auth_owner._identity_matches(record["guardian"], table)
+                or not auth_owner._identity_matches(daemon, table)
+                or not auth_owner._daemon_socket_proven(record)
+                or len(record["children"]) >= 32):
+                raise auth_owner.AuthOwnerError("Codex joined owner changed during setup")
+            identity = auth_owner._identity_for(process.pid, fields["argv"][0])
+            if identity["pgrp"] != identity["pid"]:
+                raise auth_owner.AuthOwnerError("Codex joined process group is invalid")
+            record["children"].append(identity)
+            auth_owner._write_owner(owner, record)
+        table = auth_owner._process_table()
+        known = [record.get("child"), record.get("daemon"), *record.get("children", [])]
+        baseline = {(item["pid"], item["start"]) for item in table.values()
+                    if item["ppid"] == guardian_pid
+                    and all(not candidate or (item["pid"], item["start"])
+                            != (candidate["pid"], candidate["start"]) for candidate in known)}
+        entry = {"process": process, "identity": identity, "descendants": [],
+                 "status": None, "done": False, "completed_at": None,
+                 "channel": server, "channel_open": True, "guardian_pid": guardian_pid,
+                 "baseline_guardian_children": baseline}
+        joined[(identity["pid"], identity["start"])] = entry
+        registered = True
+        client.close()
+        client = None
+        os.write(gate_write, b"1")
+        return {"pid": identity["pid"], "start": identity["start"]}
+    except (auth_owner.AuthOwnerError, OSError, ValueError, TypeError, KeyError,
+            subprocess.SubprocessError) as error:
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+        if identity is not None:
+            joined.pop((identity["pid"], identity["start"]), None)
+            with ExitStack() as stack:
+                owner = auth_owner._locked_owner(store, stack)
+                record = auth_owner._read_owner(owner)
+                if isinstance(record, dict) and identity in record.get("children", []):
+                    record["children"].remove(identity)
+                    auth_owner._write_owner(owner, record)
+        registered = False
+        raise auth_owner.AuthOwnerError("Codex guardian join failed") from error
+    finally:
+        for descriptor in (gate_read, gate_write):
+            if descriptor >= 0:
+                os.close(descriptor)
+        if client is not None:
+            client.close()
+        if not registered and server is not None:
+            server.close()
+
+
+def _refresh_joined_descendants(store: Path,
+                                joined: dict[tuple[int, str], dict]) -> dict[int, dict]:
+    table = auth_owner._process_table()
+    if not joined:
+        return table
+    with ExitStack() as stack:
+        owner = auth_owner._locked_owner(store, stack)
+        record = auth_owner._read_owner(owner)
+        if record is None or record.get("schema") != 2:
+            raise auth_owner.AuthOwnerError("Codex joined owner changed during supervision")
+        owner_identities = [record.get("guardian"), record.get("child"), record.get("daemon")]
+        owner_identities.extend(record.get("children", []))
+        known_owner = {(item["pid"], item["start"]) for item in owner_identities if item}
+        for entry in joined.values():
+            if entry["done"]:
+                continue
+            tracked = {(entry["identity"]["pid"], entry["identity"]["start"]),
+                       *((item["pid"], item["start"]) for item in entry["descendants"])}
+            tracked_pids = {pid for pid, _start in tracked}
+            progress = True
+            while progress:
+                progress = False
+                for item in table.values():
+                    key = (item["pid"], item["start"])
+                    if (item["status"] != "Z" and key not in tracked
+                        and item["ppid"] in tracked_pids):
+                        entry["descendants"].append(_observed_identity(item))
+                        tracked.add(key)
+                        tracked_pids.add(item["pid"])
+                        progress = True
+            for item in table.values():
+                key = (item["pid"], item["start"])
+                if (item["status"] != "Z" and item["ppid"] == entry["guardian_pid"]
+                    and key not in tracked and key not in known_owner
+                    and key not in entry["baseline_guardian_children"]):
+                    entry["descendants"].append(_observed_identity(item))
+                    tracked.add(key)
+    return table
+
+
+def _poll_joined(store: Path, joined: dict[tuple[int, str], dict]) -> None:
+    now = time.monotonic()
+    table = _refresh_joined_descendants(store, joined)
+    for key, entry in list(joined.items()):
+        if entry["done"]:
+            if entry["completed_at"] is not None and now - entry["completed_at"] > 60:
+                del joined[key]
+            continue
+        if entry["status"] is None:
+            status = entry["process"].poll()
+            if status is None:
+                continue
+            entry["status"] = 128 - status if status < 0 else status
+            table = _refresh_joined_descendants(store, joined)
+        tracked = [entry["identity"], *entry["descendants"]]
+        if any(identity["pid"] in table
+               and table[identity["pid"]]["start"] != identity["start"]
+               for identity in tracked):
+            raise auth_owner.AuthOwnerError("Codex joined descendant PID was reused")
+        if any(auth_owner._identity_matches(identity, table) for identity in tracked):
+            continue
+        with ExitStack() as stack:
+            owner = auth_owner._locked_owner(store, stack)
+            record = auth_owner._read_owner(owner)
+            if record is None or entry["identity"] not in record.get("children", []):
+                raise auth_owner.AuthOwnerError("Codex joined identity changed during teardown")
+            record["children"].remove(entry["identity"])
+            auth_owner._write_owner(owner, record)
+        if entry["channel_open"]:
+            entry["channel"].close()
+            entry["channel_open"] = False
+        entry["done"] = True
+        entry["completed_at"] = now
+
+
 def _handle(store: Path, channel: socket.socket, guardian_pid: int,
             *, external: bool = False,
             attachments: dict[tuple[int, str], dict] | None = None,
+            joined: dict[tuple[int, str], dict] | None = None,
             guest_resources: dict[str, int | None] | None = None) -> bool:
     control_space = socket.CMSG_SPACE(struct.calcsize("3i")) + socket.CMSG_SPACE(
         array.array("i").itemsize * 5)
@@ -678,6 +905,7 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
     guest_action = False
     close_guest_image = False
     guest_ack = None
+    joined_requester = None
     try:
         if (not message or len(message) > _MAX_MESSAGE
             or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
@@ -689,17 +917,27 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
         operation, fields = payload.get("operation"), payload["fields"]
         guest_action = isinstance(operation, str) and operation.startswith("guest-")
         if external and operation not in ("daemon-status", "daemon-stop", "daemon-restart",
-                                          "attach", "attach-status", "attach-signal"):
+                                          "attach", "attach-status", "attach-signal",
+                                          "join", "join-status", "join-signal"):
             raise auth_owner.AuthOwnerError("Codex external guardian operation is invalid")
         auth_action = None
         with ExitStack() as stack:
             owner = auth_owner._locked_owner(store, stack)
             record = auth_owner._read_owner(owner)
             table = auth_owner._process_table()
+            if joined is not None:
+                joined_requester = next((entry for entry in joined.values()
+                                         if not entry["done"]
+                                         and auth_owner._identity_matches(
+                                             entry["identity"], table)
+                                         and _descendant(credentials[0],
+                                                         entry["identity"]["pid"], table)), None)
+            joined_caller = not external and joined_requester is not None
             if (record is None or record.get("schema") != 2
                 or not auth_owner._identity_matches(record["guardian"], table)
                 or (not external and not _descendant(credentials[0], guardian_pid, table))
-                or (not external and not auth_owner._identity_matches(record["child"], table))):
+                or (not external and not joined_caller
+                    and not auth_owner._identity_matches(record["child"], table))):
                 raise auth_owner.AuthOwnerError("Codex guardian process identity is invalid")
             child_pid = record["child"]["pid"]
             if operation == "admit" and not fields:
@@ -875,6 +1113,32 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                     or attachments[key]["done"]):
                     raise auth_owner.AuthOwnerError("Codex remote attachment signal is invalid")
                 daemon_action = "attach-signal"
+            elif operation == "join" and external and set(fields) == {"cwd", "argv"}:
+                daemon = record.get("daemon")
+                argv = fields["argv"]
+                cwd = fields["cwd"]
+                if (joined is None or any(not entry["done"] for entry in joined.values())
+                    or len(passed_fds) != 3 or daemon is None
+                    or not isinstance(cwd, str) or not os.path.isabs(cwd)
+                    or not os.path.isdir(cwd) or not isinstance(argv, list)
+                    or not _joined_route_allowed(argv, record["child"]["binary"])
+                    or not auth_owner._identity_matches(daemon, table)
+                    or not auth_owner._daemon_socket_proven(record)):
+                    raise auth_owner.AuthOwnerError("Codex guardian join identity is invalid")
+                daemon_action = "join"
+            elif operation == "join-status" and external and set(fields) == {"pid", "start"}:
+                key = (fields["pid"], fields["start"])
+                if joined is None or key not in joined or passed_fds:
+                    raise auth_owner.AuthOwnerError("Codex guardian join status is invalid")
+                daemon_action = "join-status"
+            elif operation == "join-signal" and external and set(fields) == {
+                    "pid", "start", "signal"}:
+                key = (fields["pid"], fields["start"])
+                if (joined is None or key not in joined or passed_fds
+                    or fields["signal"] not in (signal.SIGINT, signal.SIGTERM)
+                    or joined[key]["done"]):
+                    raise auth_owner.AuthOwnerError("Codex guardian join signal is invalid")
+                daemon_action = "join-signal"
             else:
                 raise auth_owner.AuthOwnerError("Codex guardian operation is invalid")
             if auth_action is None and daemon_action is None:
@@ -899,7 +1163,9 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
             answer["answer"] = _stop_daemon(store, fields["runtime"], fields["binary"],
                                             guardian_pid,
                                             next_config_hash=(fields["config_hash"]
-                                                              if daemon_action == "restart" else None))
+                                                              if daemon_action == "restart" else None),
+                                            ignored_pgrps=({joined_requester["identity"]["pgrp"]}
+                                                            if joined_requester else None))
             if daemon_action == "restart":
                 answer["answer"] = _start_daemon(store, fields["runtime"],
                                                  fields["config_hash"], fields["binary"],
@@ -922,6 +1188,26 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                       if auth_owner._identity_matches(identity, table)}
             if not groups:
                 raise auth_owner.AuthOwnerError("Codex remote attachment signal is unverified")
+            for group in groups:
+                os.killpg(group, fields["signal"])
+            entry["status"] = 128 + fields["signal"]
+        elif daemon_action == "join":
+            answer["answer"] = _start_joined(store, fields, passed_fds, guardian_pid, joined)
+        elif daemon_action == "join-status":
+            key = (fields["pid"], fields["start"])
+            entry = joined[key]
+            answer["answer"] = ({"done": False} if not entry["done"] else
+                                {"done": True, "status": entry["status"]})
+            if entry["done"]:
+                del joined[key]
+        elif daemon_action == "join-signal":
+            entry = joined[(fields["pid"], fields["start"])]
+            table = auth_owner._process_table()
+            groups = {identity["pgrp"] for identity in
+                      [entry["identity"], *entry["descendants"]]
+                      if auth_owner._identity_matches(identity, table)}
+            if not groups:
+                raise auth_owner.AuthOwnerError("Codex guardian join signal is unverified")
             for group in groups:
                 os.killpg(group, fields["signal"])
             entry["status"] = 128 + fields["signal"]
@@ -1125,13 +1411,15 @@ def run(store: Path, argv: list[str]) -> int:
             channel_open = True
             pending_control: dict[socket.socket, float] = {}
             attachments: dict[tuple[int, str], dict] = {}
+            joined: dict[tuple[int, str], dict] = {}
             guest_resources: dict[str, int | None] = {"image_fd": None}
             while True:
                 _poll_attachments(selected, attachments)
+                _poll_joined(selected, joined)
                 if status is None:
                     status = child.poll()
                 if status is not None:
-                    if _release_when_quiescent(selected, child):
+                    if not joined and _release_when_quiescent(selected, child):
                         return 128 - status if status < 0 else status
                     if not reported:
                         with ExitStack() as stack:
@@ -1160,12 +1448,16 @@ def run(store: Path, argv: list[str]) -> int:
                 timeout = .05 if channel_open else .2
                 if pending_control:
                     timeout = min(timeout, max(0, min(pending_control.values()) - now))
+                joined_channels = [entry["channel"] for entry in joined.values()
+                                   if entry["channel_open"]]
                 readable, _, _ = select.select(
-                    ([server] if channel_open else []) + [listener, *pending_control],
+                    ([server] if channel_open else [])
+                    + [listener, *pending_control, *joined_channels],
                     [], [], timeout)
                 if server in readable:
                     channel_open = _handle(selected, server, os.getpid(),
                                            attachments=attachments,
+                                           joined=joined,
                                            guest_resources=guest_resources)
                     if not channel_open:
                         server.close()
@@ -1176,6 +1468,7 @@ def run(store: Path, argv: list[str]) -> int:
                     try:
                         _handle(selected, connection, os.getpid(), external=True,
                                 attachments=attachments,
+                                joined=joined,
                                 guest_resources=guest_resources)
                     finally:
                         connection.close()
@@ -1192,12 +1485,24 @@ def run(store: Path, argv: list[str]) -> int:
                         else:
                             pending_control[connection] = (time.monotonic()
                                                            + _CONTROL_CLIENT_TTL)
+                for entry in joined.values():
+                    connection = entry["channel"]
+                    if not entry["channel_open"] or connection not in readable:
+                        continue
+                    entry["channel_open"] = _handle(
+                        selected, connection, os.getpid(), attachments=attachments,
+                        joined=joined, guest_resources=guest_resources)
+                    if not entry["channel_open"]:
+                        connection.close()
         finally:
             image_fd = guest_resources.get("image_fd")
             if image_fd is not None:
                 os.close(image_fd)
             for connection in pending_control:
                 connection.close()
+            for entry in joined.values():
+                if entry["channel_open"]:
+                    entry["channel"].close()
             for number, handler in previous_handlers.items():
                 signal.signal(number, handler)
 
@@ -1288,6 +1593,10 @@ def _supervise(store: str, command: list[str]) -> int:
 def _main(arguments: list[str]) -> int:
     if len(arguments) >= 4 and arguments[0] == "supervise" and arguments[2] == "--":
         return _supervise(arguments[1], arguments[3:])
+    if len(arguments) == 2 and arguments[0] == "owner-present":
+        return 0 if owner_record_present(Path(arguments[1])) else 1
+    if len(arguments) >= 5 and arguments[0] == "join" and arguments[3] == "--":
+        return join(Path(arguments[1]), arguments[2], arguments[4:], (0, 1, 2))
     if len(arguments) == 2 and arguments[0] == "admit":
         request(int(arguments[1]), "admit", {})
         return 0

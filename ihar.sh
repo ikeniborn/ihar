@@ -59,10 +59,22 @@ ihar_main() {
 
   ihar_args_parse "$@"
   ihar_guard_undelivered
-  local needs_codex_guard=false
+  local needs_codex_guard=false joins_daemon_owner=false
   case "$IHAR_COMMAND:${IHAR_SUBCOMMAND:-}" in
-    codex:*|acp:codex|web:codex) needs_codex_guard=true ;;
-    install:*|update:*|switch:*) needs_codex_guard=true ;;
+    codex:*)
+      needs_codex_guard=true
+      [[ "$IHAR_FLAG_WEB" == true ]] && joins_daemon_owner=true
+      ;;
+    acp:codex) needs_codex_guard=true ;;
+    web:codex)
+      needs_codex_guard=true
+      joins_daemon_owner=true
+      ;;
+    install:*|switch:*) needs_codex_guard=true ;;
+    update:*)
+      needs_codex_guard=true
+      joins_daemon_owner=true
+      ;;
     check:*)
       if [[ -x "$IHAR_CODEX_BIN" ]]; then
         needs_codex_guard=true
@@ -91,6 +103,20 @@ ihar_main() {
       ihar_python ihar.codex.guardian admit "$IHAR_GUARD_FD" \
         || ihar_die 3 "Codex guardian admission cannot be verified"
     else
+      if [[ "$joins_daemon_owner" == true ]]; then
+        local owner_status=0 owner_error="" joined_status=0
+        owner_error="$(ihar_python ihar.codex.guardian owner-present "$IHAR_STORE" 2>&1)" \
+          || owner_status=$?
+        case "$owner_status" in
+          0)
+            ihar_python ihar.codex.guardian join "$IHAR_STORE" "$PWD" -- \
+              "$(readlink -f "$_IHAR_ENTRY")" "$@" || joined_status=$?
+            return "$joined_status"
+            ;;
+          1) ;;
+          *) ihar_die 3 "Codex daemon guardian cannot be verified: ${owner_error:-no detail}" ;;
+        esac
+      fi
       ihar_python ihar.codex.guardian supervise "$IHAR_STORE" -- "$(readlink -f "$_IHAR_ENTRY")" "$@"
       return $?
     fi
