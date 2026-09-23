@@ -828,6 +828,54 @@ def test_observed_hook_marker_outranks_a_later_api_error():
     assert conformance._LAST_TURN["dispatch_observed"] is True
 
 
+def test_session_start_marker_does_not_claim_tool_dispatch_before_api_error():
+    store = _store()
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
+    original_turn = conformance._vendor_turn
+
+    def api_error_after_session_start(
+        _vendor, binary, selected_home, _workdir, *_args, **_kwargs,
+    ):
+        block, _ = conformance._hook_block(selected_home, "claude")
+        command = next(
+            hook["command"] for group in block["SessionStart"]
+            for hook in group["hooks"] if "conformance-probe.py" in hook["command"]
+        )
+        Path(shlex.split(command)[4]).write_text("observed\n", encoding="utf-8")
+        payload = json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "terminal_reason": "api_error",
+            "result": "SECRET-SENTINEL",
+        })
+        conformance._LAST_TURN["environment"] = conformance._environment_reason(
+            payload, "", 1,
+        )
+        return conformance.subprocess.CompletedProcess([binary], 1, payload, "")
+
+    import shlex
+    conformance._vendor_turn = api_error_after_session_start
+    conformance._LAST_TURN.clear()
+    try:
+        conformance._stage(store, MANIFEST, "claude", home, auth_store=store)
+        status, detail = conformance._run_live_case(
+            "claude", "claude", home, workdir, "session-start-context"
+        )
+        downstream_target = Path(workdir, ".session-start-context-target")
+        target_exists = downstream_target.exists()
+    finally:
+        conformance._vendor_turn = original_turn
+        for directory in (store, home, workdir):
+            shutil.rmtree(directory, ignore_errors=True)
+
+    assert status == "failed", detail
+    assert target_exists is False
+    assert conformance._LAST_TURN["environment"] == "vendor-api-error"
+    assert conformance._LAST_TURN["dispatch_observed"] is False
+
+
 def test_observed_sandbox_sentinel_outranks_a_later_api_error():
     home = tempfile.mkdtemp(prefix="ihar-conf-home-")
     workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
@@ -924,11 +972,7 @@ def test_run_marks_only_api_stopped_cases_unmeasured():
     conformance.LIVE_CASES = frozenset({
         "deny-blocks-the-tool", "session-start-context",
     })
-    conformance._run_live_case = lambda *_args: (
-        post_dispatch_api_failure()
-        if _args[-1] == "session-start-context"
-        else api_failure()
-    )
+    conformance._run_live_case = api_failure
     conformance._stage = lambda *_args, **_kwargs: None
     conformance.vendor_version = lambda *_args: "2.1.274 (Claude Code)"
     conformance._validate_release_pin = lambda *_args: None
@@ -955,9 +999,8 @@ def test_run_marks_only_api_stopped_cases_unmeasured():
     assert record["cases"]["sandbox-observed-api-error"]["status"] == "failed"
     assert record["cases"]["sandbox-observed-api-error"]["reason"] == \
         "vendor-exited-nonzero"
-    assert record["cases"]["session-start-context"]["status"] == "failed"
-    assert record["cases"]["session-start-context"]["reason"] == \
-        "vendor-exited-nonzero"
+    assert record["cases"]["session-start-context"]["status"] == "unmeasured"
+    assert record["cases"]["session-start-context"]["reason"] == "vendor-api-error"
     assert record["cases"]["real-hook-failure"]["status"] == "failed"
     assert record["cases"]["real-hook-failure"]["reason"] == "hook-never-fired"
 

@@ -595,13 +595,18 @@ def _run_live_case(vendor, binary, home, workdir, name):
     except subprocess.TimeoutExpired:
         return "failed", "the vendor turn exceeded 180 seconds"
 
-    _record_dispatch_observed(
-        _observed(observed)
-        or os.path.exists(target)
-        or os.path.exists(observed + ".decision")
-        or os.path.exists(observed + ".completed")
-        or os.path.exists(observed + ".ended")
-    )
+    if name == "session-start-context":
+        # SessionStart runs before the model/API turn. Its marker proves that the hook
+        # loaded, not that its context reached the model or that Bash was dispatched.
+        _record_dispatch_observed(os.path.exists(target))
+    else:
+        _record_dispatch_observed(
+            _observed(observed)
+            or os.path.exists(target)
+            or os.path.exists(observed + ".decision")
+            or os.path.exists(observed + ".completed")
+            or os.path.exists(observed + ".ended")
+        )
     if not _observed(observed):
         return "failed", f"the vendor exited {result.returncode} without firing the probe hook"
     if name != "timeout-behaviour" and result.returncode != 0:
