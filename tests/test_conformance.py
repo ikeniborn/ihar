@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -424,7 +425,7 @@ def run_hooks(event, tool="", tool_input=None):
 
 
 _, _, contexts = run_hooks("SessionStart")
-prompt = sys.argv[-1]
+prompt = sys.argv[2]
 if "MCP server's prove tool" in prompt:
     tool = "mcp__ihar-conformance__prove"
     decisions, _, _ = run_hooks("PreToolUse", tool, {})
@@ -653,10 +654,58 @@ def test_vendor_turn_uses_supported_native_cli_and_exact_claude_tool_allowlist()
     claude_argv, claude_kwargs = seen[0]
     codex_argv, codex_kwargs = seen[1]
     assert claude_argv[:2] == ["/pinned/claude", "-p"], claude_argv
+    assert claude_argv.index("prompt") < claude_argv.index("--allowedTools"), claude_argv
     assert claude_argv[claude_argv.index("--allowedTools") + 1] == "Bash", claude_argv
     assert claude_kwargs["env"]["CLAUDE_CONFIG_DIR"] == "/runtime"
     assert codex_argv[:2] == ["/pinned/codex", "exec"], codex_argv
     assert codex_kwargs["env"]["CODEX_HOME"] == "/runtime"
+
+
+def test_claude_shell_places_prompt_before_variadic_allowed_tools():
+    seen = []
+    real_run = conformance.subprocess.run
+
+    def fake_run(argv, **kwargs):
+        seen.append((argv, kwargs))
+        return conformance.subprocess.CompletedProcess(argv, 0, "", "")
+
+    conformance.subprocess.run = fake_run
+    try:
+        conformance._run_claude_shell(
+            "/pinned/claude", "/runtime", "/work", "printf measured"
+        )
+    finally:
+        conformance.subprocess.run = real_run
+
+    argv, _kwargs = seen[0]
+    prompt = argv[2]
+    assert "printf measured" in prompt, argv
+    assert argv.index(prompt) < argv.index("--allowedTools"), argv
+
+
+def test_deny_probe_returns_json_decision_with_success_status():
+    with tempfile.TemporaryDirectory(prefix="ihar-conf-probe-") as raw:
+        script = Path(raw, "probe.py")
+        marker = Path(raw, "marker")
+        script.write_text(conformance._PROBE_SCRIPT, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(script), "deny", str(marker)],
+            input='{"hook_event_name":"PreToolUse"}',
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert result.returncode == 0, result
+    output = json.loads(result.stdout)["hookSpecificOutput"]
+    assert output["hookEventName"] == "PreToolUse"
+    assert output["permissionDecision"] == "deny"
+
+
+def test_failed_rewrite_has_a_closed_reason():
+    assert conformance._reason_for(
+        "failed", "the vendor executed the unrewritten secret"
+    ) == "rewrite-not-applied"
 
 
 def test_staged_vendor_home_uses_stable_login_without_exposing_codex_canonical():

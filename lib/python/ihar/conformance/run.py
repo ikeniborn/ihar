@@ -75,7 +75,7 @@ if mode == "deny":
                                       "permissionDecisionReason": "conformance deny probe"}},
               sys.stdout)
     sys.stdout.write("\n")
-    raise SystemExit(2)
+    raise SystemExit(0)
 elif mode == "context":
     json.dump({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                       "additionalContext": "IHAR-CONFORMANCE-SESSION-CONTEXT"}},
@@ -381,11 +381,15 @@ def _vendor_turn(
     env = dict(os.environ)
     if vendor == "claude":
         env["CLAUDE_CONFIG_DIR"] = home
-        argv = [binary, "-p", "--output-format", "json", "--permission-mode", "dontAsk"]
-        argv.extend(["--allowedTools", allowed_tool])
+        # `--allowedTools <tools...>` is variadic. A positional prompt after it is
+        # consumed as another tool name, so keep the prompt before that final option.
+        argv = [
+            binary, "-p", prompt, "--output-format", "json",
+            "--permission-mode", "dontAsk",
+        ]
         if mcp_config:
             argv.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
-        argv.append(prompt)
+        argv.extend(["--allowedTools", allowed_tool])
     else:
         env["CODEX_HOME"] = home
         # Measured against the pinned 0.154.0 rather than assumed: `codex exec` has no
@@ -455,6 +459,7 @@ REASONS = (
     "hook-never-fired",
     "sentinel-missing",
     "decision-not-recorded",
+    "rewrite-not-applied",
     "timeout",
     "case-raised",
     "unclassified",
@@ -470,6 +475,7 @@ _REASON_PHRASES = (
     ("did not run", "sentinel-missing"),
     ("did not receive", "sentinel-missing"),
     ("without recording an explicit deny", "decision-not-recorded"),
+    ("executed the unrewritten secret", "rewrite-not-applied"),
     ("raised", "case-raised"),
 )
 
@@ -633,7 +639,7 @@ def _run_claude_shell(binary: str, home: str, workdir: str, command: str):
     )
     env = {**os.environ, "CLAUDE_CONFIG_DIR": home}
     return subprocess.run(
-        [binary, "-p", "--output-format", "json", "--allowedTools", "Bash", prompt],
+        [binary, "-p", prompt, "--output-format", "json", "--allowedTools", "Bash"],
         cwd=workdir,
         env=env,
         capture_output=True,
