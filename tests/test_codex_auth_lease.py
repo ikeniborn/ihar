@@ -1355,6 +1355,34 @@ else:
         self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
         self.assertFalse(self.record.exists())
 
+    def test_external_status_runs_under_original_guardian(self) -> None:
+        process, binary, env = self._start_guarded_review_daemon()
+        command = [sys.executable, "-m", "ihar.codex.daemon", "status", "--binary",
+                   str(binary), "--home", str(self.runtime_a), "--state",
+                   str(self.root / "state"), "--auth-store", str(self.store)]
+        checked = subprocess.run(command, env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        record = json.loads(self.record.read_text())
+        self.assertEqual(int((self.runtime_a / "status-parent").read_text()),
+                         record["guardian"]["pid"])
+        self.assertIsNone(process.poll(), "status must not release the daemon owner")
+
+    def test_absent_external_status_starts_no_codex_process(self) -> None:
+        marker = self.root / "status-vendor-started"
+        binary = self.root / "status-codex"
+        binary.write_text(f"#!/bin/sh\ntouch {str(marker)!r}\n", encoding="utf-8")
+        binary.chmod(0o700)
+        command = [sys.executable, "-m", "ihar.codex.daemon", "status", "--binary",
+                   str(binary), "--home", str(self.runtime_a), "--state",
+                   str(self.root / "state"), "--auth-store", str(self.store)]
+        checked = subprocess.run(
+            command,
+            env=dict(os.environ,
+                     PYTHONPATH=str(Path(__file__).resolve().parents[1] / "lib" / "python")),
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(checked.returncode, 1, checked.stderr)
+        self.assertFalse(marker.exists(), checked.stderr)
+
     def test_external_restart_keeps_original_guardian(self) -> None:
         process, binary, env = self._start_guarded_review_daemon()
         first = json.loads(self.record.read_text())
@@ -1964,6 +1992,7 @@ elif sys.argv[1:] == ['app-server', 'daemon', 'stop']:
     os.killpg(int(open(pidfile).read()), signal.SIGTERM)
     print(json.dumps({'status':'stopped'}))
 elif sys.argv[1:] == ['app-server', 'daemon', 'version']:
+    open(home + '/status-parent', 'w').write(str(os.getppid()))
     if mode != 'absent-status' and os.path.exists(sock):
         print(json.dumps({'status':'running','pid':int(open(pidfile).read()),
                           'socketPath':sock,'managedCodexVersion':'0.154.0'}))

@@ -688,7 +688,7 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
             raise auth_owner.AuthOwnerError("Codex guardian request is invalid")
         operation, fields = payload.get("operation"), payload["fields"]
         guest_action = isinstance(operation, str) and operation.startswith("guest-")
-        if external and operation not in ("daemon-stop", "daemon-restart",
+        if external and operation not in ("daemon-status", "daemon-stop", "daemon-restart",
                                           "attach", "attach-status", "attach-signal"):
             raise auth_owner.AuthOwnerError("Codex external guardian operation is invalid")
         auth_action = None
@@ -827,8 +827,8 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                     or not os.path.isabs(fields["binary"])):
                     raise auth_owner.AuthOwnerError("Codex daemon start owner is invalid")
                 daemon_action = "start"
-            elif (operation in ("daemon-stop", "daemon-restart") and external
-                  and set(fields) == ({"runtime", "binary"} if operation == "daemon-stop"
+            elif (operation in ("daemon-status", "daemon-stop", "daemon-restart") and external
+                  and set(fields) == ({"runtime", "binary"} if operation != "daemon-restart"
                                       else {"runtime", "binary", "config_hash"})):
                 daemon = record.get("daemon")
                 if (daemon is None or fields["runtime"] != record["runtime"]
@@ -839,7 +839,7 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
                     or not auth_owner._identity_matches(daemon, table)
                     or not auth_owner._daemon_socket_proven(record)):
                     raise auth_owner.AuthOwnerError("Codex daemon stop identity is invalid")
-                daemon_action = "stop" if operation == "daemon-stop" else "restart"
+                daemon_action = operation.removeprefix("daemon-")
             elif operation == "attach" and external and set(fields) == {
                     "runtime", "config_hash", "argv"}:
                 daemon = record.get("daemon")
@@ -887,7 +887,11 @@ def _handle(store: Path, channel: socket.socket, guardian_pid: int,
         answer = {"ok": True, "state": record["state"]}
         if guest_ack is not None:
             answer["ack"] = guest_ack
-        if daemon_action == "start":
+        if daemon_action == "status":
+            from . import daemon
+            answer["answer"] = daemon._daemon_call(fields["binary"], fields["runtime"],
+                                                    "version", timeout=30.0)
+        elif daemon_action == "start":
             answer["answer"] = _start_daemon(store, fields["runtime"],
                                              fields["config_hash"], fields["binary"],
                                              guardian_pid)

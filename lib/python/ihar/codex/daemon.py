@@ -86,8 +86,19 @@ def _daemon_call(binary: str, home: str, action: str, timeout: float = 120.0) ->
             "exit": completed.returncode}
 
 
-def status(binary: str, home: str) -> dict:
-    return _daemon_call(binary, home, "version", timeout=30.0)
+def status(binary: str, home: str, *, auth_store: str | None = None) -> dict:
+    if auth_store is None:
+        return _daemon_call(binary, home, "version", timeout=30.0)
+    if not os.path.lexists(os.path.join(home, "app-server-control", "app-server-control.sock")):
+        return {"status": "absent", "exit": 1}
+    from . import guardian
+    reply = guardian.call_owner(auth_store, "daemon-status",
+                                {"runtime": os.path.abspath(home),
+                                 "binary": os.path.abspath(binary)})
+    answer = reply.get("answer")
+    if not isinstance(answer, dict):
+        raise auth_owner.AuthOwnerError("Codex daemon status proof is invalid")
+    return answer
 
 
 def start(binary: str, home: str, *, auth_store: str | None = None,
@@ -428,7 +439,11 @@ def main(argv: list[str]) -> int:
         return 0
 
     if args.action == "status":
-        answer = status(args.binary, args.home)
+        try:
+            answer = status(args.binary, args.home, auth_store=args.auth_store)
+        except auth_owner.AuthOwnerError as error:
+            print(str(error), file=sys.stderr)
+            return 3
         record = read_record(args.state)
         json.dump({"status": answer, "record": record}, sys.stdout)
         sys.stdout.write("\n")
