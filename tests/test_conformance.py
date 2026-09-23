@@ -111,6 +111,44 @@ def test_main_reports_failed_case_without_dynamic_detail():
     assert "SECRET-SENTINEL" not in out.getvalue() + err.getvalue()
 
 
+def test_main_aborts_guarded_stage_when_required_case_is_unmeasured():
+    store = tempfile.mkdtemp(prefix="ihar-conf-unmeasured-owner-")
+    binary = os.path.join(store, "binary")
+    manifest = os.path.join(store, "manifest")
+    for path in (binary, manifest):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("fixture\n")
+    record = _record("codex", binary, manifest)
+    name = sorted(EXPECTED_REQUIRED_CASES["codex"])[0]
+    record["cases"][name] = {
+        "status": "unmeasured",
+        "detail": f"{name}: unmeasured",
+        "reason": "vendor-unreachable",
+    }
+    real_run = conformance.run
+    real_begin = conformance._begin_codex_conformance
+    real_finish = conformance._finish_codex_conformance
+    finished = []
+    conformance.run = lambda *_args, **_kwargs: record
+    conformance._begin_codex_conformance = lambda _store: "synthetic-stage"
+    conformance._finish_codex_conformance = lambda *args: finished.append(args)
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with redirect_stdout(out), redirect_stderr(err):
+            result = conformance.main([
+                "codex", binary, store, manifest,
+                "--auth-store", store, "--lockfile", LOCKFILE,
+            ])
+    finally:
+        conformance.run = real_run
+        conformance._begin_codex_conformance = real_begin
+        conformance._finish_codex_conformance = real_finish
+        shutil.rmtree(store, ignore_errors=True)
+    assert result == 1
+    assert finished == [(store, "synthetic-stage", True)]
+    assert f"unmeasured {name} (vendor-unreachable)" in out.getvalue()
+
+
 def test_main_hides_pre_record_exception_detail():
     store = tempfile.mkdtemp(prefix="ihar-conf-output-")
     real_run = conformance.run

@@ -9,6 +9,12 @@ and this manifest and every case passed.
 
 Usage: python3 -m ihar.conformance.check <record> <binary> <manifest>
        python3 -m ihar.conformance.check --failed-record <vendor> <record> <binary> <manifest>
+       python3 -m ihar.conformance.check --unmeasured-record <vendor> <record> <binary> <manifest>
+
+`--unmeasured-record` answers 0 when every required case that is not passed is
+`unmeasured` — a quota, a missing login, an unreachable endpoint — and at least one is.
+An install may then activate the generation while recording the vendor as unproven; an
+enforced profile still refuses to launch, because an unmeasured case proves nothing.
 """
 
 from __future__ import annotations
@@ -30,7 +36,8 @@ def _digest(path: str) -> str:
 
 def main(argv: list[str]) -> int:
     failed_record_mode = bool(argv) and argv[0] == "--failed-record"
-    if failed_record_mode:
+    unmeasured_record_mode = bool(argv) and argv[0] == "--unmeasured-record"
+    if failed_record_mode or unmeasured_record_mode:
         if len(argv) != 5 or argv[1] not in REQUIRED_CASES:
             print(__doc__, file=sys.stderr)
             return 2
@@ -46,7 +53,7 @@ def main(argv: list[str]) -> int:
     except (jsonio.SchemaError, OSError, UnicodeError):
         print("the record is unreadable")
         return 1
-    if failed_record_mode and record["vendor"] != expected_vendor:
+    if (failed_record_mode or unmeasured_record_mode) and record["vendor"] != expected_vendor:
         print("the record does not match the vendor")
         return 1
 
@@ -62,8 +69,21 @@ def main(argv: list[str]) -> int:
 
     failed = sorted(name for name, case in record["cases"].items()
                     if case["status"] == "failed")
+    required = REQUIRED_CASES[record["vendor"]]
+    unmeasured = sorted(name for name, case in record["cases"].items()
+                        if case["status"] == "unmeasured")
     if failed_record_mode:
-        return 0 if REQUIRED_CASES[record["vendor"]].intersection(failed) else 1
+        return 0 if required.intersection(failed) else 1
+    if unmeasured_record_mode:
+        # Only when nothing actually failed: one real failure among the required cases
+        # and the record is a failure, whatever else could not be measured.
+        if required.intersection(failed):
+            return 1
+        return 0 if required.intersection(unmeasured) else 1
+    if required.intersection(unmeasured):
+        print("these cases could not be measured: "
+              + ", ".join(sorted(required.intersection(unmeasured))))
+        return 1
     if failed:
         required_failed = sorted(REQUIRED_CASES[record["vendor"]].intersection(failed))
         if required_failed:

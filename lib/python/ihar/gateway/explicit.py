@@ -26,7 +26,7 @@ import urllib.parse
 import uuid
 
 from ..mask import shapes
-from ..mask.engine import Masker
+from ..mask.engine import Masker, MaskingUnavailable
 from . import limits, log, routes
 
 UPSTREAMS = {
@@ -151,6 +151,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 family=shapes.family_for(self.path), enforced=self.enforced,
             )
         except shapes.Unsupported as reason:
+            return self._refuse(request_id, 502, str(reason), method)
+        except MaskingUnavailable as reason:
+            # The engine that the profile promises could not run on this body. Relaying
+            # it masked by something weaker would be the silent degradation this refusal
+            # exists to prevent.
             return self._refuse(request_id, 502, str(reason), method)
 
         outgoing = json.dumps(masked).encode()

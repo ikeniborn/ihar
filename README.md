@@ -38,6 +38,15 @@ A profile is a set of guarantees, and `ihar check` prints the text of the one in
 A profile that enforces something and cannot prove it aborts the launch. There is no mode
 where a guarantee degrades silently.
 
+The masking behind `protected` is two layers: tuned patterns for the things that have a
+shape — addresses, keys, cards, addresses of machines — and a named-entity engine on top
+for the things that do not, like a person or a place. It reads both English and Russian,
+picking the language from the script the text is written in rather than from a setting,
+and `ihar check` prints which engine and which languages are actually in force. Installing
+ihar fetches that engine with its two language models, about 380 MB in the store; a machine
+that cannot install it keeps working on the patterns alone and says so instead of implying
+more.
+
 ## Install
 
 Everything installs under your own user. Installation never uses `sudo`. An `isolated`
@@ -162,6 +171,12 @@ ihar switch --to codex --history transcript
 Neither vendor accepts a foreign session, so the transcript arrives as a file the
 next agent may read, never as a session it resumes. Those exports are kept until you
 delete them; `ihar check` reports how many there are and how much space they use.
+
+The export is bounded at 256 KiB by default, which is a measured figure rather than a
+round one: the masking engine that `protected` promises processes this kind of text at
+roughly 0.015 MiB/s, so a larger default would mean minutes of waiting for one switch.
+If the engine cannot mask something at all, ihar refuses or degrades and says so — it
+never quietly masks with something weaker than the level you asked for.
 
 ## Web access today
 

@@ -123,8 +123,18 @@ ihar_store_verify_hooks() {
       || status=$?
     case "$status" in
       0) ;;
-      1) ihar_die 3 "$out differs from the lockfile
+      1)
+        # `out` is "missing <path>" or "changed <path>". A store that predates a pin and
+        # a file something rewrote are different problems, and the message says which.
+        case "$out" in
+          missing\ *) ihar_die 3 "${out#missing } is pinned by the lockfile and absent from the store
 run 'ihar install'" ;;
+          changed\ *) ihar_die 3 "${out#changed } differs from the lockfile
+run 'ihar install'" ;;
+          *) ihar_die 3 "$out does not satisfy the lockfile
+run 'ihar install'" ;;
+        esac
+        ;;
       *) ihar_die 3 "cannot verify $key integrity: ${out:-no output}" ;;
     esac
   done

@@ -12,7 +12,7 @@ mkdir -p "$PROJECT"
 IHAR_LOCKFILE="$IHAR_TEST_TMP/lifecycle-lock.json"
 export IHAR_LOCKFILE
 printf '%s\n' \
-  '{"schema":1,"claude":{"version":"2.1.274"},"codex":{"version":"rust-v0.154.0","asset":"codex.tar.gz","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"hooks":{},"managedHooks":{}}' \
+  '{"schema":1,"claude":{"version":"2.1.274"},"codex":{"version":"0.154.0","tarball":"https://example.invalid/codex.tgz","prefix":"package/vendor/x86_64-unknown-linux-musl","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"hooks":{},"managedHooks":{}}' \
   > "$IHAR_LOCKFILE"
 cp -R "$ROOT/hooks" "$ROOT/manifests" "$ROOT/skills" "$IHAR_STORE/"
 

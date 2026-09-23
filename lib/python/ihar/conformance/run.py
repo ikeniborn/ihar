@@ -338,6 +338,36 @@ def _prepare_codex_hooks(binary: str, home: str, workdir: str) -> tuple[bool, st
     return code == 0, "Codex did not trust the staged conformance hooks"
 
 
+_LAST_TURN: dict[str, object] = {}
+
+# Phrases the vendors use, matched only to classify. Nothing from the text is stored or
+# printed: the record keeps one word from REASONS and the status that goes with it.
+_ENVIRONMENT_PHRASES = (
+    ("usage limit", "vendor-quota-exhausted"),
+    ("quota", "vendor-quota-exhausted"),
+    ("rate limit", "vendor-quota-exhausted"),
+    ("not logged in", "vendor-unauthenticated"),
+    ("please log in", "vendor-unauthenticated"),
+    ("login required", "vendor-unauthenticated"),
+    ("unauthorized", "vendor-unauthenticated"),
+    ("401", "vendor-unauthenticated"),
+    ("could not connect", "vendor-unreachable"),
+    ("connection refused", "vendor-unreachable"),
+    ("name or service not known", "vendor-unreachable"),
+)
+
+
+def _environment_reason(text: str, returncode: int) -> str:
+    """One word when the environment stopped the turn, empty when it did not."""
+    if returncode == 0:
+        return ""
+    lowered = (text or "").lower()
+    for phrase, reason in _ENVIRONMENT_PHRASES:
+        if phrase in lowered:
+            return reason
+    return ""
+
+
 def _vendor_turn(
     vendor: str,
     binary: str,
@@ -358,13 +388,15 @@ def _vendor_turn(
         argv.append(prompt)
     else:
         env["CODEX_HOME"] = home
-        # Measured against pinned Codex 0.154.0: `exec` accepts the approval policy
-        # as a configuration override, not as `--ask-for-approval`.
+        # Measured against the pinned 0.154.0 rather than assumed: `codex exec` has no
+        # `--ask-for-approval`. It answers `error: unexpected argument` and exits 2, so
+        # every case failed on a usage error that looked like a policy failure. The
+        # approval policy is a configuration key, and `-c` is how exec takes one.
         argv = [
             binary, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
             "--sandbox", "workspace-write", "-c", 'approval_policy="never"', prompt,
         ]
-    return subprocess.run(
+    result = subprocess.run(
         argv,
         cwd=workdir,
         env=env,
@@ -372,6 +404,22 @@ def _vendor_turn(
         text=True,
         timeout=180,
     )
+    # One bit, not the text: did this binary reject the argv we built? Without it a
+    # harness that passes a flag the pinned vendor removed looks exactly like a policy
+    # that did not hold, which is what happened with `--ask-for-approval`.
+    # An environment that stopped the turn is not a policy that failed. A quota, a
+    # missing login and an unreachable endpoint say nothing about whether this vendor
+    # honours a hook decision, and recording them as failures both hides the real state
+    # and blocks an install that has nothing wrong with it.
+    _LAST_TURN["environment"] = _environment_reason(
+        (result.stdout or "") + (result.stderr or ""), result.returncode)
+    _LAST_TURN["rejected_argv"] = bool(
+        result.returncode != 0
+        and ("unexpected argument" in (result.stderr or "")
+             or "unrecognized arguments" in (result.stderr or "")
+             or "unknown option" in (result.stderr or ""))
+    )
+    return result
 
 
 def _observed(marker: str) -> bool:
@@ -392,6 +440,49 @@ def _configure_mcp(home: str, vendor: str, marker: str) -> str | None:
         handle.write('command = "python3"\n')
         handle.write(f"args = {json.dumps(['-I', script, marker])}\n")
     return None
+
+
+# A closed vocabulary, because the record must carry no dynamic text: §14's rule keeps
+# vendor and model output out of anything persisted or printed. A word from this set is
+# not dynamic, and it is the difference between "failed" and "failed because the binary
+# rejected our argv" — which is what two sessions of looking at authentication cost.
+REASONS = (
+    "vendor-quota-exhausted",
+    "vendor-unauthenticated",
+    "vendor-unreachable",
+    "vendor-rejected-argv",
+    "vendor-exited-nonzero",
+    "hook-never-fired",
+    "sentinel-missing",
+    "decision-not-recorded",
+    "timeout",
+    "case-raised",
+    "unclassified",
+)
+
+# Our own sentences, matched to a word. Nothing here reads vendor output; the mapping is
+# over phrases this module itself writes.
+_REASON_PHRASES = (
+    ("exceeded 180 seconds", "timeout"),
+    ("without firing the probe hook", "hook-never-fired"),
+    ("the turn exited", "vendor-exited-nonzero"),
+    ("did not create its sentinel", "sentinel-missing"),
+    ("did not run", "sentinel-missing"),
+    ("did not receive", "sentinel-missing"),
+    ("without recording an explicit deny", "decision-not-recorded"),
+    ("raised", "case-raised"),
+)
+
+
+def _reason_for(status: str, detail: str, rejected_argv: bool = False) -> str:
+    if status != "failed":
+        return ""
+    if rejected_argv:
+        return "vendor-rejected-argv"
+    for phrase, reason in _REASON_PHRASES:
+        if phrase in (detail or ""):
+            return reason
+    return "unclassified"
 
 
 def _run_live_case(vendor, binary, home, workdir, name):
@@ -733,7 +824,7 @@ def run(
             else tempfile.mkdtemp(prefix="ihar-conf-home-"))
     owns_codex_home = vendor == "codex" and codex_home is None
     state_root = tempfile.mkdtemp(prefix="ihar-conf-state-")
-    failed = True
+    unproven = True
     try:
         protected_roots = [protected_store or store, state_root, home] \
             if vendor == "claude" else None
@@ -745,22 +836,38 @@ def run(
             if name in CLAUDE_ONLY_CASES and vendor != "claude":
                 continue
             try:
-                status, _detail = case(vendor, binary, home, workdir)
+                status, detail = case(vendor, binary, home, workdir)
             except Exception:                      # noqa: BLE001
-                status = "failed"
-            record["cases"][name] = {"status": status, "detail": f"{name}: {status}"}
+                status, detail = "failed", "the case raised"
+            entry = {"status": status, "detail": f"{name}: {status}"}
+            reason = _reason_for(status, detail)
+            if reason:
+                entry["reason"] = reason
+            record["cases"][name] = entry
         for name in sorted(LIVE_CASES):
+            rejected = False
+            environment = ""
             try:
-                status, _detail = _run_live_case(vendor, binary, home, workdir, name)
+                status, detail = _run_live_case(vendor, binary, home, workdir, name)
+                rejected = bool(_LAST_TURN.get("rejected_argv", False))
+                environment = str(_LAST_TURN.get("environment") or "")
             except Exception:                      # noqa: BLE001
-                status = "failed"
-            record["cases"][name] = {"status": status, "detail": f"{name}: {status}"}
-        failed = any(case["status"] == "failed" for case in record["cases"].values())
+                status, detail = "failed", "the case raised"
+            if status == "failed" and environment:
+                # Unmeasured, not failed: nothing here says the vendor mishandled a hook.
+                status, reason = "unmeasured", environment
+            else:
+                reason = _reason_for(status, detail, rejected)
+            entry = {"status": status, "detail": f"{name}: {status}"}
+            if reason:
+                entry["reason"] = reason
+            record["cases"][name] = entry
+        unproven = any(case["status"] != "passed" for case in record["cases"].values())
     finally:
         if owns_codex_home:
             from ..codex import guardian
             guardian._cleanup_auth_stage(
-                Path(auth_store), Path(home), retain_changed=failed,
+                Path(auth_store), Path(home), retain_changed=unproven,
             )
         elif vendor != "codex":
             shutil.rmtree(home, ignore_errors=True)
@@ -785,12 +892,12 @@ def _begin_codex_conformance(auth_store: str) -> str:
     return stage
 
 
-def _finish_codex_conformance(auth_store: str, stage: str, failed: bool) -> None:
+def _finish_codex_conformance(auth_store: str, stage: str, unproven: bool) -> None:
     from ..codex import guardian
     guard_fd = os.environ.get("IHAR_GUARD_FD")
     if guard_fd is None:
         raise auth_owner.AuthOwnerError("Codex guardian admission is missing")
-    operation = "auth-abort" if failed else "auth-finish"
+    operation = "auth-abort" if unproven else "auth-finish"
     guardian.request(
         int(guard_fd), operation, {"stage": stage, "verb": "status"},
         store=Path(auth_store),
@@ -846,10 +953,10 @@ def main(argv: list[str]) -> int:
                               f"{vendor}-{version_slug(record['version'])}.json")
         os.makedirs(os.path.dirname(target), exist_ok=True)
         jsonio.write("conformance", target, record, mode=0o644)
-        failed = any(record["cases"][name]["status"] == "failed"
-                     for name in REQUIRED_CASES[vendor])
+        unproven = sorted(name for name in REQUIRED_CASES[vendor]
+                          if record["cases"][name]["status"] != "passed")
         if codex_stage is not None:
-            _finish_codex_conformance(auth_store, codex_stage, failed)
+            _finish_codex_conformance(auth_store, codex_stage, bool(unproven))
             codex_stage = None
     except (RuntimeError, OSError, ValueError, jsonio.SchemaError) as error:
         if codex_stage is not None:
@@ -861,14 +968,15 @@ def main(argv: list[str]) -> int:
               file=sys.stderr)
         return 3
 
-    failed_cases = sorted(name for name in REQUIRED_CASES[vendor]
-                          if record["cases"][name]["status"] == "failed")
     if "--json" in options:
         print(json.dumps(record, indent=2, sort_keys=True))
     else:
-        for name in failed_cases:
-            print(f"failed {name}")
-    return 1 if failed_cases else 0
+        for name in unproven:
+            # One word from a closed set, never a sentence and never vendor output.
+            case = record["cases"][name]
+            reason = case.get("reason")
+            print(f"{case['status']} {name}" + (f" ({reason})" if reason else ""))
+    return 1 if unproven else 0
 
 
 if __name__ == "__main__":

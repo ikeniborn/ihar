@@ -2,8 +2,8 @@
 
 | Field | Value |
 |-------|-------|
-| Status | revision 22 (continuous Codex guardian and recoverable guest return) |
-| Date | 2026-09-22 |
+| Status | revision 23 (masking engine, continuous Codex guardian and recoverable guest return) |
+| Date | 2026-09-23 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
 | Verified against | Claude Code 2.1.274, Codex CLI 0.154.0 (`--help`, `app-server generate-json-schema`, binary strings), iclaude and icodex checkouts on this machine |
@@ -203,7 +203,7 @@ skills/  tests/  docs/
 
 ### 2.6 Project configuration `.ihar_config`
 
-Keys: `IHAR_PROFILE`, `IHAR_DEFAULT_AGENT`, `IHAR_GATEWAY_MASKING_LEVEL` (tighten-only, §12.3), `IHAR_GATEWAY_ENGINE`, `IHAR_STATE_ROOT`, `IHAR_STORE`, `IHAR_PROXY_URL`, `IHAR_PROXY_CA`, `IHAR_PROXY_INSECURE`, `IHAR_TELEMETRY`, `IHAR_CHAT_LANG`, `IHAR_DOC_LANG`, `IHAR_IWIKI_*`, `IHAR_DISTILLER`, `IHAR_SOCKET_PATH_MAX`, `IHAR_CONSOLE_PORT`, `IHAR_CONSOLE_MAX_SESSIONS`, `IHAR_HANDOFF_HISTORY`, `IHAR_HANDOFF_TRANSCRIPT_BYTES`. An unknown `IHAR_*` key is exit 2. Precedence is defaults < file < flags, with the tighten-only exception of §12.3. There is no shared-home mode. The two console keys are read by the broker, which is per user rather than per project (§13.2): the project file that starts the broker wins, and a second project cannot retune a running one.
+Keys: `IHAR_PROFILE`, `IHAR_DEFAULT_AGENT`, `IHAR_GATEWAY_MASKING_LEVEL` (tighten-only, §12.3), `IHAR_GATEWAY_ENGINE`, `IHAR_STATE_ROOT`, `IHAR_STORE`, `IHAR_PROXY_URL`, `IHAR_PROXY_CA`, `IHAR_PROXY_INSECURE`, `IHAR_TELEMETRY`, `IHAR_CHAT_LANG`, `IHAR_DOC_LANG`, `IHAR_IWIKI_*`, `IHAR_DISTILLER`, `IHAR_SOCKET_PATH_MAX`, `IHAR_CONSOLE_PORT`, `IHAR_CONSOLE_MAX_SESSIONS`, `IHAR_HANDOFF_HISTORY`, `IHAR_HANDOFF_TRANSCRIPT_BYTES` (262144 by default, measured in §8.4). An unknown `IHAR_*` key is exit 2. Precedence is defaults < file < flags, with the tighten-only exception of §12.3. There is no shared-home mode. The two console keys are read by the broker, which is per user rather than per project (§13.2): the project file that starts the broker wins, and a second project cannot retune a running one.
 
 ## 3. Control plane
 
@@ -594,6 +594,14 @@ The result is written to `$IHAR_STORE/verification/<vendor>-<version>.json` with
 hook enforcement unproven for <vendor> <version>; run ihar check --conformance
 ```
 
+**The argv is measured, and a test keeps it measured.** `codex exec` on 0.154.0 has no `--ask-for-approval`: it answers `error: unexpected argument` and exits 2. The runner passed it anyway, so every Codex case reported `failed` as though a policy had not held, through two sessions of looking at authentication instead. The approval policy is configuration, so the turn now passes `-c approval_policy="never"`, which was measured by running the turn: it completes with `agent_message` and `turn.completed`. `tests/test_conformance_argv.py` reads the argv the runner builds and asserts every long flag appears in that binary's own `--help`, skipping cleanly where a vendor is not installed — a fixture cannot catch this class, only the binary can.
+
+**A failed case says why.** Each case already computed a reason and the record stored `name: status` instead, so the printed line carried nothing. The record now keeps the case's own sentence, clipped to 200 characters, and the runner prints it. Those sentences are the runner's words — an exit code, a missing sentinel, a decision that was not recorded — never vendor or model output, which stays out of the record as §14 requires.
+
+**A case that could not be measured is not a case that failed.** A quota, a missing login and an unreachable endpoint say nothing about whether a vendor honours a hook decision. Recording them as failures blocked an install that had nothing wrong with it — observed when this project's own debugging exhausted a Codex quota — so those turns are recorded `unmeasured` with one word from the reason vocabulary. The vendor's text is read to classify and never kept.
+
+The consequence is asymmetric on purpose. An install whose only non-passes are unmeasured activates the generation, discards the record as proof and adds the vendor to the unproven list, with a warning naming what happened. An enforced profile still refuses to launch that vendor, because an unmeasured case proves nothing; `ihar check --conformance` is what turns it into evidence once the environment allows. One real failure among the required cases and the record is a failure again, whatever else went unmeasured.
+
 ## 7. MCP and its egress (slice S4)
 
 ### 7.1 Registry
@@ -679,6 +687,18 @@ Revision 2 said both that `system` is masked and that `system` content is preser
 6. A body that is not parseable is 400; a body with a non-identity `Content-Encoding` is 415. Neither is forwarded.
 
 Engine (`ihar.mask.engine`): Presidio with spaCy when available, the iclaude regex engine as fallback, `IHAR_GATEWAY_ENGINE=regex` to force it, levels `off | secrets | standard`. The same module sanitises handoff packages (§11.2), so one implementation carries the claim. This also closes the icodex defect where `ICODEX_PII_ENGINE=nlp` is accepted while `server.py` never imports Presidio.
+
+**7. A failed analysis is a refusal, not a quieter mask.** Measured on 2026-09-22 with presidio-analyzer and spaCy 3.8.16 on `en_core_web_lg`: the engine refuses input over 1,000,000 characters with `ValueError [E088] Text of length 1000001 exceeds maximum of 1000000`. The implementation used to catch every exception from `analyze()` and mask with the regex patterns instead, so a body that exceeded the limit was recorded `masked: true` at level `standard` while `ihar check` still reported `engine: presidio` — a weaker promise than the label, visible to nobody. The call now raises `MaskingUnavailable` and each caller decides: the gateway refuses the request (502, as it does for any payload it cannot promise about) and the handoff degrades its transcript to `summary` with a named warning.
+
+**Throughput, measured rather than assumed.** On transcript-shaped text — prose with paths, identifiers, an address and a planted credential — the presidio engine ran at 0.012 to 0.016 MiB/s (64 KiB in 3.99 s, 256 KiB in 20.58 s) and the regex engine at about 6 MiB/s, linearly to 2 MiB. Two consequences are already in force: the handoff transcript budget is 256 KiB rather than 2 MB (§11.2), which is roughly twenty seconds in the slow engine and stays under the hard limit; and a gateway body large enough to matter now refuses rather than degrades.
+
+**The dependency ships, pinned and hashed.** `lib/python/requirements.lock` is compiled by `uv pip compile --generate-hashes` from `requirements.in`, and carries 54 packages with sha256 hashes, including both spaCy models by release URL. `ihar install` installs it into the store venv — including into a venv that already exists, which is what previously left every store on the patterns while the documents described Presidio. A machine that cannot install it warns and falls back, and `ihar check` names the engine that actually ran.
+
+**Both languages are pinned, and the small models are the measured choice.** `en_core_web_sm` (12 MiB) and `ru_core_news_sm` (15 MiB) run at 0.016 to 0.030 MiB/s; `en_core_web_lg` (382 MiB) and `ru_core_news_lg` (490 MiB) run at 0.012 to 0.016. The large pair costs thirty-two times the download to be no faster, so the small pair ships and the lockfile is where that choice can be reversed in one line. Russian is pinned because the project writes in both languages and an engine that knew only English would miss a Russian name while every report said the same word.
+
+**Two layers, in this order.** The patterns run first and always, then the named-entity engine on the already-masked text. Measured on 2026-09-22: Presidio alone mangles an address, because its URL recognizer matches fragments and replacing by offsets leaves the rest visible — `X-urlith@X-urlvalid` in English, `X-urlrov@X-urlvalid` in Russian. Using it instead of the patterns, which is what the code did before, would have been a regression on email. Language comes from the script the text is written in, never from a configured hint: Cyrillic gets the Russian pass, Latin the English one, text with both gets both.
+
+**Limits of this construction, measured rather than assumed.** In mixed-language text a name in the minority language can survive, because each pass sees the whole text and a model reads its own language's context; the sample `Иван wrote to John from Berlin` masked the English span and left the Russian name. And a token the patterns already inserted can be caught again by the named-entity pass and reported under a second kind, which over-reports `kinds` without exposing anything. Both are named here rather than discovered later.
 
 ### 8.5 Transparent mode spike: no-go
 
@@ -800,7 +820,7 @@ Load the index and fold by `ihar_id`; call both adapters' `list_sessions`; join 
 3. **Optional summary** from the distiller; a timeout omits the field with a warning.
 4. **Sanitise** every string with `ihar.mask.engine` at the effective level. `masked: true` is set only after the pass. No engine and a level other than `off` is exit 3.
 5. **Size**, target 8 kB, measured after each step. Truncation order: `recent_messages` oldest first, then `summary`, then `decisions_heuristic`, then `decisions` beyond 20, then `open_items` beyond 30, then `files_touched` beyond 50 with `files_touched_truncated: true` and `git.files_changed` carrying the real count. Only `git` (a single shortstat line), `ledger` and the identity fields are never truncated, so the bound is reachable on any repository.
-6. **Transcript render**, in `transcript` mode only: `adapter_<source>_get_session` is normalised to `{role, text, at}` in order, rendered as Markdown with a header naming the source vendor, session and revision, masked by the same engine as step 4, and written atomically at mode 600. The budget is `IHAR_HANDOFF_TRANSCRIPT_BYTES` (default 2 MB), applied oldest-first with `history.truncated` and the real `history.messages` count recorded; a render or masking failure **degrades to `summary` mode with a named warning** rather than shipping an unmasked or partial file, and the switch continues, because handoff is a convenience layer while its sanitisation is not.
+6. **Transcript render**, in `transcript` mode only: `adapter_<source>_get_session` is normalised to `{role, text, at}` in order, rendered as Markdown with a header naming the source vendor, session and revision, masked by the same engine as step 4, and written atomically at mode 600. The budget is `IHAR_HANDOFF_TRANSCRIPT_BYTES` (default 262144 bytes, the measured figure of §8.4 rather than a round number), applied oldest-first with `history.truncated` and the real `history.messages` count recorded; a render or masking failure **degrades to `summary` mode with a named warning** rather than shipping an unmasked or partial file, and the switch continues, because handoff is a convenience layer while its sanitisation is not.
 7. **Write** both files atomically and the pending file for the target.
 
 **The transcript file is kept indefinitely, by decision.** It is an export under `$IHAR_STATE/handoff/`, outside the checkout, mode 600, masked — the same class of artifact as `handoff.json`, which has always carried `recent_messages`. The consequence is stated rather than discovered later: a project that switches often accumulates a masked archive of its own conversations that no retention rule removes, `ihar homes clean` does not touch it because it is not a runtime generation, and deleting it is a user action. `ihar check` reports the directory's file count and total bytes so the growth is visible rather than silent.
@@ -1002,9 +1022,15 @@ The tracked lockfile is immutable release input. It merges iclaude's version fie
 
 Machine-local evidence lives in `$IHAR_STORE/install-receipt.json`: installation time, the release-lock digest, installed versions, and SHA-256 digests of the produced Claude and Codex executables. The receipt is validated and atomically replaced only after a successful install transaction. `codex.sha256` remains in the release lockfile because it is the published archive digest checked before extraction.
 
+**Codex is pinned to its npm platform package, not to the GitHub release archive.** Measured on 2026-09-22: the release asset `codex-x86_64-unknown-linux-musl.tar.gz`, whose digest matches this lockfile, contains exactly one file — the `codex` executable. The CLI then answers every tool call with `Code Mode is unavailable because failed to spawn code-mode host …/codex-code-mode-host: host executable was not found`, and disabling `code_mode_host` does not restore a classic shell tool: the model replies that the execution tool is disabled. An install from that archive can hold a conversation and never run a command, which made every live conformance case fail for a reason no message named.
+
+`@openai/codex@0.154.0-linux-x64` carries `bin/codex`, `bin/codex-code-mode-host`, the `bwrap` sandbox helper, `rg` and a shell. The lockfile therefore pins `{version, tarball, prefix, sha256}`, the installer extracts that prefix preserving the package's own geometry — `bin/` into the store's `bin/`, `codex-path/` and `codex-resources/` beside it — and `IHAR_CODEX_BIN` stays where it was. Verified end to end: a turn run from a store built this way executed its tool and wrote the sentinel in 26 seconds, where the release-archive install produced no file at all.
+
 ### 14.2 Verification at launch
 
 Release-lock drift warns that install evidence is stale. `ihar_receipt_binary_status <vendor> <selected-binary>` validates `$IHAR_STORE/install-receipt.json`, its release-lock digest and the selected executable bytes, then returns exactly `verified`, `mismatched`, or `missing receipt`. Missing, malformed and unreadable receipt evidence all report `missing receipt`; a missing component, changed release lock or changed executable reports `mismatched`. Either non-verified state warns and continues under `standard`, and exits 3 before vendor execution under `protected` and `isolated`. Every ACP-allowed real launch runs the same selected-native-executable check before its adapter; the shipped `protected` and `isolated` profiles refuse ACP earlier at the profile gate. Dry-run alone skips this receipt comparison because it executes neither the native binary nor an adapter that delegates to it; hook and store integrity checks remain in force. ACP adapter version and digest integrity remain under the existing adapter verification and do not add fields to the install receipt. A hook or managed-hook hash mismatch is exit 3 in every profile. For enforced profiles, a pending recheck or a missing, stale or failing conformance record is exit 3.
+
+**A missing pin is named as missing.** `--verify-map` answers `missing <path>` or `changed <path>`, and the refusal repeats the distinction. A store that predates a pin and a file something rewrote are different situations with different remedies; calling both "differs from the lockfile" sent a user looking for tampering when the store had simply never carried the file.
 
 ### 14.3 Commands
 
@@ -1101,7 +1127,8 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | profile | override loosens the masking floor | usage | 2 |
 | profile | masking level above `off` with no gateway | usage | 2 |
 | state | socket path over the limit | usage | 2 |
-| store | hook or managed-hook sha256 mismatch | fail-closed | 3 |
+| store | pinned hook absent from the store | fail-closed, named as missing | 3 |
+| store | hook or managed-hook sha256 mismatch | fail-closed, named as changed | 3 |
 | store | executable receipt state is `mismatched` or `missing receipt`, `standard` / enforced | fail-soft / fail-closed | 0 / 3 |
 | store | conformance binary differs from the release pin; record is missing, stale, incomplete, skipped or failing under an enforced profile | fail-closed | 3 |
 | store | mutable-link manifest or canonical source topology is invalid | fail-closed | 3 |
@@ -1120,6 +1147,7 @@ Bash tests source the module under test with stubbed logging helpers and use `as
 | gateway | unhealthy within 15 s | fail-closed | 3 |
 | gateway | unknown route, masking on | fail-closed per request | 502 |
 | gateway | unknown content block or non-text payload, enforced profile | fail-closed per request | 502 |
+| gateway | the promised masking engine cannot analyse the body | fail-closed per request | 502 |
 | gateway | body unparseable / compressed / over limits | fail-closed per request | 400 / 415 / 413 |
 | sandbox | microVM boot, prelaunch manifest/artifact lineage, observed launch identity or network policy verification fails | fail-closed | 3 |
 | index | append fails | fail-soft | 0 |
@@ -1197,7 +1225,6 @@ Revision 12 records only choices supported by the approved artifacts and reviewe
 
 Revision 13 opened three. The terminal asset pin is now answered and closed: `xterm.js` 5.5.0 is vendored at `console/vendor/xterm.js`, sha256 `1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495`, with its stylesheet at `ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6`; both digests were taken from the installed files and are recorded in the release lockfile, which the broker verifies before serving. Two remain, each owned by the slice that must measure it rather than assume it:
 
-- **Masking throughput on a transcript (S14).** The 2 MB default budget assumes the masking engine finishes a large render in a time a user will wait for. Presidio's rate on this class of input is unmeasured; S14 measures it and either keeps the default, lowers it, or streams the render, and records the number here.
 - **ACP tab promotion (S13).** claude-agent-acp #144 and codex-acp #310/#477 decide whether an ACP tab can ever be offered under an enforced profile. The question is now asked by `ihar check --acp-promotion` rather than by hand, and on 2026-09-22 it answered `not promotable` with all three issues open and the behavioural half unmeasurable here. Two things must still be produced by a machine that has the adapters and vendor credentials: a passing `claude-hooks-fire` probe, and a measured run of `codex-acp` from which the `codex-config-survives` assertion can finally be written.
 
 ## 21. Disposition of the architecture review

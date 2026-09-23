@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Every conformance flag must exist on the pinned vendor CLI contract."""
+"""Every flag the conformance runner passes must exist on the pinned binary (LLD 6.6).
+
+This is the guard for a class, not for one bug. `codex exec` has no
+`--ask-for-approval`; the runner passed it, the vendor answered `error: unexpected
+argument` and exited 2, and every Codex case reported `failed` as though a policy had
+not held. A fixture cannot catch that — only the binary can — so the flags are read from
+the argv the runner actually builds and checked against that binary's own help.
+
+Skipped cleanly when a vendor is not installed, like every other test of a real
+component; the conformance suite itself is what refuses to skip.
+"""
 
 import os
 import subprocess
@@ -24,6 +34,7 @@ def check(label, condition):
 
 
 def argv_for(vendor: str, binary: str) -> list[str]:
+    """The argv the runner would run, captured without running the vendor."""
     captured = {}
 
     def fake_run(argv, **kwargs):
@@ -68,6 +79,7 @@ def main():
         for flag in flags:
             check(f"{vendor}: {flag} exists on the pinned binary", flag in text)
 
+    # The approval policy is passed as configuration, which is how `codex exec` takes it.
     codex_binary = os.environ.get("IHAR_CODEX_BIN", "") or "codex"
     argv = argv_for("codex", codex_binary)
     check("codex: the approval policy travels as a configuration override",
