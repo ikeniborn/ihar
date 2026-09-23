@@ -605,6 +605,21 @@ def test_codex_mcp_case_uses_the_normalized_hook_tool_name():
     assert seen["allowed_tool"] == "mcp__ihar_conformance__prove", seen
 
 
+def test_codex_mcp_probe_is_approved_for_noninteractive_execution():
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    marker = os.path.join(home, "called")
+    try:
+        conformance._configure_mcp(home, "codex", marker)
+        with open(os.path.join(home, "config.toml"), "rb") as handle:
+            import tomllib
+            config = tomllib.load(handle)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+    server = config["mcp_servers"]["ihar-conformance"]
+    assert server["default_tools_approval_mode"] == "approve", server
+
+
 def test_deny_needs_an_explicit_probe_decision_not_only_an_absent_sentinel():
     store = _store()
     binary = _fake_claude(store)

@@ -476,6 +476,9 @@ def _configure_mcp(home: str, vendor: str, marker: str) -> str | None:
         handle.write("\n[mcp_servers.ihar-conformance]\n")
         handle.write('command = "python3"\n')
         handle.write(f"args = {json.dumps(['-I', script, marker])}\n")
+        # The isolated probe must reach tools/call without an interactive prompt.
+        # Codex otherwise treats an unannotated MCP tool as approval-required.
+        handle.write('default_tools_approval_mode = "approve"\n')
     return None
 
 
