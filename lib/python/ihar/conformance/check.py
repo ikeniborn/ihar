@@ -11,10 +11,11 @@ Usage: python3 -m ihar.conformance.check <record> <binary> <manifest>
        python3 -m ihar.conformance.check --failed-record <vendor> <record> <binary> <manifest>
        python3 -m ihar.conformance.check --unmeasured-record <vendor> <record> <binary> <manifest>
 
-`--unmeasured-record` answers 0 when every required case that is not passed is
-`unmeasured` — a quota, a missing login, an unreachable endpoint — and at least one is.
-An install may then activate the generation while recording the vendor as unproven; an
-enforced profile still refuses to launch, because an unmeasured case proves nothing.
+`--unmeasured-record` answers 0 only when every required case that is not passed is
+`unmeasured` with an allowed environmental reason, at least one such case exists, and no
+case (including an extra diagnostic case) failed. An install may then activate the
+generation while recording the vendor as unproven; an enforced profile still refuses to
+launch, because an unmeasured case proves nothing.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import hashlib
 import sys
 
 from .. import jsonio
-from . import REQUIRED_CASES
+from . import ENVIRONMENT_REASONS, REQUIRED_CASES
 
 
 def _digest(path: str) -> str:
@@ -75,11 +76,21 @@ def main(argv: list[str]) -> int:
     if failed_record_mode:
         return 0 if required.intersection(failed) else 1
     if unmeasured_record_mode:
-        # Only when nothing actually failed: one real failure among the required cases
-        # and the record is a failure, whatever else could not be measured.
-        if required.intersection(failed):
+        # Any real failure blocks activation, including a diagnostic case added outside
+        # the required matrix. Every required non-pass must be explicitly environmental.
+        if failed:
             return 1
-        return 0 if required.intersection(unmeasured) else 1
+        required_nonpasses = {
+            name for name in required if record["cases"][name]["status"] != "passed"
+        }
+        if not required_nonpasses:
+            return 1
+        for name in required_nonpasses:
+            case = record["cases"][name]
+            if (case["status"] != "unmeasured"
+                    or case.get("reason") not in ENVIRONMENT_REASONS):
+                return 1
+        return 0
     if required.intersection(unmeasured):
         print("these cases could not be measured: "
               + ", ".join(sorted(required.intersection(unmeasured))))

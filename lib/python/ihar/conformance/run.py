@@ -37,7 +37,7 @@ from .. import jsonio
 from ..codex import auth_owner
 from ..render import claude_settings
 from ..render import hooks as render_hooks
-from . import LIVE_CASES, REQUIRED_CASES
+from . import ENVIRONMENT_REASONS, LIVE_CASES, REQUIRED_CASES
 
 
 _SESSION_CONTEXT = "IHAR-CONFORMANCE-SESSION-CONTEXT"
@@ -340,8 +340,10 @@ def _prepare_codex_hooks(binary: str, home: str, workdir: str) -> tuple[bool, st
 
 _LAST_TURN: dict[str, object] = {}
 
-# Phrases the vendors use, matched only to classify. Nothing from the text is stored or
-# printed: the record keeps one word from REASONS and the status that goes with it.
+_ENVIRONMENT_SCAN_LIMIT = 8192
+
+# Legacy non-JSON phrases, matched only to classify. Parsed structured stdout is never
+# phrase-scanned; stderr is bounded. Nothing from the text is stored or printed.
 _ENVIRONMENT_PHRASES = (
     ("usage limit", "vendor-quota-exhausted"),
     ("quota", "vendor-quota-exhausted"),
@@ -361,16 +363,33 @@ def _environment_reason(stdout: str, stderr: str, returncode: int) -> str:
     """One word when the environment stopped the turn, empty when it did not."""
     if returncode == 0:
         return ""
+    stripped = (stdout or "").strip()
+    structured = False
+    results: list[object] = []
+    legacy_lines: list[str] = []
     try:
-        result = json.loads(stdout or "")
+        results = [json.loads(stripped)]
+        structured = True
     except (json.JSONDecodeError, TypeError):
-        result = None
-    if (isinstance(result, dict)
-            and result.get("type") == "result"
-            and result.get("is_error") is True
-            and result.get("terminal_reason") == "api_error"):
-        return "vendor-api-error"
-    lowered = ((stdout or "") + (stderr or "")).lower()
+        for line in (line for line in stripped.splitlines() if line.strip()):
+            try:
+                results.append(json.loads(line))
+                structured = True
+            except (json.JSONDecodeError, TypeError):
+                legacy_lines.append(line)
+    for result in results:
+        if (isinstance(result, dict)
+                and result.get("type") == "result"
+                and result.get("subtype") == "success"
+                and result.get("is_error") is True
+                and result.get("terminal_reason") == "api_error"):
+            return "vendor-api-error"
+    if structured:
+        legacy_stdout = "\n".join(legacy_lines)[:_ENVIRONMENT_SCAN_LIMIT]
+    else:
+        legacy_stdout = (stdout or "")[:_ENVIRONMENT_SCAN_LIMIT]
+    bounded_stderr = (stderr or "")[:_ENVIRONMENT_SCAN_LIMIT]
+    lowered = (legacy_stdout + bounded_stderr).lower()
     for phrase, reason in _ENVIRONMENT_PHRASES:
         if phrase in lowered:
             return reason
@@ -439,6 +458,11 @@ def _observed(marker: str) -> bool:
     return os.path.isfile(marker) and os.path.getsize(marker) > 0
 
 
+def _record_dispatch_observed(observed: bool) -> None:
+    _LAST_TURN["dispatch_observed"] = bool(
+        _LAST_TURN.get("dispatch_observed", False) or observed)
+
+
 def _configure_mcp(home: str, vendor: str, marker: str) -> str | None:
     script = os.path.join(home, "mcp-conformance.py")
     if vendor == "claude":
@@ -460,10 +484,7 @@ def _configure_mcp(home: str, vendor: str, marker: str) -> str | None:
 # not dynamic, and it is the difference between "failed" and "failed because the binary
 # rejected our argv" — which is what two sessions of looking at authentication cost.
 REASONS = (
-    "vendor-quota-exhausted",
-    "vendor-unauthenticated",
-    "vendor-unreachable",
-    "vendor-api-error",
+    *sorted(ENVIRONMENT_REASONS),
     "vendor-rejected-argv",
     "vendor-exited-nonzero",
     "hook-never-fired",
@@ -574,6 +595,13 @@ def _run_live_case(vendor, binary, home, workdir, name):
     except subprocess.TimeoutExpired:
         return "failed", "the vendor turn exceeded 180 seconds"
 
+    _record_dispatch_observed(
+        _observed(observed)
+        or os.path.exists(target)
+        or os.path.exists(observed + ".decision")
+        or os.path.exists(observed + ".completed")
+        or os.path.exists(observed + ".ended")
+    )
     if not _observed(observed):
         return "failed", f"the vendor exited {result.returncode} without firing the probe hook"
     if name != "timeout-behaviour" and result.returncode != 0:
@@ -706,6 +734,7 @@ def _case_sandbox_protected_write(vendor, binary, home, workdir, kind):
                 command = f"python3 -c {shlex.quote(code)}"
 
             result = _run_claude_shell(binary, home, workdir, command)
+            _record_dispatch_observed(any(os.path.exists(path) for path in paths))
             if result.returncode != 0:
                 return "failed", f"Claude exited {result.returncode} while probing {root}"
             if not os.path.isfile(before):
@@ -743,6 +772,7 @@ def case_sandbox_workspace_write(vendor, binary, home, workdir):
     try:
         command = f"printf 'ihar-conformance\\n' > {shlex.quote(target)}"
         result = _run_claude_shell(binary, home, workdir, command)
+        _record_dispatch_observed(os.path.exists(target))
         if result.returncode != 0:
             return "failed", f"Claude exited {result.returncode} during the workspace probe"
         try:
@@ -860,7 +890,8 @@ def run(
             except Exception:                      # noqa: BLE001
                 status, detail = "failed", "the case raised"
             environment = str(_LAST_TURN.get("environment") or "")
-            if status == "failed" and environment:
+            dispatch_absent = _LAST_TURN.get("dispatch_observed") is False
+            if status == "failed" and environment and dispatch_absent:
                 status, reason = "unmeasured", environment
             else:
                 reason = _reason_for(status, detail)
@@ -878,7 +909,8 @@ def run(
                 environment = str(_LAST_TURN.get("environment") or "")
             except Exception:                      # noqa: BLE001
                 status, detail = "failed", "the case raised"
-            if status == "failed" and environment:
+            dispatch_absent = _LAST_TURN.get("dispatch_observed") is False
+            if status == "failed" and environment and dispatch_absent:
                 # Unmeasured, not failed: nothing here says the vendor mishandled a hook.
                 status, reason = "unmeasured", environment
             else:

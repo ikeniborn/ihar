@@ -730,11 +730,43 @@ def test_claude_structured_api_error_is_environmental_without_reading_result_tex
         json.dumps({
             "type": "result",
             "is_error": True,
-            "terminal_reason": "turn_setup_failed",
+            "terminal_reason": "api_error",
             "result": "SECRET-SENTINEL",
         }),
         "",
         1,
+    ) == ""
+    assert conformance._environment_reason(
+        json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "terminal_reason": "turn_setup_failed",
+            "result": "Please log in because quota and connection refused SECRET-SENTINEL",
+        }),
+        "",
+        1,
+    ) == ""
+    assert conformance._environment_reason(
+        json.dumps({"result": "Please log in because quota and connection refused"}),
+        "",
+        1,
+    ) == ""
+    structured_lines = "\n".join((
+        json.dumps({"type": "account", "message": "Please log in"}),
+        json.dumps({"type": "model", "message": "quota connection refused"}),
+    ))
+    assert conformance._environment_reason(structured_lines, "", 1) == ""
+    assert conformance._environment_reason(
+        structured_lines + "\nordinary legacy diagnostic", "", 1
+    ) == ""
+    assert conformance._environment_reason(
+        json.dumps({"result": "SECRET-SENTINEL"}),
+        "connection refused",
+        1,
+    ) == "vendor-unreachable"
+    assert conformance._environment_reason(
+        "", "x" * conformance._ENVIRONMENT_SCAN_LIMIT + " connection refused", 1
     ) == ""
 
 
@@ -744,6 +776,7 @@ def test_claude_shell_records_structured_api_error_for_sandbox_cases():
     def fake_run(argv, **_kwargs):
         payload = json.dumps({
             "type": "result",
+            "subtype": "success",
             "is_error": True,
             "terminal_reason": "api_error",
             "result": "SECRET-SENTINEL",
@@ -762,6 +795,101 @@ def test_claude_shell_records_structured_api_error_for_sandbox_cases():
     assert conformance._LAST_TURN == {"environment": "vendor-api-error"}
 
 
+def test_observed_hook_marker_outranks_a_later_api_error():
+    store = _store()
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
+    original_turn = conformance._vendor_turn
+
+    def post_dispatch_error(_vendor, binary, selected_home, _workdir, *_args, **_kwargs):
+        block, _ = conformance._hook_block(selected_home, "claude")
+        command = next(
+            hook["command"] for group in block["PreToolUse"]
+            for hook in group["hooks"] if "conformance-probe.py" in hook["command"]
+        )
+        Path(shlex.split(command)[4]).write_text("observed\n", encoding="utf-8")
+        conformance._LAST_TURN["environment"] = "vendor-api-error"
+        return conformance.subprocess.CompletedProcess([binary], 1, "{}", "")
+
+    import shlex
+    conformance._vendor_turn = post_dispatch_error
+    conformance._LAST_TURN.clear()
+    try:
+        conformance._stage(store, MANIFEST, "claude", home, auth_store=store)
+        status, detail = conformance._run_live_case(
+            "claude", "claude", home, workdir, "deny-blocks-the-tool"
+        )
+    finally:
+        conformance._vendor_turn = original_turn
+        for directory in (store, home, workdir):
+            shutil.rmtree(directory, ignore_errors=True)
+
+    assert status == "failed", detail
+    assert conformance._LAST_TURN["dispatch_observed"] is True
+
+
+def test_observed_sandbox_sentinel_outranks_a_later_api_error():
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
+    original_shell = conformance._run_claude_shell
+
+    def post_dispatch_error(_binary, _home, _workdir, command):
+        target = shlex.split(command)[-1]
+        Path(target).write_text("ihar-conformance\n", encoding="utf-8")
+        conformance._LAST_TURN["environment"] = "vendor-api-error"
+        return conformance.subprocess.CompletedProcess([_binary], 1, "{}", "")
+
+    import shlex
+    conformance._run_claude_shell = post_dispatch_error
+    conformance._LAST_TURN.clear()
+    try:
+        status, detail = conformance.case_sandbox_workspace_write(
+            "claude", "claude", home, workdir
+        )
+    finally:
+        conformance._run_claude_shell = original_shell
+        for directory in (home, workdir):
+            shutil.rmtree(directory, ignore_errors=True)
+
+    assert status == "failed", detail
+    assert conformance._LAST_TURN["dispatch_observed"] is True
+
+
+def test_observed_sandbox_status_outranks_a_later_api_error():
+    store = _store()
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
+    protected = tempfile.mkdtemp(prefix="ihar-conf-protected-")
+    original_shell = conformance._run_claude_shell
+
+    def post_dispatch_error(_binary, _home, _workdir, command):
+        redirects = re.findall(r"> ([^;]+)", command)
+        before = shlex.split(redirects[0])[0]
+        after = shlex.split(redirects[-1])[0]
+        Path(before).write_text("ihar-conformance\n", encoding="utf-8")
+        Path(after).write_text("1\n", encoding="utf-8")
+        conformance._LAST_TURN["environment"] = "vendor-api-error"
+        return conformance.subprocess.CompletedProcess([_binary], 1, "{}", "")
+
+    import shlex
+    conformance._run_claude_shell = post_dispatch_error
+    conformance._LAST_TURN.clear()
+    try:
+        conformance._stage(
+            store, MANIFEST, "claude", home, [protected], auth_store=store,
+        )
+        status, detail = conformance.case_sandbox_direct_write(
+            "claude", "claude", home, workdir
+        )
+    finally:
+        conformance._run_claude_shell = original_shell
+        for directory in (store, home, workdir, protected):
+            shutil.rmtree(directory, ignore_errors=True)
+
+    assert status == "failed", detail
+    assert conformance._LAST_TURN["dispatch_observed"] is True
+
+
 def test_run_marks_only_api_stopped_cases_unmeasured():
     store = tempfile.mkdtemp(prefix="ihar-conf-api-error-")
     binary = os.path.join(store, "claude")
@@ -777,17 +905,30 @@ def test_run_marks_only_api_stopped_cases_unmeasured():
 
     def api_failure(*_args):
         conformance._LAST_TURN["environment"] = "vendor-api-error"
+        conformance._LAST_TURN["dispatch_observed"] = False
         return "failed", "Claude exited before the sandbox probe"
 
     def hook_failure(*_args):
         return "failed", "the vendor exited 1 without firing the probe hook"
 
+    def post_dispatch_api_failure(*_args):
+        conformance._LAST_TURN["environment"] = "vendor-api-error"
+        conformance._LAST_TURN["dispatch_observed"] = True
+        return "failed", "the vendor fired the hook but the turn exited 1"
+
     conformance.CASES = {
         "sandbox-direct-write": api_failure,
+        "sandbox-observed-api-error": post_dispatch_api_failure,
         "real-hook-failure": hook_failure,
     }
-    conformance.LIVE_CASES = frozenset({"deny-blocks-the-tool"})
-    conformance._run_live_case = api_failure
+    conformance.LIVE_CASES = frozenset({
+        "deny-blocks-the-tool", "session-start-context",
+    })
+    conformance._run_live_case = lambda *_args: (
+        post_dispatch_api_failure()
+        if _args[-1] == "session-start-context"
+        else api_failure()
+    )
     conformance._stage = lambda *_args, **_kwargs: None
     conformance.vendor_version = lambda *_args: "2.1.274 (Claude Code)"
     conformance._validate_release_pin = lambda *_args: None
@@ -811,6 +952,12 @@ def test_run_marks_only_api_stopped_cases_unmeasured():
         "reason": "vendor-api-error",
     }
     assert record["cases"]["deny-blocks-the-tool"]["status"] == "unmeasured"
+    assert record["cases"]["sandbox-observed-api-error"]["status"] == "failed"
+    assert record["cases"]["sandbox-observed-api-error"]["reason"] == \
+        "vendor-exited-nonzero"
+    assert record["cases"]["session-start-context"]["status"] == "failed"
+    assert record["cases"]["session-start-context"]["reason"] == \
+        "vendor-exited-nonzero"
     assert record["cases"]["real-hook-failure"]["status"] == "failed"
     assert record["cases"]["real-hook-failure"]["reason"] == "hook-never-fired"
 
