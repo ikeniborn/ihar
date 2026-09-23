@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import array
 import fcntl
+import hashlib
 import json
 import os
 import pty
@@ -203,6 +204,50 @@ class AuthLeaseTests(unittest.TestCase):
                 self.assertEqual(canonical.read_text(encoding="utf-8"), "synthetic-original")
                 self.assertEqual(proof.read_text(encoding="utf-8"), "synthetic-proof")
         first.wait(timeout=10)
+
+    def test_busy_owner_blocks_sessions_list_fallback_before_vendor_start(self) -> None:
+        marker = self.root / "sessions-list-codex-started"
+        source = (
+            "#!/bin/sh\n"
+            f"touch {str(marker)!r}\n"
+            "case \"$1\" in --version) echo 'codex-cli 0.154.0' ;; esac\n"
+        )
+        first = self._guardian("import time; time.sleep(5)")
+        self._wait_for(self.record)
+        result = self._run_ihar("sessions", "list", binary_source=source)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertFalse(marker.exists(), result.stderr)
+        first.wait(timeout=8)
+
+    def test_busy_owner_blocks_codex_session_resume_before_vendor_start(self) -> None:
+        project = self.root / "project"
+        project.mkdir(exist_ok=True)
+        state_id = hashlib.sha256(os.fsencode(str(project))).hexdigest()[:8]
+        state = self.root / "state" / state_id
+        state.mkdir(parents=True)
+        session_id = "01996d8e-4ef2-7000-8000-000000000001"
+        row = {
+            "schema": 1, "ihar_id": session_id, "vendor": "codex",
+            "vendor_session_id": "codex-session", "project": "project",
+            "cwd": str(project), "git_branch": None, "title": "Codex session",
+            "model": None, "profile": "standard",
+            "started_at": "2026-09-23T00:00:00Z",
+            "updated_at": "2026-09-23T00:00:00Z", "parent_ihar_id": None,
+            "handoff_from": None, "handoff_to": None, "tags": [], "source": "launch",
+        }
+        (state / "sessions.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+        marker = self.root / "sessions-resume-codex-started"
+        source = (
+            "#!/bin/sh\n"
+            f"touch {str(marker)!r}\n"
+            "case \"$1\" in --version) echo 'codex-cli 0.154.0' ;; esac\n"
+        )
+        first = self._guardian("import time; time.sleep(5)")
+        self._wait_for(self.record)
+        result = self._run_ihar("sessions", "resume", session_id, binary_source=source)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertFalse(marker.exists(), result.stderr)
+        first.wait(timeout=8)
 
     def test_absent_codex_check_stays_metadata_only_if_binary_appears_after_route(self) -> None:
         binary = self.root / "codex"

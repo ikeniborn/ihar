@@ -78,6 +78,11 @@ ihar_main() {
       ihar_profile_resolve "$IHAR_FLAG_PROFILE"
       [[ "$IHAR_PROFILE_SANDBOX" == microvm ]] && needs_codex_guard=true
       ;;
+    sessions:*)
+      if ihar_sessions_needs_codex_guard; then
+        needs_codex_guard=true
+      fi
+      ;;
   esac
   if [[ "$needs_codex_guard" == true ]]; then
     [[ -z "${IHAR_CODEX_GUARD_FD:-}" ]] \
