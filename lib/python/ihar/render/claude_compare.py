@@ -1,4 +1,4 @@
-"""Compare Claude settings while excluding its vendor-owned top-level theme.
+"""Compare Claude settings while excluding its vendor-owned top-level strings.
 
 Failure class: fail-closed. The CLI exits 3 for drift or unreadable JSON and
 prints only the first differing field path, never a field value.
@@ -10,6 +10,10 @@ import copy
 import json
 import sys
 
+# Top-level string keys Claude writes into its own settings: `theme`, and `tui`
+# (measured with Claude 2.1.274 as "tui": "fullscreen").
+VENDOR_OWNED = ("theme", "tui")
+
 
 def compare_objects(desired: dict, active: dict) -> str | None:
     """Return first differing field path, or None; leave both inputs untouched."""
@@ -17,8 +21,9 @@ def compare_objects(desired: dict, active: dict) -> str | None:
     active = copy.deepcopy(active)
     if not isinstance(desired, dict) or not isinstance(active, dict):
         return "$"
-    if isinstance(active.get("theme"), str):
-        active.pop("theme")
+    for key in VENDOR_OWNED:
+        if isinstance(active.get(key), str):
+            active.pop(key)
     return _first_difference(desired, active, "")
 
 

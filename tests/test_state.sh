@@ -357,6 +357,10 @@ _test_claude_check_diff() (
 )
 theme_diff="$(_test_claude_check_diff)"
 assert_contains "check --diff accepts Claude's top-level theme" "$theme_diff" "no differences"
+printf '%s\n' '{"hooks":{"PreToolUse":[]},"sandbox":{"enabled":true},"_iharGateway":"https://expected.example","tui":"fullscreen"}' > "$rt/settings.json"
+assert_exit "runtime reuse accepts Claude's top-level tui" 0 \
+  ihar_runtime_materialise claude "$h1" "$RENDER"
+assert_contains "check --diff accepts Claude's top-level tui" "$(_test_claude_check_diff)" "no differences"
 printf '%s\n' '{"hooks":{"PreToolUse":["secret-value"]},"sandbox":{"enabled":true},"_iharGateway":"https://expected.example","theme":"dark"}' > "$rt/settings.json"
 managed_drift_status=0
 managed_drift_out="$(ihar_runtime_materialise claude "$h1" "$RENDER" 2>&1)" \

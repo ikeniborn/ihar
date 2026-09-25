@@ -27,6 +27,22 @@ class ClaudeCompareTests(unittest.TestCase):
         self.assertEqual(active["theme"], "light")
         self.assertNotIn("theme", desired)
 
+    def test_top_level_tui_string_is_vendor_owned(self):
+        # Measured: Claude 2.1.274 writes "tui": "fullscreen" into its settings.
+        desired = {"hooks": {"PreToolUse": []}}
+        active = {"hooks": {"PreToolUse": []}, "tui": "fullscreen"}
+        self.assertIsNone(compare_objects(desired, active))
+        self.assertEqual(active["tui"], "fullscreen")
+
+    def test_tui_does_not_hide_hook_tampering(self):
+        desired = {"hooks": {"PreToolUse": []}}
+        active = {"hooks": {"PreToolUse": ["changed"]}, "tui": "fullscreen"}
+        self.assertEqual(compare_objects(desired, active), "hooks.PreToolUse")
+
+    def test_non_string_or_nested_tui_is_not_ignored(self):
+        self.assertEqual(compare_objects({}, {"tui": {"secret": True}}), "tui")
+        self.assertEqual(compare_objects({"hooks": {}}, {"hooks": {"tui": "fullscreen"}}), "hooks.tui")
+
     def test_theme_does_not_hide_hook_tampering(self):
         desired = {"hooks": {"PreToolUse": []}}
         active = {"hooks": {"PreToolUse": ["changed"]}, "theme": "dark"}

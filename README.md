@@ -103,7 +103,7 @@ adoption of an older materialized runtime file.
 Run `ihar check --diff` to see the selected runtime generation and bounded drift
 categories. The generation includes effective MCP selection, so changing available
 servers or a non-secret endpoint selects a new home without rewriting the old one.
-Claude's top-level string `theme` is vendor-owned; managed settings and unknown fields
+Claude's top-level strings `theme` and `tui` are vendor-owned; managed settings and unknown fields
 still fail closed. Diagnostics name only fixed categories, never credential contents,
 private owner metadata or environment values. If a Codex runtime already contains a
 real `auth.json` in place of the required link, ihar preserves it without adopting or
