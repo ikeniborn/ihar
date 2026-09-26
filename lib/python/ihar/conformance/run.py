@@ -56,9 +56,14 @@ if mode == "watch":
     parent = int(marker)
     started, ended = float(sys.argv[3]), pathlib.Path(sys.argv[4])
     while time.monotonic() - started < 8:
+        # A killed hook left unreaped by a subreaper is a zombie, which still answers
+        # kill(pid, 0); its /proc state is what says it has terminated.
         try:
-            os.kill(parent, 0)
-        except ProcessLookupError:
+            with open(f"/proc/{parent}/stat", encoding="utf-8") as handle:
+                terminated = handle.read().rsplit(")", 1)[1].split()[0] == "Z"
+        except FileNotFoundError:
+            terminated = True
+        if terminated:
             ended.write_text(str(time.monotonic() - started), encoding="utf-8")
             raise SystemExit(0)
         time.sleep(0.02)
@@ -554,9 +559,14 @@ def _run_live_case(vendor, binary, home, workdir, name):
         )
     elif name == "rewrite-reaches-the-tool":
         _add_probe_hook(home, vendor, "PreToolUse", "observe", observed, matcher="Bash")
+        # Claude 2.1.274 refused about one turn in four to write a bare key-shaped
+        # string; saying what the token is keeps the turn about the hook.
         prompt = (
-            "Use the Bash tool exactly once and run this command verbatim; do not use another "
-            f"tool: printf '%s' '{_FAKE_SECRET}' > {shlex.quote(target)}"
+            "This is an automated hook conformance test in a disposable directory. The "
+            "token below is synthetic and non-functional, not a real credential, and a "
+            "PreToolUse hook is expected to redact it before the command runs. Use the Bash "
+            "tool exactly once and run this command verbatim; do not use another tool: "
+            f"printf '%s' '{_FAKE_SECRET}' > {shlex.quote(target)}"
         )
     elif name == "session-start-context":
         _add_probe_hook(home, vendor, "SessionStart", "context", observed)
