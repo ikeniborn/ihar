@@ -77,6 +77,39 @@ proof records.
 An explicit recheck revokes the prior managed proof for each checked vendor. If it fails,
 the enforced profile stays closed until that vendor passes a later recheck.
 
+Codex uses one shared credential at `$IHAR_STORE/auth/codex/auth.json` across projects
+and profiles. Sign in with the existing `ihar codex -- login` entry point: only the
+authentication command runs in a private staging home, while ordinary launches keep
+the verified runtime link. Re-authentication when a shared credential already exists
+requires direct human approval; `--assume-yes` cannot approve it, and preserving old
+bytes cannot undo a vendor-side account or token change.
+
+One continuous Linux guardian owns that credential before any ihar-managed Codex
+executable starts. It covers runtime preflight, CLI/ACP, check and conformance,
+install/update, switch distillation, daemon clients and an isolated guest without a
+release/reacquire handoff. Admission uses an authenticated inherited descriptor and
+process identity; an environment marker or owner ID is not authority. A busy, blocked
+or unverifiable owner, unsupported supervision, or failed remote mount isolation exits
+3 before the new vendor process starts. There is no unprotected fallback.
+
+An isolated guest gets a private writable credential view while configuration, policy
+and hooks stay read-only. After verified VM shutdown, a changed sole-owner credential
+may return through a recoverable transaction; prior and candidate bytes are retained
+until the requester acknowledges durable publication. Missing output, a changed
+baseline, a lost acknowledgment or ambiguous ownership preserves recovery evidence and
+blocks reuse. This guarded refresh does not approve interactive re-authentication or
+adoption of an older materialized runtime file.
+
+Run `ihar check --diff` to see the selected runtime generation and bounded drift
+categories. The generation includes effective MCP selection, so changing available
+servers or a non-secret endpoint selects a new home without rewriting the old one.
+Claude's top-level strings `theme` and `tui` are vendor-owned; managed settings and unknown fields
+still fail closed. Diagnostics name only fixed categories, never credential contents,
+private owner metadata or environment values. If a Codex runtime already contains a
+real `auth.json` in place of the required link, ihar preserves it without adopting or
+deleting it and asks for a separate user-approved recovery proposal. Do not delete,
+move, or paste that credential as a troubleshooting step.
+
 The specialised Firecracker guest comes from a compatible, locally built asset directory.
 Its `firecracker`, `vmlinux` and `rootfs.ext4` files are checked against lockfile
 digests. The three SSH key files are checked for their expected format and pairing;

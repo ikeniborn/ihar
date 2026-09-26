@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Результат: codex-auth-claude-runtime-recovery</title>
+<style>
+:root{--bg:#f6f7fb;--surface:#fff;--fg:#2b2b3a;--muted:#6b6b80;--accent:#5c6bc0;--accent-2:#3949ab;--border:#d6d8e6;--line:#9aa0b4;--zebra:#eef0f8;--ok:#43a047;--ok-2:#2e7d32;--warn:#fb8c00;--warn-2:#ef6c00;--danger:#e53935;--danger-2:#c62828;--shadow:rgba(40,40,80,.18)}
+body:has(#theme-toggle:checked){--bg:#181825;--surface:#262637;--fg:#cdd6f4;--muted:#a6adc8;--accent:#89b4fa;--accent-2:#5e95f0;--border:#3a3b52;--line:#6c7086;--zebra:#21222f;--ok:#a6e3a1;--ok-2:#74c46e;--warn:#f9e2af;--warn-2:#f5c95b;--danger:#f38ba8;--danger-2:#e8638a;--shadow:rgba(0,0,0,.45)}
+body{margin:0 auto;padding:1.5rem 2rem 4rem;max-width:1080px;font:16px/1.55 system-ui,sans-serif;background:radial-gradient(1200px 500px at 100% -10%,color-mix(in srgb,var(--accent) 10%,transparent),transparent),var(--bg);color:var(--fg);transition:background .3s,color .3s}
+.theme-btn{position:sticky;top:.5rem;float:right;cursor:pointer;user-select:none;padding:.25rem .6rem;border:1px solid var(--border);border-radius:6px;background:var(--surface)}
+h1{color:var(--accent-2);margin-bottom:.2rem}h2{color:var(--accent);border-bottom:2px solid var(--border);padding-bottom:.2rem;margin-top:2.2rem}
+.lead{color:var(--muted)}
+code{background:color-mix(in srgb,var(--accent) 12%,var(--surface));padding:0 .3rem;border-radius:4px;font-size:.88em}
+table{width:100%;border-collapse:collapse;background:var(--surface);box-shadow:0 1px 4px var(--shadow);border-radius:8px;overflow:hidden;margin:.8rem 0}
+th,td{padding:.45rem .7rem;border-bottom:1px solid var(--border);text-align:left;vertical-align:top;font-size:.93rem}
+th{background:color-mix(in srgb,var(--accent) 16%,var(--surface))}
+tr:nth-child(even) td{background:var(--zebra)}tr:hover td{background:color-mix(in srgb,var(--accent) 10%,var(--surface))}
+.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.badge{display:inline-block;padding:.05rem .5rem;border-radius:999px;font-size:.8rem;font-weight:600;color:#fff}
+.b-ok{background:var(--ok-2)}.b-warn{background:var(--warn-2)}.b-add{background:var(--accent-2)}.b-mod{background:var(--line)}
+.note{border-left:4px solid var(--warn);background:color-mix(in srgb,var(--warn) 12%,var(--surface));padding:.6rem .9rem;border-radius:6px;margin:.8rem 0}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.8rem}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.7rem .9rem;box-shadow:0 1px 4px var(--shadow)}
+.card b{display:block;color:var(--muted);font-size:.8rem;font-weight:500}
+details{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.4rem .8rem;margin:.6rem 0}
+summary{cursor:pointer;font-weight:600}
+figure{margin:1rem 0;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.6rem}
+svg text{fill:var(--fg);font:13px system-ui,sans-serif}svg .sub{fill:var(--muted);font-size:11px}
+svg .node{fill:var(--surface);stroke:var(--accent);stroke-width:1.5}svg .new{fill:color-mix(in srgb,var(--accent) 16%,var(--surface))}
+svg .edge{stroke:var(--line);stroke-width:1.6;fill:none;marker-end:url(#arr)}
+figcaption{color:var(--muted);font-size:.85rem;margin-top:.3rem}
+</style>
+</head>
+<body>
+<input type="checkbox" id="theme-toggle" hidden>
+<label for="theme-toggle" class="theme-btn" title="Тёмная / светлая тема">🌙 / ☀️</label>
+<main class="report">
+<h1>Результат: codex-auth-claude-runtime-recovery</h1>
+<p class="lead">Сверка реализации с цепочкой intent → spec → plan. Итоговый вердикт result-гейта: <span class="badge b-ok">OK</span> — 0 CRITICAL, 1 WARNING.</p>
+
+<h2>1. Резюме внедрения</h2>
+<div class="cards">
+<div class="card"><b>Топик</b><code>codex-auth-claude-runtime-recovery</code></div>
+<div class="card"><b>Ветка / HEAD</b><code>dev-codex-auth-claude-runtime-recovery</code> @ <code>b0f1716</code></div>
+<div class="card"><b>База diff</b><code>origin/master...HEAD</code></div>
+<div class="card"><b>Вердикт</b><span class="badge b-ok">OK</span> <span class="badge b-warn">1 WARNING</span></div>
+</div>
+<table><tr><th>Документ</th><th>Путь</th></tr>
+<tr><td>Intent</td><td><code>docs/superpowers/intents/2026-09-21-codex-auth-claude-runtime-recovery-intent.md</code></td></tr>
+<tr><td>Spec</td><td><code>docs/superpowers/specs/2026-09-22-codex-auth-claude-runtime-recovery-design.md</code></td></tr>
+<tr><td>Plan</td><td><code>docs/superpowers/plans/2026-09-22-codex-auth-claude-runtime-recovery.md</code></td></tr></table>
+
+<h2>2. Выполненные изменения</h2>
+<p class="lead">53 файла, +10286 / −243 строк.</p>
+<table><tr><th>Файл</th><th>Вид</th><th class="num">±</th><th>Что делает</th></tr>
+<tr><td><code>lib/python/ihar/codex/guardian.py</code></td><td><span class="badge b-add">added</span></td><td class="num">+1713</td><td>Непрерывный guardian и аутентифицированный канал управления</td></tr>
+<tr><td><code>lib/python/ihar/codex/auth_owner.py</code></td><td><span class="badge b-add">added</span></td><td class="num">+1538</td><td>Владелец общего Codex credential: staging и публикация</td></tr>
+<tr><td><code>lib/python/ihar/codex/remote_sandbox.py</code></td><td><span class="badge b-add">added</span></td><td class="num">+414</td><td>Изоляция remote-клиентов Codex</td></tr>
+<tr><td><code>lib/python/ihar/render/claude_compare.py</code></td><td><span class="badge b-add">added</span></td><td class="num">+78</td><td>Сравнение Claude settings; vendor-owned <code>theme</code>/<code>tui</code></td></tr>
+<tr><td><code>lib/codex/auth.sh</code></td><td><span class="badge b-add">added</span></td><td class="num">+39</td><td>Shell-вход в guarded login</td></tr>
+<tr><td><code>lib/python/ihar/conformance/run.py</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+208 / −43</td><td>Vendor argv, API-stop как unmeasured, безопасная цель deny, watcher вне дерева хука + проверка зомби, синтетический токен rewrite, минимальная длительность timeout</td></tr>
+<tr><td><code>lib/python/ihar/codex/daemon.py</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+137 / −28</td><td>Демон Codex под владельцем guardian</td></tr>
+<tr><td><code>lib/sandbox/microvm.sh</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+129 / −12</td><td>Возврат guest auth</td></tr>
+<tr><td><code>lib/python/ihar/check_result.py</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+97</td><td>Диагностика без секретов</td></tr>
+<tr><td><code>ihar.sh</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+67</td><td>Ранний вход в guardian</td></tr>
+<tr><td><code>lib/cli/commands.sh</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+52 / −5</td><td>Guarded conformance / install / switch</td></tr>
+<tr><td><code>lib/cli/check.sh</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+49 / −11</td><td><code>check --diff</code>: поколение, категории причин</td></tr>
+<tr><td><code>lib/sessions/sessions.sh</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+41 / −2</td><td>Индекс сессий с доверенным PYTHONPATH</td></tr>
+<tr><td><code>lib/python/ihar/render/mcp.py</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+16 / −1</td><td>Effective MCP identity</td></tr>
+<tr><td><code>lib/state/runtime.sh</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+10 / −4</td><td>Выбор поколения runtime, общий компаратор</td></tr>
+<tr><td><code>docs/lld/unified-harness.md</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+62 / −19</td><td>LLD revision 25</td></tr>
+<tr><td><code>README.md</code>, <code>docs/README.ru.md</code></td><td><span class="badge b-mod">modified</span></td><td class="num">+33, +37</td><td>Инструкции пользователя</td></tr>
+<tr><td>Тесты: <code>test_codex_auth_lease.py</code> (+2193), <code>test_codex_auth_guest.py</code> (+761), <code>test_codex_auth_owner.py</code> (+238), <code>test_claude_compare.py</code> (+124)</td><td><span class="badge b-add">added</span></td><td class="num">+3316</td><td>Покрытие guardian, guest, owner, компаратора</td></tr>
+<tr><td>Тесты: <code>test_conformance.py</code> (+729/−16), <code>test_contracts.sh</code> (+272), <code>test_microvm.sh</code> (+147/−1), <code>test_web.sh</code> (+140/−25), <code>test_state.sh</code> (+95/−25), прочие мелкие</td><td><span class="badge b-mod">modified</span></td><td class="num">—</td><td>Регрессии и негативные пути</td></tr>
+<tr><td>Chain docs: intent, spec, plan, <code>docs/profiles/…yaml</code></td><td><span class="badge b-add">added</span></td><td class="num">+523</td><td>Артефакты цепочки</td></tr>
+</table>
+
+<h2>3. Результаты</h2>
+<table><tr><th>Шаг плана</th><th>Статус</th><th>Доказательство</th></tr>
+<tr><td>Task 1 — effective MCP identity выбирает поколение</td><td><span class="badge b-ok">DONE</span></td><td><code>render/mcp.py</code>, <code>state/runtime.sh</code>, <code>test_mcp.sh</code></td></tr>
+<tr><td>Task 2 — компаратор Claude settings</td><td><span class="badge b-warn">DONE · WARNING</span></td><td><code>claude_compare.py</code>; добавлен <code>tui</code> по замеру Claude 2.1.274</td></tr>
+<tr><td>Task 3 — staging / publication</td><td><span class="badge b-ok">DONE</span></td><td><code>auth_owner.py</code>, <code>test_codex_auth_owner.py</code></td></tr>
+<tr><td>Task 4 — непрерывный guardian</td><td><span class="badge b-ok">DONE</span></td><td><code>guardian.py</code>, <code>test_codex_auth_lease.py</code></td></tr>
+<tr><td>Task 5 — admission до preflight</td><td><span class="badge b-ok">DONE</span></td><td><code>ihar.sh</code></td></tr>
+<tr><td>Task 6 — daemon и подключённые клиенты</td><td><span class="badge b-ok">DONE</span></td><td><code>daemon.py</code>, <code>remote_sandbox.py</code></td></tr>
+<tr><td>Task 7 — guarded check / conformance / install / switch</td><td><span class="badge b-ok">DONE</span></td><td><code>commands.sh</code>, <code>conformance/run.py</code></td></tr>
+<tr><td>Task 8 — возврат guest auth</td><td><span class="badge b-ok">DONE</span></td><td><code>microvm.sh</code>, <code>test_codex_auth_guest.py</code></td></tr>
+<tr><td>Task 9 — LLD и диагностика</td><td><span class="badge b-ok">DONE</span></td><td>LLD rev 25, <code>check_result.py</code>, <code>test_contracts.sh</code></td></tr>
+<tr><td>Task 10 — интеграция и human checkpoint</td><td><span class="badge b-ok">DONE</span></td><td><code>bash -n</code> 0; <code>compileall</code> 0; <code>tests/run.sh</code> files=42 failed=0 на <code>b0f1716</code>; deep review APPROVE (нет High/Medium); live <code>ihar check --conformance</code> exit 0 — Claude и Codex <code>proven</code>; <code>login status</code> Logged in; <code>check --diff</code> no differences; code graph = <code>graph_unavailable</code></td></tr>
+</table>
+<div class="cards">
+<div class="card"><b>Intent Desired Outcomes</b>4 / 4 покрыты</div>
+<div class="card"><b>Stop Rule «Done when»</b>выполнен</div>
+<div class="card"><b>Excess</b>нет — фиксы пробы и guardian чинят воспроизводимые сбои в файлах Task 7 / Task 4 (разрешено Task 10)</div>
+</div>
+<div class="note"><b>WARNING (Task 2).</b> План требует «do not whitelist other keys». Добавлен второй vendor-owned ключ <code>tui</code>: Claude 2.1.274 сам записал <code>"tui": "fullscreen"</code>, и следующий запуск отказал. Изменение одобрено пользователем как LLD revision 25 и соответствует Desired Outcome 4. Вложенные и нестроковые значения по-прежнему считаются drift.</div>
+
+<h2>4. Влияние на систему</h2>
+<table><tr><th>Область</th><th>Изменение поведения</th></tr>
+<tr><td>Codex auth</td><td>Один писатель общего credential; при занятом владельце — fail-closed отказ</td></tr>
+<tr><td>Claude runtime</td><td>Ложного drift на <code>theme</code> / <code>tui</code> больше нет; managed-поля по-прежнему fail-closed</td></tr>
+<tr><td>MCP</td><td>Смена доступности серверов выбирает новое неизменяемое поколение runtime</td></tr>
+<tr><td>Conformance</td><td>Claude впервые реально измерен и <code>proven</code>; пробы устойчивы к tree-kill и subreaper</td></tr>
+<tr><td>Guardian</td><td>Отказ лишнему control-клиенту за 0.06 s вместо 2 s</td></tr>
+</table>
+<details open><summary>Риски и follow-up</summary>
+<ul>
+<li>Публикация code graph — после merge (local сервер индексирует master).</li>
+<li>PR заблокирован: GitHub недоступен.</li>
+<li>Один необъяснённый сбой lease-теста из 12 изолированных прогонов.</li>
+<li>Claude passthrough <code>--</code> делает <code>-p</code> текстом prompt — by design (LLD §229).</li>
+</ul></details>
+
+<h2>5. Схемы</h2>
+<figure>
+<svg viewBox="0 0 980 360" width="100%" role="img" aria-label="Схема компонентов">
+<defs>
+<filter id="ds"><feDropShadow dx="0" dy="1" stdDeviation="1.5" flood-color="rgba(40,40,80,.25)"/></filter>
+<marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#9aa0b4"/></marker>
+</defs>
+<g filter="url(#ds)">
+<rect class="node" x="20" y="40" width="140" height="50" rx="8"/><text x="90" y="70" text-anchor="middle">ihar.sh</text>
+<rect class="node new" x="230" y="40" width="170" height="50" rx="8"/><text x="315" y="62" text-anchor="middle">guardian</text><text class="sub" x="315" y="78" text-anchor="middle">supervise / admit</text>
+<rect class="node" x="480" y="10" width="170" height="44" rx="8"/><text x="565" y="37" text-anchor="middle">Codex daemon</text>
+<rect class="node" x="480" y="64" width="170" height="44" rx="8"/><text x="565" y="91" text-anchor="middle">conformance run</text>
+<rect class="node" x="480" y="118" width="170" height="44" rx="8"/><text x="565" y="145" text-anchor="middle">install / check / switch</text>
+<rect class="node new" x="230" y="170" width="170" height="50" rx="8"/><text x="315" y="200" text-anchor="middle">auth_owner</text>
+<rect class="node" x="480" y="185" width="190" height="44" rx="8"/><text x="575" y="212" text-anchor="middle">store auth/codex (canonical)</text>
+<rect class="node" x="20" y="170" width="140" height="50" rx="8"/><text x="90" y="192" text-anchor="middle">microVM guest</text><text class="sub" x="90" y="208" text-anchor="middle">publish_guest</text>
+<rect class="node" x="20" y="280" width="140" height="50" rx="8"/><text x="90" y="310" text-anchor="middle">launch</text>
+<rect class="node" x="230" y="280" width="170" height="50" rx="8"/><text x="315" y="310" text-anchor="middle">state/runtime.sh</text>
+<rect class="node new" x="480" y="250" width="190" height="44" rx="8"/><text x="575" y="277" text-anchor="middle">claude_compare</text>
+<rect class="node" x="480" y="305" width="190" height="44" rx="8"/><text x="575" y="324" text-anchor="middle">render/mcp</text><text class="sub" x="575" y="339" text-anchor="middle">MCP identity → generation</text>
+<rect class="node new" x="740" y="10" width="200" height="44" rx="8"/><text x="840" y="37" text-anchor="middle">remote_sandbox</text>
+</g>
+<path class="edge" d="M160,65 L228,65"/>
+<path class="edge" d="M400,58 C440,40 450,32 478,32"/>
+<path class="edge" d="M400,66 L478,86"/>
+<path class="edge" d="M400,76 C440,110 450,140 478,140"/>
+<path class="edge" d="M315,90 L315,168"/>
+<path class="edge" d="M400,200 L478,205"/>
+<path class="edge" d="M160,195 L228,195"/>
+<path class="edge" d="M650,32 L738,32"/>
+<path class="edge" d="M160,305 L228,305"/>
+<path class="edge" d="M400,298 C440,280 450,272 478,272"/>
+<path class="edge" d="M400,312 L478,322"/>
+</svg>
+<figcaption>Новые модули выделены заливкой. Guardian владеет всеми запусками Codex; auth_owner — единственный писатель canonical credential; launch выбирает поколение runtime через MCP identity и сверяет Claude settings компаратором.</figcaption>
+</figure>
+</main>
+</body>
+</html>

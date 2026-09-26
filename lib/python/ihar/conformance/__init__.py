@@ -8,6 +8,13 @@ LIVE_CASES = frozenset({
     "timeout-behaviour",
 })
 
+ENVIRONMENT_REASONS = frozenset({
+    "vendor-api-error",
+    "vendor-quota-exhausted",
+    "vendor-unauthenticated",
+    "vendor-unreachable",
+})
+
 REQUIRED_CASES = {
     "claude": LIVE_CASES | {
         "sandbox-direct-write",

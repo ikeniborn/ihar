@@ -34,12 +34,12 @@ ihar_upgrade_runtime_state() {
 }
 
 # ihar_config_hash <profile> <masking> <gateway> <sandbox> <mcp-strict>
-#                  <hooks-digest> <registry-digest> <vendor-version>
-# The eight explicit inputs plus validated persistent-state and tracked-asset
+#                  <hooks-digest> <registry-digest> <vendor-version> <mcp-identity>
+# The nine explicit inputs plus validated persistent-state and tracked-asset
 # identities decide how the vendor behaves. Folding both link inventories into the
 # generation prevents a runtime built for older topology from being reused.
 ihar_config_hash() {
-  (( $# == 8 )) || ihar_die 2 "ihar_config_hash: expected 8 inputs, got $#"
+  (( $# == 9 )) || ihar_die 2 "ihar_config_hash: expected 9 inputs, got $#"
   local state_manifest_digest asset_manifest_identity
   state_manifest_digest="$(ihar_state_manifest_digest)" \
     || ihar_die 3 "cannot digest persistent-state manifest"
@@ -186,7 +186,7 @@ _ihar_rtrim_blank() {
 # disagree, so one of them is wrong and continuing would run under a configuration
 # nobody chose.
 _ihar_runtime_verify() {
-  local runtime="$1" render="$2" relative
+  local runtime="$1" render="$2" relative difference
   [[ -n "$render" && -d "$render" ]] || return 0
 
   while IFS= read -r -d '' file; do
@@ -205,6 +205,12 @@ _ihar_runtime_verify() {
       if ! cmp -s <(_ihar_rtrim_blank < "$file") \
                   <(sed '/# ihar:hook-trust:start/,$d' "$runtime/$relative" | _ihar_rtrim_blank); then
         ihar_die 3 "runtime home $runtime has drifted at $relative; rendering into an existing home is never allowed"
+      fi
+      continue
+    fi
+    if [[ "$relative" == "settings.json" ]]; then
+      if ! difference="$(ihar_python ihar.render.claude_compare "$file" "$runtime/$relative")"; then
+        ihar_die 3 "runtime home $runtime has drifted at $relative (${difference:-root}); rendering into an existing home is never allowed"
       fi
       continue
     fi

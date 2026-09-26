@@ -830,10 +830,11 @@ KINDS: dict[str, dict[str, Any]] = {
                         "detail": {"type": str},
                         "reason": {"type": str, "enum": (
                             "vendor-quota-exhausted", "vendor-unauthenticated",
-                            "vendor-unreachable",
+                            "vendor-unreachable", "vendor-api-error",
                             "vendor-rejected-argv", "vendor-exited-nonzero",
                             "hook-never-fired", "sentinel-missing",
-                            "decision-not-recorded", "timeout", "case-raised",
+                            "decision-not-recorded", "rewrite-not-applied", "timeout",
+                            "case-raised",
                             "unclassified")},
                     },
                 },

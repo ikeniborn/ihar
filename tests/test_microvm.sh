@@ -102,9 +102,155 @@ env_file="$session/guest-env.sh"
 ihar_microvm_write_guest_env "$env_file" codex /mnt/ihar/runtime/codex
 guest_env="$(cat "$env_file")"
 assert_contains "Claude home is always visible" "$guest_env" "CLAUDE_CONFIG_DIR='/mnt/ihar/runtime/claude'"
-assert_contains "Codex home is always visible" "$guest_env" "CODEX_HOME='/mnt/ihar/runtime/codex'"
+assert_contains "Codex uses a writable home for atomic credential replacement" "$guest_env" \
+  "CODEX_HOME='/mnt/ihar-state/.ihar-guest-codex-home'"
 assert_contains "both binaries are on PATH" "$guest_env" "PATH='/mnt/ihar/bin:"
 assert_contains "gateway uses host side address" "$guest_env" "http://172.31.0.1:43123"
+
+# Credential writes must hit the separate writable state drive. Policy content
+# remains immutable and contains neither a private credential copy nor a link to one.
+guest_bundle="$session/guest-bundle"
+guest_state="$session/guest-state"
+guest_auth="$IHAR_STORE/auth/codex/auth.json"
+mkdir -p "$guest_bundle/runtime/codex" "$guest_state" "$(dirname "$guest_auth")"
+chmod 700 "$guest_bundle"
+chmod 700 "$IHAR_STORE/auth" "$(dirname "$guest_auth")"
+printf '%s' synthetic-guest-seed > "$guest_auth"
+chmod 600 "$guest_auth"
+ln -s "$guest_auth" "$guest_bundle/runtime/codex/auth.json"
+printf '%s' managed-policy > "$guest_bundle/runtime/codex/config.toml"
+_ihar_microvm_stage_guest_auth "$guest_bundle" "$guest_state" "$guest_auth"
+assert_eq "Codex guest link targets writable state" "/mnt/ihar-state/.ihar-guest-codex-home/auth.json" \
+  "$(readlink "$guest_bundle/runtime/codex/auth.json")"
+assert_eq "writable Codex home keeps config on read-only policy" \
+  "/mnt/ihar/runtime/codex/config.toml" \
+  "$(readlink "$guest_state/.ihar-guest-codex-home/config.toml")"
+assert_exit "writable Codex auth path is a real file" 1 \
+  test -L "$guest_state/.ihar-guest-codex-home/auth.json"
+assert_exit "policy image has no credential copy" 1 test -e "$guest_bundle/store/auth/codex/auth.json"
+guest_policy_image="$session/guest-policy.ext4"
+_ihar_microvm_make_image "$guest_policy_image" "$guest_bundle" 16
+assert_eq "state seed holds private credential bytes" "synthetic-guest-seed" \
+  "$(cat "$guest_state/.ihar-guest-codex-home/auth.json")"
+assert_eq "state seed credential stays private" "600" \
+  "$(stat -c %a "$guest_state/.ihar-guest-codex-home/auth.json")"
+guest_state_image="$session/guest-state.ext4"
+_ihar_microvm_make_image "$guest_state_image" "$guest_state" 16
+mkdir "$session/guest-config"
+guest_config="$(ihar_microvm_write_config "$session/guest-config" tap-ihar-1 172.31.0.2 \
+  "$session/rootfs.ext4" "$guest_policy_image" "$session/workspace.ext4" "$guest_state_image")"
+policy_before="$(sha256sum "$guest_policy_image" | cut -d' ' -f1)"
+drive_attempt="$(python3 - "$guest_config" <<'PY'
+import errno
+import json
+import os
+import sys
+
+drives = {drive['drive_id']: drive for drive in json.load(open(sys.argv[1]))['drives']}
+for name in ('policy', 'state'):
+    drive = drives[name]
+    read_only = drive['is_read_only']
+    fd = os.open(drive['path_on_host'], os.O_RDONLY if read_only else os.O_RDWR)
+    try:
+        try:
+            os.pwrite(fd, b'X', os.fstat(fd).st_size - 1)
+        except OSError as error:
+            result = 'blocked' if error.errno == errno.EBADF else f'error-{error.errno}'
+        else:
+            result = 'written'
+    finally:
+        os.close(fd)
+    print(f'{name}:{"ro" if read_only else "rw"}:{result}')
+PY
+)"
+assert_contains "emitted policy drive blocks fake-VM write" "$drive_attempt" 'policy:ro:blocked'
+assert_contains "emitted state drive permits fake-VM write" "$drive_attempt" 'state:rw:written'
+assert_eq "policy bytes stay unchanged after fake-VM write refusal" "$policy_before" \
+  "$(sha256sum "$guest_policy_image" | cut -d' ' -f1)"
+assert_eq "writable guest drive contains credential" "synthetic-guest-seed" \
+  "$(debugfs -R 'cat /.ihar-guest-codex-home/auth.json' "$guest_state_image" 2>/dev/null)"
+assert_exit "prelaunch state image matches the private seed" 0 \
+  _ihar_microvm_image_auth_matches "$guest_state_image" \
+  "$guest_state/.ihar-guest-codex-home/auth.json" "$guest_bundle"
+assert_exit "stopped state image yields a private candidate" 0 \
+  _ihar_microvm_extract_guest_auth "$guest_state_image" "$guest_bundle"
+assert_eq "extracted candidate preserves bytes" "synthetic-guest-seed" \
+  "$(cat "$guest_bundle/auth.json")"
+assert_eq "extracted candidate is owner-only" "600" \
+  "$(stat -c %a "$guest_bundle/auth.json")"
+debugfs -w -R 'rm /.ihar-guest-codex-home/auth.json' "$guest_state_image" >/dev/null 2>&1
+assert_exit "missing image credential is not treated as logout" 1 \
+  _ihar_microvm_extract_guest_auth "$guest_state_image" "$guest_bundle"
+assert_eq "failed extraction retains earlier candidate" "synthetic-guest-seed" \
+  "$(cat "$guest_bundle/auth.json")"
+assert_exit "fake guest can substitute a symlink in its writable image" 0 \
+  debugfs -w -R 'symlink /.ihar-guest-codex-home/auth.json /etc/passwd' "$guest_state_image"
+assert_exit "symlinked image credential is rejected" 1 \
+  _ihar_microvm_extract_guest_auth "$guest_state_image" "$guest_bundle"
+printf '%s' synthetic-atomic-refresh > "$guest_state/.ihar-guest-codex-home/.auth-next"
+chmod 600 "$guest_state/.ihar-guest-codex-home/.auth-next"
+mv "$guest_state/.ihar-guest-codex-home/.auth-next" \
+  "$guest_state/.ihar-guest-codex-home/auth.json"
+assert_eq "writable Codex home permits atomic credential replacement" \
+  "synthetic-atomic-refresh" "$(cat "$guest_state/.ihar-guest-codex-home/auth.json")"
+mkdir -p "$session/persisted-state"
+rsync -a --exclude='/.ihar-guest-codex-home/' "$guest_state/" "$session/persisted-state/"
+assert_exit "live state transfer omits private credential view" 1 \
+  test -e "$session/persisted-state/.ihar-guest-codex-home/auth.json"
+
+early_store="$session/early-store"
+early_runtime="$session/early-runtime"
+mkdir -p "$early_store/auth/codex" "$early_runtime" "$session/early-state"
+chmod 700 "$early_store/auth" "$early_store/auth/codex"
+printf '%s' synthetic-early-owner > "$early_store/auth/codex/auth.json"
+chmod 600 "$early_store/auth/codex/auth.json"
+ln -s "$early_store/auth/codex/auth.json" "$early_runtime/auth.json"
+early_status=0
+(
+  export IHAR_STORE="$early_store" IHAR_STATE_ROOT="$session/early-state-root"
+  export IHAR_STATE="$session/early-state"
+  export IHAR_GUARD_FD=41
+  source "$ROOT/lib/codex/auth.sh"
+  ihar_microvm_preflight() { :; }
+  ihar_codex_guest_owner() {
+    printf '%s\n' "$*" >> "$IHAR_TEST_TMP/early-guest-actions"
+  }
+  ihar_gateway_release() { printf x >> "$IHAR_TEST_TMP/early-release-count"; }
+  ihar_microvm_reserve_slot() {
+    _ihar_microvm_early_cleanup
+    ihar_die 3 'synthetic prelaunch failure'
+  }
+  ihar_microvm_launch codex "$early_runtime"
+) > "$session/early-stdout" 2> "$session/early-stderr" || early_status=$?
+assert_eq "synthetic prelaunch failure exits closed" "3" "$early_status"
+assert_exit "slot failure happens before guest bundle registration" 1 \
+  test -e "$IHAR_TEST_TMP/early-guest-actions"
+assert_eq "early failure preserves canonical credential" "synthetic-early-owner" \
+  "$(cat "$early_store/auth/codex/auth.json")"
+assert_eq "early cleanup releases gateway only once" "x" \
+  "$(cat "$IHAR_TEST_TMP/early-release-count")"
+
+guardian_call="$(
+(
+  export IHAR_GUARD_FD=42
+  source "$ROOT/lib/codex/auth.sh"
+  ihar_python() {
+    printf '%s\n' "$*"
+  }
+  ihar_codex_guest_owner register /private/bundle /private/state.ext4 /private/seed.json
+)
+)"
+assert_eq "guest bundle registration uses the inherited guardian channel" \
+  "ihar.codex.guardian guest-register 42 /private/bundle /private/state.ext4 /private/seed.json" \
+  "$guardian_call"
+guest_registration_flow="$(sed -n '/_ihar_microvm_make_image "$state_img"/,/guest_bundle_registered=true/p' "$ROOT/lib/sandbox/microvm.sh")"
+assert_contains "registered state image is owner-only" \
+  "$guest_registration_flow" 'chmod 600 "$state_img"'
+guest_return_flow="$(sed -n '/ihar_codex_guest_owner quiescent/,/_ihar_microvm_cleanup/p' "$ROOT/lib/sandbox/microvm.sh")"
+assert_contains "guest extraction stays inside the inherited guardian" \
+  "$guest_return_flow" 'ihar_codex_guest_owner extract "$guest_auth_bundle"'
+assert_contains "guest publication requires a second authenticated acknowledgment" \
+  "$guest_return_flow" 'ihar_codex_guest_owner ack "$guest_auth_bundle" "$guest_publish_ack"'
 
 # --- host-side deny-by-default policy -------------------------------------------------
 

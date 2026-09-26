@@ -60,19 +60,20 @@ def run_check(mode, vendor, path, binary, manifest) -> int:
 def main():
     global PASS, FAIL
 
-    # The vendor's own words are matched only to classify; nothing of them is kept.
+    # Legacy non-JSON output is matched only to classify; nothing of it is kept.
     check("a usage limit is an environment, not a failure",
-          run_module._environment_reason("You've hit your usage limit", 1)
+          run_module._environment_reason("You've hit your usage limit", "", 1)
           == "vendor-quota-exhausted")
     check("a missing login is an environment",
-          run_module._environment_reason("Please log in to continue", 1)
+          run_module._environment_reason("Please log in to continue", "", 1)
           == "vendor-unauthenticated")
     check("an unreachable endpoint is an environment",
-          run_module._environment_reason("connection refused", 1) == "vendor-unreachable")
+          run_module._environment_reason("connection refused", "", 1)
+          == "vendor-unreachable")
     check("a clean exit is never an environment reason",
-          run_module._environment_reason("You've hit your usage limit", 0) == "")
+          run_module._environment_reason("You've hit your usage limit", "", 0) == "")
     check("an ordinary failure is not reclassified",
-          run_module._environment_reason("the hook did not fire", 1) == "")
+          run_module._environment_reason("the hook did not fire", "", 1) == "")
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -94,6 +95,22 @@ def main():
               run_check("--unmeasured-record", vendor, str(target), str(binary),
                         str(manifest)) == 0)
 
+        missing_reason = record_for(
+            vendor, str(binary), str(manifest), {one: "unmeasured"})
+        del missing_reason["cases"][one]["reason"]
+        jsonio.write("conformance", str(target), missing_reason)
+        check("an unmeasured case without an environment reason blocks the install",
+              run_check("--unmeasured-record", vendor, str(target), str(binary),
+                        str(manifest)) == 1)
+
+        hook_reason = record_for(
+            vendor, str(binary), str(manifest), {one: "unmeasured"})
+        hook_reason["cases"][one]["reason"] = "hook-never-fired"
+        jsonio.write("conformance", str(target), hook_reason)
+        check("a hook reason cannot authorize unmeasured activation",
+              run_check("--unmeasured-record", vendor, str(target), str(binary),
+                        str(manifest)) == 1)
+
         # One real failure and the record is a failure, whatever else went unmeasured.
         jsonio.write("conformance", str(target),
                      record_for(vendor, str(binary), str(manifest),
@@ -103,6 +120,17 @@ def main():
                         str(manifest)) == 1)
         check("and still refuses the enforced gate",
               run_check(None, None, str(target), str(binary), str(manifest)) == 1)
+
+        extra_failure = record_for(vendor, str(binary), str(manifest), {one: "unmeasured"})
+        extra_failure["cases"]["optional-diagnostic"] = {
+            "status": "failed",
+            "detail": "optional-diagnostic: failed",
+            "reason": "unclassified",
+        }
+        jsonio.write("conformance", str(target), extra_failure)
+        check("an extra failed case blocks unmeasured activation",
+              run_check("--unmeasured-record", vendor, str(target), str(binary),
+                        str(manifest)) == 1)
 
         # A fully passing record is untouched by any of this.
         jsonio.write("conformance", str(target),

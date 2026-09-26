@@ -10,6 +10,7 @@
 
 IHAR_COMMAND=""
 IHAR_PASSTHROUGH=()
+IHAR_CODEX_AUTH_VERB=""
 IHAR_FLAG_PROFILE=""
 IHAR_FLAG_DRY_RUN=false
 IHAR_FLAG_JSON=false
@@ -112,7 +113,20 @@ ihar_args_parse() {
   # Rule 2: after the command only its own flags are parsed. Rule 3: -- ends parsing.
   while (( $# )); do
     case "$1" in
-      --) shift; IHAR_PASSTHROUGH=("$@"); return 0 ;;
+      --)
+        shift
+        IHAR_PASSTHROUGH=("$@")
+        if [[ "$IHAR_COMMAND" == codex ]]; then
+          case "${IHAR_PASSTHROUGH[0]:-}" in
+            login)
+              IHAR_CODEX_AUTH_VERB=login
+              [[ "${IHAR_PASSTHROUGH[1]:-}" == status ]] && IHAR_CODEX_AUTH_VERB=status
+              ;;
+            logout) IHAR_CODEX_AUTH_VERB=logout ;;
+          esac
+        fi
+        return 0
+        ;;
     esac
 
     if [[ "$IHAR_COMMAND" == claude || "$IHAR_COMMAND" == codex ||

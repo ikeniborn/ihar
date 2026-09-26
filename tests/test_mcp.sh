@@ -82,6 +82,44 @@ write_registry "$NEEDS"
 assert_contains "an unmet requires_env skips the server" "$(render claude standard)" \
   "remote: skipped, NOT_SET_ANYWHERE is not set"
 
+# Identity tracks the effective server set, not the value of a forwarded secret.
+IDENTITY='{"schema":1,"servers":[
+  {"name":"remote","transport":"http","url":"https://wiki.example/mcp",
+   "headers":{"Authorization":"Bearer ${IWIKI_REMOTE_TOKEN}"},
+   "requires_env":["IWIKI_REMOTE_TOKEN"],"scope":"user","profiles":["*"]}]}'
+write_registry "$IDENTITY"
+unset IWIKI_REMOTE_TOKEN
+for vendor in claude codex; do
+  without="$(python3 -m ihar.render.mcp "$vendor" standard "$REGISTRY" --identity)"
+  with="$(IWIKI_REMOTE_TOKEN=synthetic python3 -m ihar.render.mcp "$vendor" standard "$REGISTRY" --identity)"
+  changed_value="$(IWIKI_REMOTE_TOKEN=other-synthetic python3 -m ihar.render.mcp "$vendor" standard "$REGISTRY" --identity)"
+  repeated="$(IWIKI_REMOTE_TOKEN=synthetic python3 -m ihar.render.mcp "$vendor" standard "$REGISTRY" --identity)"
+  assert_exit "$vendor identity is a lowercase SHA-256" 0 \
+    bash -c "[[ '$with' =~ ^[0-9a-f]{64}$ ]]"
+  assert_exit "$vendor selected server changes identity" 1 test "$without" = "$with"
+  assert_eq "$vendor forwarded secret value does not change identity" "$with" "$changed_value"
+  assert_eq "$vendor stable render keeps identity" "$with" "$repeated"
+  expected="$(IWIKI_REMOTE_TOKEN=synthetic body "$vendor" standard | python3 -c '
+import hashlib, json, sys
+rendered = sys.stdin.read().removesuffix("\n")
+if sys.argv[1] == "claude":
+    rendered = json.loads(rendered)
+canonical = json.dumps(rendered, sort_keys=True, separators=(",", ":"))
+print(hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+' "$vendor")"
+  assert_eq "$vendor identity matches the stable render" "$expected" "$with"
+done
+
+for vendor in claude codex; do
+  first_url="$(IHAR_IWIKI_REMOTE_URL=https://first.example/mcp \
+    IWIKI_REMOTE_TOKEN=synthetic python3 -m ihar.render.mcp \
+    "$vendor" standard "$ROOT/manifests/mcp/registry.json" --identity)"
+  second_url="$(IHAR_IWIKI_REMOTE_URL=https://second.example/mcp \
+    IWIKI_REMOTE_TOKEN=synthetic python3 -m ihar.render.mcp \
+    "$vendor" standard "$ROOT/manifests/mcp/registry.json" --identity)"
+  assert_exit "$vendor resolved endpoint changes identity" 1 test "$first_url" = "$second_url"
+done
+
 # --- a reference Codex cannot expand is fail-closed --------------------------------------------
 #
 # Codex does not expand environment references in its configuration, so one that

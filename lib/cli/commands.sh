@@ -32,7 +32,12 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
       *) ihar_die 2 "profile '$IHAR_PROFILE' does not allow ${vendor^} web" ;;
     esac
   fi
-
+  if [[ "$vendor" == claude && "$IHAR_PROFILE_SANDBOX" == microvm ]]; then
+    [[ -z "${IHAR_CODEX_GUARD_FD:-}" && -n "${IHAR_GUARD_FD:-}" ]] \
+      || ihar_die 3 "Codex guardian admission cannot be verified"
+    ihar_python ihar.codex.guardian admit "$IHAR_GUARD_FD" \
+      || ihar_die 3 "Codex guardian admission cannot be verified"
+  fi
   # 3. store integrity, at the severity the profile asks for
   IHAR_VENDOR="$vendor"; export IHAR_VENDOR
   local native_binary
@@ -45,6 +50,15 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
     verify_receipt=false
   fi
   ihar_store_verify "$vendor" "$native_binary" "$verify_receipt"
+
+  local auth_verb=""
+  if [[ "$vendor" == codex ]]; then
+    auth_verb="$(ihar_codex_auth_verb)" || auth_verb=""
+    if [[ -n "$auth_verb" ]]; then
+      ihar_codex_auth_command "$auth_verb"
+      return $?
+    fi
+  fi
 
   # 4. project state. Called directly rather than in a command substitution: the
   # setup exports IHAR_STATE, and a subshell would drop that export while still
@@ -79,12 +93,13 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
 
   # 6. render. The hook block and the effective policy are produced here; the MCP
   #    registry and the managed config regions arrive with S6 and S7.
-  local render hooks_digest registry_digest
+  local render hooks_digest registry_digest mcp_identity
   render="$(mktemp -d "${TMPDIR:-/tmp}/ihar-render-XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -rf '$render'" RETURN
   hooks_digest="$(ihar_manifest_digest)"
   registry_digest="$(ihar_registry_digest)"
+  mcp_identity="$(ihar_effective_mcp_identity "$vendor")" || return
   ihar_render_all "$vendor" "$render"
 
   # 7. runtime home, keyed by the configuration and never rewritten
@@ -93,21 +108,27 @@ codex-acp #310/#477: sandbox and approval policy are overridden"
   hash="$(ihar_config_hash \
             "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
             "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
-            "$hooks_digest" "$registry_digest" "$version")"
+            "$hooks_digest" "$registry_digest" "$version" "$mcp_identity")"
   local mode=writable
   if [[ "${IHAR_PROFILE_HOOKS:-best-effort}" == "enforced" ]]; then mode=immutable; fi
   ihar_runtime_materialise "$vendor" "$hash" "$render" "$mode" >/dev/null
   runtime="$IHAR_RUNTIME"
+  if [[ "$vendor" == codex ]]; then
+    ihar_python ihar.codex.guardian bind-runtime "$IHAR_GUARD_FD" "$runtime" "$hash" \
+      || ihar_die 3 "Codex runtime guardian binding failed"
+  fi
 
   if [[ "$IHAR_PROFILE_SANDBOX" == microvm ]]; then
-    local other_vendor=claude other_render other_hash other_runtime
+    local other_vendor=claude other_render other_hash other_runtime other_mcp_identity
     [[ "$vendor" == claude ]] && other_vendor=codex
+    other_mcp_identity="$(ihar_effective_mcp_identity "$other_vendor")" || return
     other_render="$(mktemp -d "${TMPDIR:-/tmp}/ihar-render-other-XXXXXX")"
     ihar_render_all "$other_vendor" "$other_render"
     other_hash="$(ihar_config_hash \
       "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
       "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
-      "$hooks_digest" "$registry_digest" "$(ihar_vendor_version "$other_vendor")")"
+      "$hooks_digest" "$registry_digest" "$(ihar_vendor_version "$other_vendor")" \
+      "$other_mcp_identity")"
     ihar_runtime_materialise "$other_vendor" "$other_hash" "$other_render" "$mode" >/dev/null
     other_runtime="$IHAR_RUNTIME"
     ihar_verify_hook_trust "$other_vendor" "$other_runtime"
@@ -174,6 +195,7 @@ run 'ihar install'"
 
   if [[ "${IHAR_ACP_MODE:-false}" == true ]]; then
     ihar_env_apply
+    if [[ "$vendor" == codex ]]; then ihar_codex_guard_drop; fi
     if (( ${#IHAR_ENV[@]} )); then
       exec env -i "${IHAR_ENV[@]}" "${IHAR_ARGV[@]}"
     fi
@@ -191,7 +213,29 @@ run 'ihar install'"
     return $?
   fi
 
+  local attach_store="" attach_python_path="" attach_interpreter=""
+  if [[ "$vendor" == codex && "$IHAR_FLAG_WEB" == true ]]; then
+    attach_store="$IHAR_STORE"
+    attach_python_path="$IHAR_ROOT/lib/python"
+    attach_interpreter="$(ihar_python_bin)" || return 3
+  fi
   ihar_env_apply
+  if [[ "$vendor" == codex ]]; then
+    ihar_codex_guard_drop
+    if [[ "$IHAR_FLAG_WEB" == true ]]; then
+      if (( ${#IHAR_ENV[@]} )); then
+        env -i "${IHAR_ENV[@]}" \
+          PYTHONPATH="$attach_python_path" \
+          "$attach_interpreter" -m ihar.codex.guardian attach \
+          "$attach_store" "$runtime" "$hash" -- "${IHAR_ARGV[@]}"
+      else
+        PYTHONPATH="$attach_python_path${PYTHONPATH:+:$PYTHONPATH}" \
+          "$attach_interpreter" -m ihar.codex.guardian attach \
+          "$attach_store" "$runtime" "$hash" -- "${IHAR_ARGV[@]}"
+      fi
+      return $?
+    fi
+  fi
   if (( ${#IHAR_ENV[@]} )); then
     exec env -i "${IHAR_ENV[@]}" "${IHAR_ARGV[@]}"
   fi
@@ -264,6 +308,9 @@ ihar_cmd_conformance() {
   for vendor in claude codex; do
     binary="$(eval echo "\$IHAR_${vendor^^}_BIN")"
     [[ -x "$binary" ]] || continue
+    if [[ "$vendor" == codex && "${IHAR_CHECK_CODEX_PROBES:-true}" != true ]]; then
+      continue
+    fi
     marker="$directory/.recheck-$vendor"
     if [[ ! -e "$directory" && ! -L "$directory" ]]; then
       mkdir -- "$directory" || {

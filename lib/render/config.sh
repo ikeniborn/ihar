@@ -22,12 +22,14 @@ ihar_render_config() {
 # --------------------------------------------------------------------------- #
 
 _ihar_claude_runtime_path() {
-  local version hash
+  local version hash mcp_identity
   version="$(ihar_vendor_version claude)" || return
+  mcp_identity="$(ihar_effective_mcp_identity claude)" || return
   hash="$(ihar_config_hash \
     "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
     "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
-    "$(ihar_manifest_digest)" "$(ihar_registry_digest)" "$version")" || return
+    "$(ihar_manifest_digest)" "$(ihar_registry_digest)" "$version" \
+    "$mcp_identity")" || return
   printf '%s/r/%s/claude\n' "$IHAR_STATE" "$hash"
 }
 

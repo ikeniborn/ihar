@@ -83,7 +83,7 @@ def main():
     codex_binary = os.environ.get("IHAR_CODEX_BIN", "") or "codex"
     argv = argv_for("codex", codex_binary)
     check("codex: the approval policy travels as a configuration override",
-          "-c" in argv and any("approval_policy" in token for token in argv))
+          "-c" in argv and 'approval_policy="never"' in argv)
     check("codex: the flag the binary rejects is gone",
           "--ask-for-approval" not in argv)
 

@@ -72,4 +72,29 @@ PY
 assert_eq "parallel hooks leave no claim behind" "0" \
   "$(find "$STATE/launches" -type f | wc -l)"
 
+# The launch append runs under the lock as an executable argv rather than through the
+# ihar_python shell function. It must still find the checkout package, and an ambient
+# Python path must not become executable code inside the helper.
+ambient="$IHAR_TEST_TMP/ambient-python"
+ambient_marker="$IHAR_TEST_TMP/ambient-loaded"
+direct_state="$IHAR_TEST_TMP/direct-state"
+mkdir -p "$ambient" "$direct_state" "$IHAR_TEST_TMP/direct-project"
+cat > "$ambient/sitecustomize.py" <<'PY'
+import os
+from pathlib import Path
+Path(os.environ["IHAR_TEST_AMBIENT_MARKER"]).write_text("loaded\n", encoding="utf-8")
+PY
+PYTHONPATH="$ambient" IHAR_TEST_AMBIENT_MARKER="$ambient_marker" \
+  IHAR_ROOT="$ROOT" IHAR_PY="$(command -v python3)" IHAR_STATE="$direct_state" \
+  IHAR_LAUNCH_ID="$id" IHAR_PROJECT_ROOT="$IHAR_TEST_TMP/direct-project" \
+  IHAR_PROFILE=standard bash -c '
+    source "$IHAR_ROOT/lib/core/logging.sh"
+    source "$IHAR_ROOT/lib/core/lock.sh"
+    source "$IHAR_ROOT/lib/sessions/sessions.sh"
+    ihar_session_append_launch claude vendor-direct
+  '
+assert_contains "the locked launch helper imports from the trusted checkout" \
+  "$(cat "$direct_state/sessions.jsonl" 2>/dev/null || true)" '"vendor_session_id":"vendor-direct"'
+assert_exit "the locked launch helper drops ambient PYTHONPATH" 1 test -e "$ambient_marker"
+
 finish

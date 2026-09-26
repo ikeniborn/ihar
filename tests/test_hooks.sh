@@ -116,6 +116,14 @@ assert_contains "it is rewritten through updatedInput" "$out" "updatedInput"
 assert_contains "the placeholder names the kind" "$out" "REDACTED-anthropic-key"
 assert_eq "and the secret itself is gone" "0" "$(grep -c 'sk-ant-abcdefghijklmnopqrstuvwxyz0123' <<<"$out")"
 
+codex_secret='{"hook_event_name":"PreToolUse","tool_name":"Bash",
+  "tool_input":{"command":"printf sk-ant-abcdefghijklmnopqrstuvwxyz0123"}}'
+out="$(printf '%s' "$codex_secret" | python3 -I "$HOOK" --vendor codex 2>/dev/null)"
+assert_contains "a Codex rewrite carries its required allow decision" "$out" \
+  '"permissionDecision": "allow"'
+assert_contains "and carries the rewritten input" "$out" '"updatedInput"'
+assert_contains "and keeps the masked command" "$out" "REDACTED-anthropic-key"
+
 # The anchor an edit matches against is never rewritten: masking it would make the
 # edit fail rather than make it safe.
 edit_anchor='{"hook_event_name":"PreToolUse","tool_name":"Edit",

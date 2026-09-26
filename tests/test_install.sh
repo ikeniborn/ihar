@@ -624,7 +624,8 @@ run_install_scenario() ( # <scenario> [install|update]
     printf '#!/bin/sh\necho new claude\n' > "$IHAR_CLAUDE_BIN"
     chmod +x "$IHAR_CLAUDE_BIN"
   }
-  if [[ "$scenario" == bootstrap-* || "$scenario" == existing-failed || "$scenario" == receipt-only ||
+  if [[ "$scenario" == bootstrap-* || "$scenario" == existing-failed ||
+        "$scenario" == existing-unmeasured || "$scenario" == receipt-only ||
         "$scenario" == receipt-link-only || "$scenario" == executable-only-* ||
         "$scenario" == executable-link-codex ]]; then
     ihar_python() {
@@ -632,7 +633,11 @@ run_install_scenario() ( # <scenario> [install|update]
         printf '%s\n' "$2" >> "$IHAR_TEST_TMP/$scenario.conformance-runs"
         [[ "$scenario" != bootstrap-prerecord ]] || return 3
         [[ "$scenario" != bootstrap-missing-record ]] || return 1
-        printf 'failed deny-blocks-the-tool\n'
+        if [[ "$scenario" == existing-unmeasured ]]; then
+          printf 'unmeasured deny-blocks-the-tool (vendor-api-error)\n'
+        else
+          printf 'failed deny-blocks-the-tool\n'
+        fi
         python3 - "$2" "$3" "$4" "$5" <<'PY'
 import hashlib
 import json
@@ -651,15 +656,23 @@ with open(manifest, "rb") as stream:
 version = f"new-{vendor}"
 record_vendor = ({"claude": "codex", "codex": "claude"}[vendor]
                  if os.environ["IHAR_TEST_SCENARIO"] == "bootstrap-other-vendor" else vendor)
+unmeasured = os.environ["IHAR_TEST_SCENARIO"] == "existing-unmeasured"
+cases = {}
+for name in REQUIRED_CASES[record_vendor]:
+    if name == "deny-blocks-the-tool":
+        cases[name] = {
+            "status": "unmeasured" if unmeasured else "failed",
+            "detail": "SECRET-SENTINEL",
+        }
+        if unmeasured:
+            cases[name]["reason"] = "vendor-api-error"
+    else:
+        cases[name] = {"status": "passed", "detail": "SECRET-SENTINEL"}
 record = {
     "schema": 1, "vendor": record_vendor, "version": version,
     "binary_sha256": binary_digest, "manifest_digest": manifest_digest,
     "created_at": "2026-09-21T00:00:00Z",
-    "cases": {
-        name: {"status": "failed" if name == "deny-blocks-the-tool" else "passed",
-               "detail": "SECRET-SENTINEL"}
-        for name in REQUIRED_CASES[record_vendor]
-    },
+    "cases": cases,
 }
 target = os.path.join(store, "verification", f"{vendor}-{version_slug(version)}.json")
 os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -785,6 +798,25 @@ assert_eq "failed update does not print record detail" 0 \
   "$(grep -cF 'SECRET-SENTINEL' <<<"$existing_output")"
 assert_eq "failed update preserves previous active generation" \
   "$before_generation" "$(transaction_fingerprint)"
+
+reset_active_generation
+unmeasured_output="$(run_install_scenario existing-unmeasured update 2>&1)"
+unmeasured_status=$?
+assert_eq "API-stopped existing-generation conformance permits update" "0" "$unmeasured_status"
+assert_contains "unmeasured update activates staged Claude" "$(cat "$IHAR_CLAUDE_BIN")" "new claude"
+assert_contains "unmeasured update activates staged Codex" "$(cat "$IHAR_CODEX_BIN")" "new codex"
+for vendor in claude codex; do
+  assert_exit "unmeasured $vendor proof is not published" 1 \
+    test -e "$IHAR_STORE/verification/$vendor-new-$vendor.json"
+  assert_contains "unmeasured update names unproven $vendor" \
+    "$unmeasured_output" "hook conformance unproven for $vendor"
+done
+assert_exit "transient unproven warning list is not published" 1 \
+  test -e "$IHAR_STORE/.ihar-unproven-vendors"
+assert_contains "unmeasured update keeps enforced profiles fail-closed" \
+  "$unmeasured_output" "enforced profiles will refuse it"
+assert_eq "unmeasured update does not print record detail" 0 \
+  "$(grep -cF 'SECRET-SENTINEL' <<<"$unmeasured_output")"
 
 for scenario in receipt-only executable-only-claude executable-only-codex; do
   reset_active_generation

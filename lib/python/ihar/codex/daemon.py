@@ -36,6 +36,7 @@ import subprocess
 import sys
 
 from .. import jsonio
+from . import auth_owner
 
 RECORD_NAME = "codex.json"
 STANDALONE_RELATIVE = os.path.join("packages", "standalone", "current", "codex")
@@ -85,16 +86,64 @@ def _daemon_call(binary: str, home: str, action: str, timeout: float = 120.0) ->
             "exit": completed.returncode}
 
 
-def status(binary: str, home: str) -> dict:
-    return _daemon_call(binary, home, "version", timeout=30.0)
+def status(binary: str, home: str, *, auth_store: str | None = None) -> dict:
+    if auth_store is None:
+        return _daemon_call(binary, home, "version", timeout=30.0)
+    if not os.path.lexists(os.path.join(home, "app-server-control", "app-server-control.sock")):
+        return {"status": "absent", "exit": 1}
+    from . import guardian
+    reply = guardian.call_owner(auth_store, "daemon-status",
+                                {"runtime": os.path.abspath(home),
+                                 "binary": os.path.abspath(binary)})
+    answer = reply.get("answer")
+    if not isinstance(answer, dict):
+        raise auth_owner.AuthOwnerError("Codex daemon status proof is invalid")
+    return answer
 
 
-def start(binary: str, home: str) -> dict:
-    return _daemon_call(binary, home, "start")
+def start(binary: str, home: str, *, auth_store: str | None = None,
+          config_hash: str = "") -> dict:
+    if auth_store is None:
+        return _daemon_call(binary, home, "start")
+    from . import guardian
+    fd = os.environ.get("IHAR_GUARD_FD")
+    if fd is None:
+        raise auth_owner.AuthOwnerError("Codex daemon start requires original guardian")
+    answer = guardian.request(int(fd), "daemon-start",
+                              {"runtime": os.path.abspath(home), "config_hash": config_hash,
+                               "binary": os.path.abspath(binary)})
+    result = answer.get("answer")
+    if not isinstance(result, dict):
+        raise auth_owner.AuthOwnerError("Codex daemon start proof is invalid")
+    return result
 
 
-def stop(binary: str, home: str) -> dict:
-    return _daemon_call(binary, home, "stop", timeout=60.0)
+def stop(binary: str, home: str, *, auth_store: str | None = None) -> dict:
+    if auth_store is None:
+        return _daemon_call(binary, home, "stop", timeout=60.0)
+    from . import guardian
+    reply = guardian.call_owner(auth_store, "daemon-stop",
+                                {"runtime": os.path.abspath(home),
+                                 "binary": os.path.abspath(binary)})
+    answer = reply.get("answer")
+    if not isinstance(answer, dict):
+        raise auth_owner.AuthOwnerError("Codex daemon stop proof is invalid")
+    return answer
+
+
+def restart(binary: str, home: str, config_hash: str, *, auth_store: str | None = None) -> dict:
+    if auth_store is None:
+        stop(binary, home)
+        return start(binary, home)
+    from . import guardian
+    reply = guardian.call_owner(auth_store, "daemon-restart",
+                                {"runtime": os.path.abspath(home),
+                                 "binary": os.path.abspath(binary),
+                                 "config_hash": config_hash})
+    answer = reply.get("answer")
+    if not isinstance(answer, dict):
+        raise auth_owner.AuthOwnerError("Codex daemon restart proof is invalid")
+    return answer
 
 
 def running(answer: dict) -> bool:
@@ -174,7 +223,8 @@ RESTART = "restart"
 REFUSE = "refuse"
 
 
-def reconcile(binary: str, home: str, state: str, config_hash: str) -> dict:
+def reconcile(binary: str, home: str, state: str, config_hash: str,
+              *, auth_store: str | None = None) -> dict:
     """What this launch must do about whatever daemon is running.
 
     `none` — no daemon, or one that already matches.
@@ -185,12 +235,36 @@ def reconcile(binary: str, home: str, state: str, config_hash: str) -> dict:
     """
     answer = status(binary, home)
     if not running(answer):
+        if auth_store is not None:
+            from . import guardian
+            if guardian.owner_record_present(auth_store):
+                return {"action": REFUSE,
+                        "reason": "daemon absence is unproven while Codex auth owner remains",
+                        "status": answer}
         # Nothing is listening, so a record is a leftover rather than a claim.
         clear_record(state)
         return {"action": NOTHING_TO_DO, "reason": "no daemon is running", "status": answer}
 
+    owner_identity = None
+    if auth_store is not None:
+        from . import guardian
+        try:
+            owner_identity = guardian.daemon_identity(auth_store, home)
+        except auth_owner.AuthOwnerError:
+            return {"action": REFUSE, "reason": "running daemon has no verified Codex auth owner",
+                    "status": answer}
+        bound = owner_identity["daemon"]
+        if answer.get("pid") != bound["pid"] or answer.get("socketPath") != bound["socket"]:
+            return {"action": REFUSE, "reason": "running daemon identity differs from original owner",
+                    "status": answer}
+
     record = read_record(state)
     ours = record is not None and alive(int(record.get("pid", 0) or 0))
+    if owner_identity is not None:
+        bound = owner_identity["daemon"]
+        ours = bool(ours and record["pid"] == bound["pid"]
+                    and record["socket"] == bound["socket"]
+                    and record["config_hash"] == owner_identity["config_hash"])
 
     mismatches = []
     running_version = answer.get("managedCodexVersion") or answer.get("appServerVersion") or ""
@@ -223,13 +297,17 @@ def _cli_version(binary: str) -> str:
     return (completed.stdout or "").strip().split()[-1] if completed.stdout.strip() else ""
 
 
-def apply(binary: str, home: str, state: str, config_hash: str, decision: dict) -> dict:
+def apply(binary: str, home: str, state: str, config_hash: str, decision: dict,
+          *, auth_store: str | None = None) -> dict:
     """Carry out a `restart`. `none` and `refuse` are the caller's to act on."""
     if decision["action"] != RESTART:
         return decision
-    stop(binary, home)
+    if auth_store is not None:
+        answer = restart(binary, home, config_hash, auth_store=auth_store)
+    else:
+        stop(binary, home)
+        answer = start(binary, home)
     clear_record(state)
-    answer = start(binary, home)
     if not running(answer):
         return {"action": REFUSE, "reason": f"the daemon did not restart: {answer}", "status": answer}
     write_record(state, pid=int(answer.get("pid", 0) or 0),
@@ -256,7 +334,7 @@ def _home_of(record: dict) -> str:
     return os.path.dirname(os.path.dirname(socket_path)) if socket_path else ""
 
 
-def stop_all(binary: str, state_root: str) -> list[dict]:
+def stop_all(binary: str, state_root: str, *, auth_store: str | None = None) -> list[dict]:
     """Stop every daemon ihar recorded, and leave a note of what to put back.
 
     The note is written before anything is stopped and removed only once everything
@@ -282,12 +360,12 @@ def stop_all(binary: str, state_root: str) -> list[dict]:
         with open(pending, "w", encoding="utf-8") as handle:
             json.dump(stopped, handle)
     for item in stopped:
-        stop(binary, item["home"])
+        stop(binary, item["home"], auth_store=auth_store)
         clear_record(item["state"])
     return stopped
 
 
-def start_pending(binary: str, state_root: str) -> list[dict]:
+def start_pending(binary: str, state_root: str, *, auth_store: str | None = None) -> list[dict]:
     """Restart exactly the daemons `stop_all` took down, and nothing else."""
     pending = os.path.join(state_root, PENDING_NAME)
     if not os.path.exists(pending):
@@ -301,7 +379,8 @@ def start_pending(binary: str, state_root: str) -> list[dict]:
 
     restarted = []
     for item in items if isinstance(items, list) else []:
-        answer = start(binary, item["home"])
+        answer = start(binary, item["home"], auth_store=auth_store,
+                       config_hash=item.get("config_hash", "00000000"))
         if running(answer):
             write_record(item["state"], pid=int(answer.get("pid", 0) or 0),
                          socket_path=answer.get("socketPath", ""), binary=binary,
@@ -327,13 +406,19 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--state")
     parser.add_argument("--state-root")
     parser.add_argument("--config-hash", default="00000000")
+    parser.add_argument("--auth-store")
     args = parser.parse_args(argv)
 
     if args.action in ("stop-all", "start-pending"):
         if not args.state_root:
             parser.error(f"{args.action} needs --state-root")
         worker = stop_all if args.action == "stop-all" else start_pending
-        json.dump(worker(args.binary, args.state_root), sys.stdout)
+        try:
+            result = worker(args.binary, args.state_root, auth_store=args.auth_store)
+        except auth_owner.AuthOwnerError as error:
+            print(str(error), file=sys.stderr)
+            return 3
+        json.dump(result, sys.stdout)
         sys.stdout.write("\n")
         return 0
 
@@ -342,8 +427,11 @@ def main(argv: list[str]) -> int:
 
     if args.action == "mark-remote":
         try:
+            if args.auth_store is not None:
+                from . import guardian
+                guardian.daemon_identity(args.auth_store, args.home)
             answer = mark_remote(args.state)
-        except ValueError as error:
+        except (ValueError, auth_owner.AuthOwnerError) as error:
             print(str(error), file=sys.stderr)
             return 3
         json.dump(answer, sys.stdout)
@@ -351,24 +439,39 @@ def main(argv: list[str]) -> int:
         return 0
 
     if args.action == "status":
-        answer = status(args.binary, args.home)
+        try:
+            answer = status(args.binary, args.home, auth_store=args.auth_store)
+        except auth_owner.AuthOwnerError as error:
+            print(str(error), file=sys.stderr)
+            return 3
         record = read_record(args.state)
         json.dump({"status": answer, "record": record}, sys.stdout)
         sys.stdout.write("\n")
         return 0 if running(answer) else 1
 
     if args.action == "stop":
-        answer = stop(args.binary, args.home)
+        try:
+            answer = stop(args.binary, args.home, auth_store=args.auth_store)
+        except auth_owner.AuthOwnerError as error:
+            print(str(error), file=sys.stderr)
+            return 3
         clear_record(args.state)
         json.dump(answer, sys.stdout)
         sys.stdout.write("\n")
         return 0
 
     if args.action in ("start", "restart"):
-        if args.action == "restart":
-            stop(args.binary, args.home)
-            clear_record(args.state)
-        answer = start(args.binary, args.home)
+        try:
+            if args.action == "restart":
+                answer = restart(args.binary, args.home, args.config_hash,
+                                 auth_store=args.auth_store)
+                clear_record(args.state)
+            else:
+                answer = start(args.binary, args.home, auth_store=args.auth_store,
+                               config_hash=args.config_hash)
+        except auth_owner.AuthOwnerError as error:
+            print(str(error), file=sys.stderr)
+            return 3
         if not running(answer):
             json.dump(answer, sys.stdout)
             sys.stdout.write("\n")
@@ -381,9 +484,15 @@ def main(argv: list[str]) -> int:
         sys.stdout.write("\n")
         return 0
 
-    decision = reconcile(args.binary, args.home, args.state, args.config_hash)
+    decision = reconcile(args.binary, args.home, args.state, args.config_hash,
+                         auth_store=args.auth_store)
     if decision["action"] == RESTART:
-        decision = apply(args.binary, args.home, args.state, args.config_hash, decision)
+        try:
+            decision = apply(args.binary, args.home, args.state, args.config_hash, decision,
+                             auth_store=args.auth_store)
+        except auth_owner.AuthOwnerError as error:
+            print(str(error), file=sys.stderr)
+            return 3
     json.dump(decision, sys.stdout)
     sys.stdout.write("\n")
     return 3 if decision["action"] == REFUSE else 0

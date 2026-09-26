@@ -319,14 +319,44 @@ IHAR_STATE="$PROJECT/state" IHAR_PROFILE=protected IHAR_PROFILE_MASKING_LEVEL=st
   IHAR_GATEWAY_MODE=off ihar_render_config claude "$lifecycle_render"
 settings="$(cat "$lifecycle_render/settings.json")"
 lifecycle_roots="$(python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["sandbox"]["filesystem"]["denyWrite"]))' <<<"$settings")"
+final_mcp_identity="$(IHAR_STATE="$PROJECT/state" IHAR_PROFILE=protected \
+  ihar_effective_mcp_identity claude)"
 final_hash="$(printf '%s\n' \
   protected standard off vendor true hooks-fixture registry-fixture claude-2.1.274 \
+  "$final_mcp_identity" \
   "$(ihar_state_manifest_digest)" "$(ihar_asset_manifest_identity)" \
   | sha256sum | cut -c1-8)"
 final_runtime="$PROJECT/state/r/$final_hash/claude"
 assert_contains "Claude denies the final selected runtime" "$lifecycle_roots" "$final_runtime"
 assert_eq "Claude does not substitute the temporary render path" "0" \
   "$(grep -cxF "$lifecycle_render" <<<"$lifecycle_roots")"
+
+# A failed identity calculation must not become an empty but otherwise valid hash.
+source "$ROOT/lib/cli/check.sh"
+mcp_path_status=0
+(
+  ihar_effective_mcp_identity() { return 3; }
+  IHAR_STATE="$PROJECT/state" IHAR_PROFILE=protected IHAR_PROFILE_MASKING_LEVEL=standard \
+    IHAR_PROFILE_GATEWAY=off IHAR_PROFILE_SANDBOX=vendor IHAR_PROFILE_MCP_STRICT=true \
+    _ihar_claude_runtime_path
+) >/dev/null 2>&1 || mcp_path_status=$?
+assert_eq "Claude path rejects an unavailable MCP identity" "3" "$mcp_path_status"
+mcp_check_status=0
+(
+  ihar_effective_mcp_identity() { return 3; }
+  IHAR_PROFILE=protected IHAR_PROFILE_MASKING_LEVEL=standard \
+    IHAR_PROFILE_GATEWAY=off IHAR_PROFILE_SANDBOX=vendor IHAR_PROFILE_MCP_STRICT=true \
+    _ihar_check_config_hash claude
+) >/dev/null 2>&1 || mcp_check_status=$?
+assert_eq "check hash rejects an unavailable MCP identity" "3" "$mcp_check_status"
+mcp_check_runtime_status=0
+(
+  ihar_effective_mcp_identity() { return 3; }
+  IHAR_PROFILE=protected IHAR_PROFILE_MASKING_LEVEL=standard \
+    IHAR_PROFILE_GATEWAY=off IHAR_PROFILE_SANDBOX=vendor IHAR_PROFILE_MCP_STRICT=true \
+    _ihar_check_runtime claude "$PROJECT/state"
+) >/dev/null 2>&1 || mcp_check_runtime_status=$?
+assert_eq "check runtime rejects an unavailable MCP identity" "3" "$mcp_check_runtime_status"
 
 # The settings that must live at the document's top level. A key after a table header
 # belongs to that table — which is right for `".git/"` inside `[permissions.…]` and
@@ -435,24 +465,40 @@ for vendor in claude codex; do
   expected_hash="$(ihar_config_hash \
     "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
     "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
-    "$hooks_digest" "$registry_digest" "$(ihar_vendor_version "$vendor")")"
+    "$hooks_digest" "$registry_digest" "$(ihar_vendor_version "$vendor")" \
+    "$(ihar_effective_mcp_identity "$vendor")")"
   expected_render="$IHAR_TEST_TMP/expected-$vendor"
   ihar_render_all "$vendor" "$expected_render"
   mkdir -p "$CHECK_STATE/r/$expected_hash/$vendor"
   cp -R "$expected_render/." "$CHECK_STATE/r/$expected_hash/$vendor/"
+  if [[ "$vendor" == codex ]]; then
+    # The copied render has configuration only; a real published Codex runtime
+    # also has the declared link to the private shared credential owner.
+    mkdir -p "$IHAR_STORE/auth/codex"
+    chmod 700 "$IHAR_STORE/auth" "$IHAR_STORE/auth/codex"
+    printf 'synthetic profile credential\n' > "$IHAR_STORE/auth/codex/auth.json"
+    chmod 600 "$IHAR_STORE/auth/codex/auth.json"
+    ln -s "$IHAR_STORE/auth/codex/auth.json" \
+      "$CHECK_STATE/r/$expected_hash/codex/auth.json"
+  fi
 done
 mkdir -p "$CHECK_STATE/r/ffffffff/claude" "$CHECK_STATE/r/ffffffff/codex"
 printf 'wrong newest\n' > "$CHECK_STATE/r/ffffffff/claude/settings.json"
 printf 'wrong newest\n' > "$CHECK_STATE/r/ffffffff/codex/config.toml"
 touch "$CHECK_STATE/r/ffffffff"
 exact_diff="$(ihar --profile protected check --diff)"
-assert_eq "diff uses exact desired runtime and real gateway inputs" "no differences" "$exact_diff"
+assert_eq "diff uses exact desired runtime and real gateway inputs" "no differences" \
+  "$(tail -n 1 <<<"$exact_diff")"
+assert_contains "clean Codex fixture has verified mutable link" "$exact_diff" \
+  "codex mutable-link: valid; auth-owner: no recorded owner"
 combined_status=0
 combined_output="$(IHAR_PY="$PY_WRAPPER" IHAR_TEST_EVIDENCE="$EVIDENCE" \
   IHAR_TEST_FAIL_VENDOR=claude IHAR_CLAUDE_BIN="$VENDOR_STUB" \
   IHAR_CODEX_BIN="$VENDOR_STUB" ihar --profile protected check --diff --conformance)" \
   || combined_status=$?
 assert_eq "clean diff retains failed conformance status" 1 "$combined_status"
+assert_contains "guarded diff recognizes its authenticated owner" "$combined_output" \
+  "codex mutable-link: valid; auth-owner: current command"
 assert_eq "combined flags still render the clean diff" "no differences" \
   "$(tail -n 1 <<<"$combined_output")"
 

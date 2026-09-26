@@ -30,11 +30,14 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import ExitStack
+from pathlib import Path
 
 from .. import jsonio
+from ..codex import auth_owner
 from ..render import claude_settings
 from ..render import hooks as render_hooks
-from . import LIVE_CASES, REQUIRED_CASES
+from . import ENVIRONMENT_REASONS, LIVE_CASES, REQUIRED_CASES
 
 
 _SESSION_CONTEXT = "IHAR-CONFORMANCE-SESSION-CONTEXT"
@@ -45,7 +48,6 @@ _PROBE_SCRIPT = r'''#!/usr/bin/env python3
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import time
 
@@ -54,9 +56,14 @@ if mode == "watch":
     parent = int(marker)
     started, ended = float(sys.argv[3]), pathlib.Path(sys.argv[4])
     while time.monotonic() - started < 8:
+        # A killed hook left unreaped by a subreaper is a zombie, which still answers
+        # kill(pid, 0); its /proc state is what says it has terminated.
         try:
-            os.kill(parent, 0)
-        except ProcessLookupError:
+            with open(f"/proc/{parent}/stat", encoding="utf-8") as handle:
+                terminated = handle.read().rsplit(")", 1)[1].split()[0] == "Z"
+        except (FileNotFoundError, ProcessLookupError):
+            terminated = True
+        if terminated:
             ended.write_text(str(time.monotonic() - started), encoding="utf-8")
             raise SystemExit(0)
         time.sleep(0.02)
@@ -72,7 +79,7 @@ if mode == "deny":
                                       "permissionDecisionReason": "conformance deny probe"}},
               sys.stdout)
     sys.stdout.write("\n")
-    raise SystemExit(2)
+    raise SystemExit(0)
 elif mode == "context":
     json.dump({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                       "additionalContext": "IHAR-CONFORMANCE-SESSION-CONTEXT"}},
@@ -80,11 +87,20 @@ elif mode == "context":
     sys.stdout.write("\n")
 elif mode == "timeout":
     started = time.monotonic()
-    subprocess.Popen(
-        [sys.executable, __file__, "watch", str(os.getpid()), str(started), marker + ".ended"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    parent = os.getpid()
+    # Claude 2.1.274 kills the hook and every descendant at the timeout, so the
+    # watcher double-forks out of that tree; a plain child dies before recording.
+    if os.fork() == 0:
+        os.setsid()
+        if os.fork() == 0:
+            devnull = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(devnull, fd)
+            os.closerange(3, os.sysconf("SC_OPEN_MAX"))
+            os.execv(sys.executable, [sys.executable, __file__, "watch", str(parent),
+                                      str(started), marker + ".ended"])
+        os._exit(0)
+    os.wait()
     time.sleep(5)
     pathlib.Path(marker + ".completed").write_text("completed\n", encoding="utf-8")
 '''
@@ -167,7 +183,30 @@ def _stage(
 
     auth_name = ".credentials.json" if vendor == "claude" else "auth.json"
     auth_source = os.path.join(auth_store, "auth", vendor, auth_name)
-    if os.path.isfile(auth_source):
+    if vendor == "codex" and os.path.isfile(auth_source):
+        stage_path = Path(os.path.abspath(home))
+        store_path = Path(os.path.abspath(auth_store))
+        seeded = False
+        with ExitStack() as stack:
+            root, _auth, owner = auth_owner._owner_directories(store_path, stack, create=False)
+            stage_fd, _token, marker = auth_owner._validated_stage(
+                stage_path, store_path, root, owner, stack,
+            )
+            try:
+                candidate = os.open("auth.json", auth_owner._FILE_FLAGS, dir_fd=stage_fd)
+            except FileNotFoundError:
+                seeded = False
+            else:
+                stack.callback(os.close, candidate)
+                identity = auth_owner._identity(candidate)
+                baseline = marker["baseline"]
+                if (baseline is None or identity["sha256"] != baseline["sha256"]
+                    or identity["size"] != baseline["size"]):
+                    raise auth_owner.AuthOwnerError("Codex conformance credential stage changed")
+                seeded = True
+        if not seeded:
+            auth_owner._seed_stage_from_canonical(stage_path, store_path)
+    elif os.path.isfile(auth_source):
         os.symlink(auth_source, os.path.join(home, auth_name))
 
     if vendor == "codex":
@@ -314,8 +353,10 @@ def _prepare_codex_hooks(binary: str, home: str, workdir: str) -> tuple[bool, st
 
 _LAST_TURN: dict[str, object] = {}
 
-# Phrases the vendors use, matched only to classify. Nothing from the text is stored or
-# printed: the record keeps one word from REASONS and the status that goes with it.
+_ENVIRONMENT_SCAN_LIMIT = 8192
+
+# Legacy non-JSON phrases, matched only to classify. Parsed structured stdout is never
+# phrase-scanned; stderr is bounded. Nothing from the text is stored or printed.
 _ENVIRONMENT_PHRASES = (
     ("usage limit", "vendor-quota-exhausted"),
     ("quota", "vendor-quota-exhausted"),
@@ -331,11 +372,37 @@ _ENVIRONMENT_PHRASES = (
 )
 
 
-def _environment_reason(text: str, returncode: int) -> str:
+def _environment_reason(stdout: str, stderr: str, returncode: int) -> str:
     """One word when the environment stopped the turn, empty when it did not."""
     if returncode == 0:
         return ""
-    lowered = (text or "").lower()
+    stripped = (stdout or "").strip()
+    structured = False
+    results: list[object] = []
+    legacy_lines: list[str] = []
+    try:
+        results = [json.loads(stripped)]
+        structured = True
+    except (json.JSONDecodeError, TypeError):
+        for line in (line for line in stripped.splitlines() if line.strip()):
+            try:
+                results.append(json.loads(line))
+                structured = True
+            except (json.JSONDecodeError, TypeError):
+                legacy_lines.append(line)
+    for result in results:
+        if (isinstance(result, dict)
+                and result.get("type") == "result"
+                and result.get("subtype") == "success"
+                and result.get("is_error") is True
+                and result.get("terminal_reason") == "api_error"):
+            return "vendor-api-error"
+    if structured:
+        legacy_stdout = "\n".join(legacy_lines)[:_ENVIRONMENT_SCAN_LIMIT]
+    else:
+        legacy_stdout = (stdout or "")[:_ENVIRONMENT_SCAN_LIMIT]
+    bounded_stderr = (stderr or "")[:_ENVIRONMENT_SCAN_LIMIT]
+    lowered = (legacy_stdout + bounded_stderr).lower()
     for phrase, reason in _ENVIRONMENT_PHRASES:
         if phrase in lowered:
             return reason
@@ -355,11 +422,15 @@ def _vendor_turn(
     env = dict(os.environ)
     if vendor == "claude":
         env["CLAUDE_CONFIG_DIR"] = home
-        argv = [binary, "-p", "--output-format", "json", "--permission-mode", "dontAsk"]
-        argv.extend(["--allowedTools", allowed_tool])
+        # `--allowedTools <tools...>` is variadic. A positional prompt after it is
+        # consumed as another tool name, so keep the prompt before that final option.
+        argv = [
+            binary, "-p", prompt, "--output-format", "json",
+            "--permission-mode", "dontAsk",
+        ]
         if mcp_config:
             argv.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
-        argv.append(prompt)
+        argv.extend(["--allowedTools", allowed_tool])
     else:
         env["CODEX_HOME"] = home
         # Measured against the pinned 0.154.0 rather than assumed: `codex exec` has no
@@ -386,7 +457,7 @@ def _vendor_turn(
     # honours a hook decision, and recording them as failures both hides the real state
     # and blocks an install that has nothing wrong with it.
     _LAST_TURN["environment"] = _environment_reason(
-        (result.stdout or "") + (result.stderr or ""), result.returncode)
+        result.stdout, result.stderr, result.returncode)
     _LAST_TURN["rejected_argv"] = bool(
         result.returncode != 0
         and ("unexpected argument" in (result.stderr or "")
@@ -398,6 +469,11 @@ def _vendor_turn(
 
 def _observed(marker: str) -> bool:
     return os.path.isfile(marker) and os.path.getsize(marker) > 0
+
+
+def _record_dispatch_observed(observed: bool) -> None:
+    _LAST_TURN["dispatch_observed"] = bool(
+        _LAST_TURN.get("dispatch_observed", False) or observed)
 
 
 def _configure_mcp(home: str, vendor: str, marker: str) -> str | None:
@@ -413,6 +489,9 @@ def _configure_mcp(home: str, vendor: str, marker: str) -> str | None:
         handle.write("\n[mcp_servers.ihar-conformance]\n")
         handle.write('command = "python3"\n')
         handle.write(f"args = {json.dumps(['-I', script, marker])}\n")
+        # The isolated probe must reach tools/call without an interactive prompt.
+        # Codex otherwise treats an unannotated MCP tool as approval-required.
+        handle.write('default_tools_approval_mode = "approve"\n')
     return None
 
 
@@ -421,14 +500,13 @@ def _configure_mcp(home: str, vendor: str, marker: str) -> str | None:
 # not dynamic, and it is the difference between "failed" and "failed because the binary
 # rejected our argv" — which is what two sessions of looking at authentication cost.
 REASONS = (
-    "vendor-quota-exhausted",
-    "vendor-unauthenticated",
-    "vendor-unreachable",
+    *sorted(ENVIRONMENT_REASONS),
     "vendor-rejected-argv",
     "vendor-exited-nonzero",
     "hook-never-fired",
     "sentinel-missing",
     "decision-not-recorded",
+    "rewrite-not-applied",
     "timeout",
     "case-raised",
     "unclassified",
@@ -444,6 +522,7 @@ _REASON_PHRASES = (
     ("did not run", "sentinel-missing"),
     ("did not receive", "sentinel-missing"),
     ("without recording an explicit deny", "decision-not-recorded"),
+    ("executed the unrewritten secret", "rewrite-not-applied"),
     ("raised", "case-raised"),
 )
 
@@ -472,20 +551,23 @@ def _run_live_case(vendor, binary, home, workdir, name):
     allowed_tool = "Bash"
 
     if name == "deny-blocks-the-tool":
-        sensitive = os.path.join(workdir, ".ssh", "id_rsa")
-        os.makedirs(os.path.dirname(sensitive), exist_ok=True)
-        _remove_probe(sensitive)
+        # A harmless target: Claude 2.1.274 refuses to overwrite a credential-like path
+        # such as `.ssh/id_rsa` before any tool dispatch, so the hook would never fire.
         _add_probe_hook(home, vendor, "PreToolUse", "deny", observed, matcher="Bash")
         prompt = (
             "Use the Bash tool exactly once and run this command verbatim; do not use another "
-            f"tool: printf denied > {shlex.quote(sensitive)}"
+            f"tool: printf denied > {shlex.quote(target)}"
         )
-        target = sensitive
     elif name == "rewrite-reaches-the-tool":
         _add_probe_hook(home, vendor, "PreToolUse", "observe", observed, matcher="Bash")
+        # Claude 2.1.274 refused about one turn in four to write a bare key-shaped
+        # string; saying what the token is keeps the turn about the hook.
         prompt = (
-            "Use the Bash tool exactly once and run this command verbatim; do not use another "
-            f"tool: printf '%s' '{_FAKE_SECRET}' > {shlex.quote(target)}"
+            "This is an automated hook conformance test in a disposable directory. The "
+            "token below is synthetic and non-functional, not a real credential, and a "
+            "PreToolUse hook is expected to redact it before the command runs. Use the Bash "
+            "tool exactly once and run this command verbatim; do not use another tool: "
+            f"printf '%s' '{_FAKE_SECRET}' > {shlex.quote(target)}"
         )
     elif name == "session-start-context":
         _add_probe_hook(home, vendor, "SessionStart", "context", observed)
@@ -496,12 +578,19 @@ def _run_live_case(vendor, binary, home, workdir, name):
     elif name == "mcp-matcher-fires":
         called = os.path.join(workdir, ".mcp-tool-called")
         _remove_probe(called)
+        # Codex normalizes model-visible MCP namespaces to the Responses API name
+        # alphabet before dispatch; Claude keeps the configured server spelling.
+        mcp_tool = (
+            "mcp__ihar_conformance__prove"
+            if vendor == "codex"
+            else "mcp__ihar-conformance__prove"
+        )
         _add_probe_hook(
             home, vendor, "PreToolUse", "observe", observed,
-            matcher="mcp__ihar-conformance__prove",
+            matcher=mcp_tool,
         )
         mcp_config = _configure_mcp(home, vendor, called)
-        allowed_tool = "mcp__ihar-conformance__prove"
+        allowed_tool = mcp_tool
         prompt = (
             "Call the ihar-conformance MCP server's prove tool exactly once with an empty object, "
             "then stop."
@@ -532,6 +621,18 @@ def _run_live_case(vendor, binary, home, workdir, name):
     except subprocess.TimeoutExpired:
         return "failed", "the vendor turn exceeded 180 seconds"
 
+    if name == "session-start-context":
+        # SessionStart runs before the model/API turn. Its marker proves that the hook
+        # loaded, not that its context reached the model or that Bash was dispatched.
+        _record_dispatch_observed(os.path.exists(target))
+    else:
+        _record_dispatch_observed(
+            _observed(observed)
+            or os.path.exists(target)
+            or os.path.exists(observed + ".decision")
+            or os.path.exists(observed + ".completed")
+            or os.path.exists(observed + ".ended")
+        )
     if not _observed(observed):
         return "failed", f"the vendor exited {result.returncode} without firing the probe hook"
     if name != "timeout-behaviour" and result.returncode != 0:
@@ -584,6 +685,8 @@ def _run_live_case(vendor, binary, home, workdir, name):
     except (OSError, ValueError) as error:
         return "failed", f"the timeout probe did not record termination: {error}"
     maximum = _HOOK_TIMEOUT_SECONDS + _HOOK_TIMEOUT_TOLERANCE_SECONDS
+    if elapsed < _HOOK_TIMEOUT_SECONDS - 0.1:
+        return "failed", f"the timeout probe ended after {elapsed:.2f}s, before the limit"
     if elapsed > maximum:
         return "failed", f"the hook timeout took {elapsed:.2f}s, above {maximum:.2f}s"
     outcome = "executed" if os.path.isfile(target) else "blocked"
@@ -606,14 +709,17 @@ def _run_claude_shell(binary: str, home: str, workdir: str, command: str):
         f"<ihar-conformance-command>{command}</ihar-conformance-command>"
     )
     env = {**os.environ, "CLAUDE_CONFIG_DIR": home}
-    return subprocess.run(
-        [binary, "-p", "--output-format", "json", "--allowedTools", "Bash", prompt],
+    result = subprocess.run(
+        [binary, "-p", prompt, "--output-format", "json", "--allowedTools", "Bash"],
         cwd=workdir,
         env=env,
         capture_output=True,
         text=True,
         timeout=120,
     )
+    _LAST_TURN["environment"] = _environment_reason(
+        result.stdout, result.stderr, result.returncode)
+    return result
 
 
 def _remove_probe(path: str) -> None:
@@ -661,6 +767,7 @@ def _case_sandbox_protected_write(vendor, binary, home, workdir, kind):
                 command = f"python3 -c {shlex.quote(code)}"
 
             result = _run_claude_shell(binary, home, workdir, command)
+            _record_dispatch_observed(any(os.path.exists(path) for path in paths))
             if result.returncode != 0:
                 return "failed", f"Claude exited {result.returncode} while probing {root}"
             if not os.path.isfile(before):
@@ -698,6 +805,7 @@ def case_sandbox_workspace_write(vendor, binary, home, workdir):
     try:
         command = f"printf 'ihar-conformance\\n' > {shlex.quote(target)}"
         result = _run_claude_shell(binary, home, workdir, command)
+        _record_dispatch_observed(os.path.exists(target))
         if result.returncode != 0:
             return "failed", f"Claude exited {result.returncode} during the workspace probe"
         try:
@@ -778,6 +886,7 @@ def run(
     auth_store: str,
     lockfile_path: str,
     protected_store: str | None = None,
+    codex_home: str | None = None,
 ) -> dict:
     """Run staged hooks/binary while probing denial against the final store."""
     version = vendor_version(vendor, binary)
@@ -793,8 +902,11 @@ def run(
     }
 
     workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
-    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    home = (codex_home or str(auth_owner.stage(auth_store)) if vendor == "codex"
+            else tempfile.mkdtemp(prefix="ihar-conf-home-"))
+    owns_codex_home = vendor == "codex" and codex_home is None
     state_root = tempfile.mkdtemp(prefix="ihar-conf-state-")
+    unproven = True
     try:
         protected_roots = [protected_store or store, state_root, home] \
             if vendor == "claude" else None
@@ -805,16 +917,23 @@ def run(
         for name, case in CASES.items():
             if name in CLAUDE_ONLY_CASES and vendor != "claude":
                 continue
+            _LAST_TURN.clear()
             try:
                 status, detail = case(vendor, binary, home, workdir)
             except Exception:                      # noqa: BLE001
                 status, detail = "failed", "the case raised"
+            environment = str(_LAST_TURN.get("environment") or "")
+            dispatch_absent = _LAST_TURN.get("dispatch_observed") is False
+            if status == "failed" and environment and dispatch_absent:
+                status, reason = "unmeasured", environment
+            else:
+                reason = _reason_for(status, detail)
             entry = {"status": status, "detail": f"{name}: {status}"}
-            reason = _reason_for(status, detail)
             if reason:
                 entry["reason"] = reason
             record["cases"][name] = entry
         for name in sorted(LIVE_CASES):
+            _LAST_TURN.clear()
             rejected = False
             environment = ""
             try:
@@ -823,7 +942,8 @@ def run(
                 environment = str(_LAST_TURN.get("environment") or "")
             except Exception:                      # noqa: BLE001
                 status, detail = "failed", "the case raised"
-            if status == "failed" and environment:
+            dispatch_absent = _LAST_TURN.get("dispatch_observed") is False
+            if status == "failed" and environment and dispatch_absent:
                 # Unmeasured, not failed: nothing here says the vendor mishandled a hook.
                 status, reason = "unmeasured", environment
             else:
@@ -832,12 +952,46 @@ def run(
             if reason:
                 entry["reason"] = reason
             record["cases"][name] = entry
+        unproven = any(case["status"] != "passed" for case in record["cases"].values())
     finally:
-        shutil.rmtree(home, ignore_errors=True)
+        if owns_codex_home:
+            from ..codex import guardian
+            guardian._cleanup_auth_stage(
+                Path(auth_store), Path(home), retain_changed=unproven,
+            )
+        elif vendor != "codex":
+            shutil.rmtree(home, ignore_errors=True)
         shutil.rmtree(workdir, ignore_errors=True)
         shutil.rmtree(state_root, ignore_errors=True)
 
     return record
+
+
+def _begin_codex_conformance(auth_store: str) -> str:
+    from ..codex import guardian
+    guard_fd = os.environ.get("IHAR_GUARD_FD")
+    if guard_fd is None:
+        raise auth_owner.AuthOwnerError("Codex guardian admission is missing")
+    guardian.request(int(guard_fd), "admit", {}, store=Path(auth_store))
+    answer = guardian.request(
+        int(guard_fd), "auth-stage", {"verb": "status"}, store=Path(auth_store),
+    )
+    stage = answer.get("stage")
+    if not isinstance(stage, str):
+        raise auth_owner.AuthOwnerError("Codex conformance stage is invalid")
+    return stage
+
+
+def _finish_codex_conformance(auth_store: str, stage: str, unproven: bool) -> None:
+    from ..codex import guardian
+    guard_fd = os.environ.get("IHAR_GUARD_FD")
+    if guard_fd is None:
+        raise auth_owner.AuthOwnerError("Codex guardian admission is missing")
+    operation = "auth-abort" if unproven else "auth-finish"
+    guardian.request(
+        int(guard_fd), operation, {"stage": stage, "verb": "status"},
+        store=Path(auth_store),
+    )
 
 
 def main(argv: list[str]) -> int:
@@ -874,34 +1028,45 @@ def main(argv: list[str]) -> int:
             or any(option != "--json" for option in options):
         print(__doc__, file=sys.stderr)
         return 2
+    codex_stage = None
     try:
+        if vendor == "codex":
+            codex_stage = _begin_codex_conformance(auth_store)
         record = run(
             vendor, binary, store, manifest_path,
             auth_store=auth_store,
             lockfile_path=lockfile_path,
             protected_store=protected_store,
+            codex_home=codex_stage,
         )
         target = os.path.join(store, "verification",
                               f"{vendor}-{version_slug(record['version'])}.json")
         os.makedirs(os.path.dirname(target), exist_ok=True)
         jsonio.write("conformance", target, record, mode=0o644)
-    except (RuntimeError, OSError, jsonio.SchemaError) as error:
+        unproven = sorted(name for name in REQUIRED_CASES[vendor]
+                          if record["cases"][name]["status"] != "passed")
+        if codex_stage is not None:
+            _finish_codex_conformance(auth_store, codex_stage, bool(unproven))
+            codex_stage = None
+    except (RuntimeError, OSError, ValueError, jsonio.SchemaError) as error:
+        if codex_stage is not None:
+            try:
+                _finish_codex_conformance(auth_store, codex_stage, True)
+            except (RuntimeError, OSError, ValueError):
+                pass
         print(f"ihar: conformance setup failed for {vendor}: {type(error).__name__}",
               file=sys.stderr)
         return 3
 
-    unproven = sorted(name for name in REQUIRED_CASES[vendor]
-                      if record["cases"][name]["status"] != "passed")
-    failed = unproven
     if "--json" in options:
         print(json.dumps(record, indent=2, sort_keys=True))
     else:
-        for name in failed:
+        for name in unproven:
             # One word from a closed set, never a sentence and never vendor output.
             case = record["cases"][name]
             reason = case.get("reason")
             print(f"{case['status']} {name}" + (f" ({reason})" if reason else ""))
-    return 1 if failed else 0
+    return 1 if unproven else 0
 
 
 if __name__ == "__main__":

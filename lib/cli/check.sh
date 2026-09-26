@@ -7,6 +7,10 @@ ihar_check_receipt_status() { # <vendor> <binary>
 
 ihar_check_conformance_status() { # <vendor> <binary>
   local vendor="$1" binary="$2" record
+  if [[ "$vendor" == codex && "${IHAR_CHECK_CODEX_PROBES:-true}" != true ]]; then
+    printf 'not-installed\n'
+    return 0
+  fi
   [[ -x "$binary" ]] || { printf 'not-installed\n'; return 0; }
   record="$IHAR_STORE/verification/$vendor-$(ihar_version_slug "$binary").json"
   [[ -f "$record" ]] || { printf 'unproven\n'; return 0; }
@@ -19,22 +23,26 @@ ihar_check_conformance_status() { # <vendor> <binary>
 }
 
 _ihar_check_config_hash() { # <vendor>
-  local vendor="$1"
+  local vendor="$1" mcp_identity
+  mcp_identity="$(ihar_effective_mcp_identity "$vendor")" || return
   ihar_config_hash \
     "$IHAR_PROFILE" "$IHAR_PROFILE_MASKING_LEVEL" "$IHAR_PROFILE_GATEWAY" \
     "$IHAR_PROFILE_SANDBOX" "$IHAR_PROFILE_MCP_STRICT" \
-    "$(ihar_manifest_digest)" "$(ihar_registry_digest)" "$(ihar_vendor_version "$vendor")"
+    "$(ihar_manifest_digest)" "$(ihar_registry_digest)" "$(ihar_vendor_version "$vendor")" \
+    "$mcp_identity"
 }
 
 _ihar_check_runtime() { # <vendor> [state]
-  local vendor="$1" state="${2:-$(_ihar_project_state)}"
-  printf '%s/r/%s/%s\n' "$state" "$(_ihar_check_config_hash "$vendor")" "$vendor"
+  local vendor="$1" state="${2:-$(_ihar_project_state)}" hash
+  hash="$(_ihar_check_config_hash "$vendor")" || return
+  printf '%s/r/%s/%s\n' "$state" "$hash" "$vendor"
 }
 
 # ihar_check_collect <target-json> — gather every fact exactly once.
 ihar_check_collect() {
-  local target="$1" vendor binary capabilities notes
+  local target="$1" vendor binary capabilities notes runtime
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
+  IHAR_STATE="$(_ihar_project_state)"; export IHAR_STATE
   ihar_env_prepare claude
 
   _IHAR_CHECK_MASK_ENGINE="$(ihar_python ihar.mask.describe "$IHAR_GATEWAY_MASKING_LEVEL" 2>/dev/null || echo unknown)"
@@ -56,7 +64,8 @@ ihar_check_collect() {
       "$(ihar_check_receipt_status "$vendor" "$binary")"
     printf -v "_IHAR_CHECK_${vendor^^}_CONFORMANCE" '%s' \
       "$(ihar_check_conformance_status "$vendor" "$binary")"
-    printf -v "_IHAR_CHECK_${vendor^^}_RUNTIME" '%s' "$(_ihar_check_runtime "$vendor")"
+    runtime="$(_ihar_check_runtime "$vendor")" || return
+    printf -v "_IHAR_CHECK_${vendor^^}_RUNTIME" '%s' "$runtime"
     printf -v "_IHAR_CHECK_${vendor^^}_BINARY" '%s' "$binary"
     printf -v "_IHAR_CHECK_MCP_${vendor^^}" '%s' "$notes"
   done
@@ -84,13 +93,17 @@ _ihar_check_file_matches() { # <desired> <active> <relative>
       <(sed '/# ihar:hook-trust:start/,$d' "$active" | _ihar_rtrim_blank)
     return $?
   fi
+  if [[ "$relative" == settings.json ]]; then
+    ihar_python ihar.render.claude_compare "$desired" "$active"
+    return $?
+  fi
   cmp -s -- "$desired" "$active"
 }
 
 # ihar_check_diff — compare temporary desired renders with active homes.
 ihar_check_diff() (
   ihar_profile_resolve "$IHAR_FLAG_PROFILE"
-  local temp="" state vendor desired active file relative found=false gateway_key port
+  local temp="" state vendor desired active file relative difference category found=false gateway_key port auth_diagnostic
   trap '[[ -z "$temp" ]] || rm -rf -- "$temp"' EXIT
   temp="$(mktemp -d "${TMPDIR:-/tmp}/ihar-check-diff-XXXXXX")" || return 1
   state="$(_ihar_project_state)"
@@ -110,14 +123,39 @@ ihar_check_diff() (
   for vendor in claude codex; do
     desired="$temp/$vendor"
     ihar_render_all "$vendor" "$desired"
-    active="$(_ihar_check_runtime "$vendor" "$state")"
+    active="$(_ihar_check_runtime "$vendor" "$state")" || return
+    printf '%s selected runtime generation %s (effective-mcp-identity included)\n' \
+      "$vendor" "$(basename "$(dirname "$active")")"
+    if [[ "$vendor" == codex && -d "$active" ]]; then
+      auth_diagnostic="$(ihar_python ihar.check_result auth-diff "$active" "$IHAR_STORE")" || return
+      printf '%s\n' "$auth_diagnostic"
+      case "$auth_diagnostic" in
+        'codex mutable-link: valid; auth-owner: no recorded owner'|'codex mutable-link: valid; auth-owner: current command') ;;
+        *) found=true ;;
+      esac
+    fi
     while IFS= read -r -d '' file; do
       relative="${file#"$desired"/}"
       if [[ -z "$active" || ! -f "$active/$relative" ]]; then
-        printf '%s %s missing from active runtime\n' "$vendor" "$relative"
+        category=managed-setting-drift
+        if [[ "$relative" == mcp/ihar.json ]]; then
+          category=effective-mcp-identity
+        elif [[ "$vendor" == codex && "$relative" == config.toml ]]; then
+          category=rendered-config-missing
+        fi
+        printf '%s %s missing from selected runtime (%s)\n' "$vendor" "$relative" \
+          "$category"
         found=true
-      elif ! _ihar_check_file_matches "$file" "$active/$relative" "$relative"; then
-        printf '%s %s differs from active runtime\n' "$vendor" "$relative"
+      elif ! difference="$(_ihar_check_file_matches "$file" "$active/$relative" "$relative")"; then
+        if [[ "$relative" == settings.json ]]; then
+          printf '%s %s managed-setting-drift at %s\n' "$vendor" "$relative" "${difference:-root}"
+        elif [[ "$vendor" == codex && "$relative" == config.toml ]]; then
+          category="$(ihar_python ihar.check_result config-diff-category "$file" "$active/$relative")" || return
+          printf '%s %s differs from selected runtime (%s)\n' "$vendor" "$relative" "$category"
+        else
+          printf '%s %s differs from selected runtime (%s)\n' "$vendor" "$relative" \
+            "$([[ "$relative" == mcp/ihar.json ]] && printf effective-mcp-identity || printf managed-setting-drift)"
+        fi
         found=true
       fi
     done < <(find "$desired" -type f -print0 | sort -z)

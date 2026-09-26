@@ -33,6 +33,7 @@ source "$_IHAR_LIB/store/install.sh"
 source "$_IHAR_LIB/render/hooks.sh"
 source "$_IHAR_LIB/render/config.sh"
 source "$_IHAR_LIB/codex/daemon.sh"
+source "$_IHAR_LIB/codex/auth.sh"
 source "$_IHAR_LIB/sessions/sessions.sh"
 source "$_IHAR_LIB/handoff/handoff.sh"
 source "$_IHAR_LIB/console/console.sh"
@@ -58,6 +59,72 @@ ihar_main() {
 
   ihar_args_parse "$@"
   ihar_guard_undelivered
+  if [[ "$IHAR_COMMAND" == codex && "$IHAR_FLAG_WEB" == true &&
+        -n "$IHAR_CODEX_AUTH_VERB" ]]; then
+    ihar_die 2 "--web cannot be combined with Codex authentication passthrough"
+  fi
+  local needs_codex_guard=false joins_daemon_owner=false
+  case "$IHAR_COMMAND:${IHAR_SUBCOMMAND:-}" in
+    codex:*)
+      needs_codex_guard=true
+      [[ "$IHAR_FLAG_WEB" == true ]] && joins_daemon_owner=true
+      ;;
+    acp:codex) needs_codex_guard=true ;;
+    web:codex)
+      needs_codex_guard=true
+      joins_daemon_owner=true
+      ;;
+    install:*|switch:*) needs_codex_guard=true ;;
+    update:*)
+      needs_codex_guard=true
+      joins_daemon_owner=true
+      ;;
+    check:*)
+      if [[ -x "$IHAR_CODEX_BIN" ]]; then
+        needs_codex_guard=true
+        IHAR_CHECK_CODEX_PROBES=true
+      else
+        # Keep this invocation metadata-only even if Codex appears after routing.
+        IHAR_CHECK_CODEX_PROBES=false
+      fi
+      export IHAR_CHECK_CODEX_PROBES
+      ;;
+    claude:*|acp:claude|web:claude)
+      # A microVM launch also renders, seals, and verifies the Codex runtime.
+      ihar_profile_resolve "$IHAR_FLAG_PROFILE"
+      [[ "$IHAR_PROFILE_SANDBOX" == microvm ]] && needs_codex_guard=true
+      ;;
+    sessions:*)
+      if ihar_sessions_needs_codex_guard; then
+        needs_codex_guard=true
+      fi
+      ;;
+  esac
+  if [[ "$needs_codex_guard" == true ]]; then
+    [[ -z "${IHAR_CODEX_GUARD_FD:-}" ]] \
+      || ihar_die 3 "Codex guardian admission cannot be verified"
+    if [[ -n "${IHAR_GUARD_FD:-}" ]]; then
+      ihar_python ihar.codex.guardian admit "$IHAR_GUARD_FD" \
+        || ihar_die 3 "Codex guardian admission cannot be verified"
+    else
+      if [[ "$joins_daemon_owner" == true ]]; then
+        local owner_status=0 owner_error="" joined_status=0
+        owner_error="$(ihar_python ihar.codex.guardian owner-present "$IHAR_STORE" 2>&1)" \
+          || owner_status=$?
+        case "$owner_status" in
+          0)
+            ihar_python ihar.codex.guardian join "$IHAR_STORE" "$PWD" -- \
+              "$(readlink -f "$_IHAR_ENTRY")" "$@" || joined_status=$?
+            return "$joined_status"
+            ;;
+          1) ;;
+          *) ihar_die 3 "Codex daemon guardian cannot be verified: ${owner_error:-no detail}" ;;
+        esac
+      fi
+      ihar_python ihar.codex.guardian supervise "$IHAR_STORE" -- "$(readlink -f "$_IHAR_ENTRY")" "$@"
+      return $?
+    fi
+  fi
   case "$IHAR_COMMAND" in
     help)         ihar_usage ;;
     claude|codex) ihar_cmd_launch "$IHAR_COMMAND" ;;

@@ -59,6 +59,12 @@ assert_exit "a profile needing an undelivered gateway is fail-closed" 3 \
   bash -c "cd '$PROJECT' && IHAR_STORE='$IHAR_STORE' IHAR_STATE_ROOT='$IHAR_STATE_ROOT' \
            '$ROOT/ihar.sh' --profile protected --dry-run claude"
 
+isolated_codex_status=0
+isolated_codex_output="$(ihar --profile isolated codex)" || isolated_codex_status=$?
+assert_eq "isolated Codex refuses before an unleased guest can start" "3" "$isolated_codex_status"
+assert_contains "isolated refusal names the earlier receipt gate" "$isolated_codex_output" \
+  "requires verified install receipt evidence"
+
 # --- the configuration hash reaches the runtime home ---------------------------------
 
 first="$(ihar --dry-run claude | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
@@ -68,6 +74,36 @@ assert_eq "the same configuration resolves to the same home" "$first" "$second"
 claude_home="$(ihar --dry-run claude | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
 codex_home="$(ihar --dry-run codex | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
 assert_exit "each vendor gets its own runtime home" 1 test "$claude_home" = "$codex_home"
+
+# A change in selected MCP servers chooses a new immutable home for each vendor.
+# The variable's value is forwarded by name, so changing only that value does not.
+unset IWIKI_REMOTE_TOKEN IHAR_IWIKI_REMOTE_URL
+for vendor in claude codex; do
+  absent_home="$(ihar --dry-run "$vendor" | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
+  if [[ "$vendor" == claude ]]; then
+    old_render=settings.json
+  else
+    old_render=config.toml
+  fi
+  absent_inode="$(stat -c '%i' "$absent_home/$old_render")"
+  enabled_home="$(IWIKI_REMOTE_TOKEN=synthetic \
+    IHAR_IWIKI_REMOTE_URL=https://wiki.example/mcp \
+    ihar --dry-run "$vendor" | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
+  changed_value_home="$(IWIKI_REMOTE_TOKEN=other-synthetic \
+    IHAR_IWIKI_REMOTE_URL=https://wiki.example/mcp \
+    ihar --dry-run "$vendor" | sed -n 's/.*"runtime": "\(.*\)".*/\1/p')"
+  assert_exit "$vendor selected MCP server chooses a new runtime" 1 \
+    test "$absent_home" = "$enabled_home"
+  assert_eq "$vendor token value reuses its runtime" "$enabled_home" "$changed_value_home"
+  assert_exit "$vendor old generation remains available" 0 test -d "$absent_home"
+  assert_eq "$vendor old generation is not rewritten" "$absent_inode" \
+    "$(stat -c '%i' "$absent_home/$old_render")"
+done
+enabled_diff="$(IWIKI_REMOTE_TOKEN=synthetic \
+  IHAR_IWIKI_REMOTE_URL=https://wiki.example/mcp ihar check --diff)"
+assert_contains "check selects the same MCP generations as launch" "$enabled_diff" "no differences"
+assert_contains "check reports selected MCP-bound generation" "$enabled_diff" \
+  "effective-mcp-identity included"
 
 # --- the project's own configuration is what is read ------------------------------------
 #
@@ -128,5 +164,43 @@ receipt_out="$(cd "$PROJECT" && \
 assert_eq "an enforced receipt mismatch exits fail-closed" "3" "$receipt_status"
 assert_contains "the launch names receipt verification" "$receipt_out" "install receipt"
 assert_exit "receipt failure occurs before the vendor starts" 1 test -e "$START_MARKER"
+
+# Account verbs bypass runtime materialization and use the protected staging home.
+FAKE_CODEX_AUTH="$IHAR_TEST_TMP/fake-auth-codex"
+AUTH_STARTS="$IHAR_TEST_TMP/auth-starts"
+cat > "$FAKE_CODEX_AUTH" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == --version ]]; then printf 'codex-cli 0.154.0\n'; exit 0; fi
+if [[ "${1:-}" == login && "${2:-}" == status ]]; then
+  [[ "$(cat "$CODEX_HOME/auth.json")" == synthetic-first ]]
+  exit $?
+fi
+printf 'started\n' >> "$AUTH_STARTS"
+printf '%s' "$IHAR_TEST_CREDENTIAL" > "$CODEX_HOME/auth.json"
+SH
+chmod +x "$FAKE_CODEX_AUTH"
+export AUTH_STARTS
+auth_status=0
+IHAR_CODEX_BIN="$FAKE_CODEX_AUTH" IHAR_TEST_CREDENTIAL=synthetic-first \
+  ihar codex -- login >/dev/null 2>&1 || auth_status=$?
+assert_eq "first Codex login publishes through protected staging" "0" "$auth_status"
+assert_eq "the shared canonical receives the staged credential" "synthetic-first" \
+  "$(cat "$IHAR_STORE/auth/codex/auth.json")"
+status_status=0
+IHAR_CODEX_BIN="$FAKE_CODEX_AUTH" ihar codex -- login status >/dev/null 2>&1 || status_status=$?
+assert_eq "Codex login status reads protected canonical copy" "0" "$status_status"
+reauth_status=0
+IHAR_CODEX_BIN="$FAKE_CODEX_AUTH" IHAR_TEST_CREDENTIAL=synthetic-second \
+  ihar --assume-yes codex -- login >/dev/null 2>&1 || reauth_status=$?
+assert_eq "assume-yes cannot approve shared credential replacement" "3" "$reauth_status"
+assert_eq "unapproved reauthentication preserves canonical bytes" "synthetic-first" \
+  "$(cat "$IHAR_STORE/auth/codex/auth.json")"
+assert_eq "unapproved reauthentication never starts vendor" "1" \
+  "$(wc -l < "$AUTH_STARTS")"
+logout_status=0
+IHAR_CODEX_BIN="$FAKE_CODEX_AUTH" ihar --assume-yes codex -- logout >/dev/null 2>&1 || logout_status=$?
+assert_eq "assume-yes cannot approve shared logout" "3" "$logout_status"
+assert_eq "unapproved logout preserves canonical bytes" "synthetic-first" \
+  "$(cat "$IHAR_STORE/auth/codex/auth.json")"
 
 finish
