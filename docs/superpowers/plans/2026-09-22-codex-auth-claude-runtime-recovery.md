@@ -13,12 +13,15 @@ chain:
   intent: docs/superpowers/intents/2026-09-21-codex-auth-claude-runtime-recovery-intent.md
   spec: docs/superpowers/specs/2026-09-22-codex-auth-claude-runtime-recovery-design.md
 result_check:
-  verdict: needs_work
+  verdict: OK
   source: plan
   plan_hash: 85a78a76c93c8f3c
-  last_run: 2026-09-23
+  last_run: 2026-09-26
   reviewed: true
   docs_checked: true
+  revision: b0f1716
+  warnings: 1
+  graph: graph_unavailable
 ---
 
 # Codex Authentication and Claude Runtime Recovery Implementation Plan
