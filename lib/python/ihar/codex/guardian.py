@@ -1507,19 +1507,20 @@ def run(store: Path, argv: list[str]) -> int:
                                 guest_resources=guest_resources)
                     finally:
                         connection.close()
-                if listener in readable:
+                # Drain the whole backlog: one accept per iteration made the excess
+                # client wait behind every pending one at the loop's per-pass cost.
+                while listener in readable:
                     try:
                         connection, _ = listener.accept()
                     except BlockingIOError:
-                        pass
+                        break
+                    connection.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+                    connection.setblocking(False)
+                    if len(pending_control) >= _MAX_PENDING_CONTROL_CLIENTS:
+                        connection.close()
                     else:
-                        connection.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
-                        connection.setblocking(False)
-                        if len(pending_control) >= _MAX_PENDING_CONTROL_CLIENTS:
-                            connection.close()
-                        else:
-                            pending_control[connection] = (time.monotonic()
-                                                           + _CONTROL_CLIENT_TTL)
+                        pending_control[connection] = (time.monotonic()
+                                                       + _CONTROL_CLIENT_TTL)
                 for entry in joined.values():
                     connection = entry["channel"]
                     if not entry["channel_open"] or connection not in readable:
