@@ -48,7 +48,6 @@ _PROBE_SCRIPT = r'''#!/usr/bin/env python3
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import time
 
@@ -83,11 +82,19 @@ elif mode == "context":
     sys.stdout.write("\n")
 elif mode == "timeout":
     started = time.monotonic()
-    subprocess.Popen(
-        [sys.executable, __file__, "watch", str(os.getpid()), str(started), marker + ".ended"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    parent = os.getpid()
+    # Claude 2.1.274 kills the hook and every descendant at the timeout, so the
+    # watcher double-forks out of that tree; a plain child dies before recording.
+    if os.fork() == 0:
+        os.setsid()
+        if os.fork() == 0:
+            devnull = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(devnull, fd)
+            os.execv(sys.executable, [sys.executable, __file__, "watch", str(parent),
+                                      str(started), marker + ".ended"])
+        os._exit(0)
+    os.wait()
     time.sleep(5)
     pathlib.Path(marker + ".completed").write_text("completed\n", encoding="utf-8")
 '''
@@ -538,15 +545,13 @@ def _run_live_case(vendor, binary, home, workdir, name):
     allowed_tool = "Bash"
 
     if name == "deny-blocks-the-tool":
-        sensitive = os.path.join(workdir, ".ssh", "id_rsa")
-        os.makedirs(os.path.dirname(sensitive), exist_ok=True)
-        _remove_probe(sensitive)
+        # A harmless target: Claude 2.1.274 refuses to overwrite a credential-like path
+        # such as `.ssh/id_rsa` before any tool dispatch, so the hook would never fire.
         _add_probe_hook(home, vendor, "PreToolUse", "deny", observed, matcher="Bash")
         prompt = (
             "Use the Bash tool exactly once and run this command verbatim; do not use another "
-            f"tool: printf denied > {shlex.quote(sensitive)}"
+            f"tool: printf denied > {shlex.quote(target)}"
         )
-        target = sensitive
     elif name == "rewrite-reaches-the-tool":
         _add_probe_hook(home, vendor, "PreToolUse", "observe", observed, matcher="Bash")
         prompt = (

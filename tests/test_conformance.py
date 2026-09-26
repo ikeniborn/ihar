@@ -12,10 +12,12 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -768,6 +770,84 @@ def test_deny_probe_returns_json_decision_with_success_status():
     output = json.loads(result.stdout)["hookSpecificOutput"]
     assert output["hookEventName"] == "PreToolUse"
     assert output["permissionDecision"] == "deny"
+
+
+def _descendants(pid):
+    children = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", encoding="utf-8") as handle:
+                fields = handle.read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        children.setdefault(int(fields[1]), []).append(int(entry))
+    found, pending = [], [pid]
+    while pending:
+        current = pending.pop()
+        for child in children.get(current, []):
+            found.append(child)
+            pending.append(child)
+    return found
+
+
+def test_timeout_watcher_survives_a_vendor_that_kills_the_hook_tree():
+    # Measured with Claude 2.1.274: at the hook timeout it kills the hook and every
+    # descendant, so a watcher left in that tree dies before recording termination.
+    with tempfile.TemporaryDirectory(prefix="ihar-conf-probe-") as raw:
+        script = Path(raw, "probe.py")
+        marker = Path(raw, "marker")
+        script.write_text(conformance._PROBE_SCRIPT, encoding="utf-8")
+        hook = subprocess.Popen(
+            [sys.executable, str(script), "timeout", str(marker)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        hook.stdin.write(b'{"hook_event_name":"PreToolUse"}')
+        hook.stdin.close()
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        time.sleep(1)
+        for pid in [hook.pid, *_descendants(hook.pid)]:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        hook.wait()
+        ended = Path(str(marker) + ".ended")
+        deadline = time.monotonic() + 3
+        while not ended.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ended.exists(), "the watcher died with the hook tree"
+        assert float(ended.read_text(encoding="utf-8")) < 2.5
+        assert not Path(str(marker) + ".completed").exists()
+
+
+def test_deny_probe_asks_for_a_harmless_command():
+    # Measured with Claude 2.1.274: a command that would overwrite `.ssh/id_rsa` is
+    # refused by the model before any tool dispatch, so the deny hook never fires.
+    store = _store()
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
+    real_turn = conformance._vendor_turn
+    prompts = []
+
+    def recording_turn(_vendor, _binary, _home, _workdir, prompt, **_kwargs):
+        prompts.append(prompt)
+        return conformance.subprocess.CompletedProcess([_binary], 0, "{}", "")
+
+    conformance._vendor_turn = recording_turn
+    try:
+        conformance._stage(store, MANIFEST, "claude", home, auth_store=store)
+        conformance._run_live_case("claude", "claude", home, workdir, "deny-blocks-the-tool")
+    finally:
+        conformance._vendor_turn = real_turn
+        for directory in (store, home, workdir):
+            shutil.rmtree(directory, ignore_errors=True)
+    assert len(prompts) == 1
+    assert ".ssh" not in prompts[0] and "id_rsa" not in prompts[0]
+    assert os.path.join(workdir, ".deny-blocks-the-tool-target") in prompts[0]
 
 
 def test_failed_rewrite_has_a_closed_reason():
