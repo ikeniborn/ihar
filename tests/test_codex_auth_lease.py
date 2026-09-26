@@ -1056,7 +1056,9 @@ class AuthLeaseTests(unittest.TestCase):
                     if target.startswith("socket:["):
                         found.append(target)
                 return found
-            for _ in range(50):
+            # A loaded host stretches each guardian pass past 0.2s; the claim is that the
+            # channel closes, not how fast, so wait up to 5s rather than 1s.
+            for _ in range(250):
                 if len(guardian_sockets()) == 1:
                     break
                 time.sleep(.02)
