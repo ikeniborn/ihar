@@ -905,6 +905,59 @@ def test_rewrite_probe_says_its_token_is_synthetic():
     assert conformance._FAKE_SECRET in prompts[0]
 
 
+def _scripted_turn(write):
+    """A vendor turn that fires the probe marker, then lets `write` add evidence."""
+    import shlex
+
+    def turn(_vendor, _binary, selected_home, _workdir, _prompt, **_kwargs):
+        block, _ = conformance._hook_block(selected_home, "claude")
+        command = next(
+            hook["command"] for group in block["PreToolUse"]
+            for hook in group["hooks"] if "conformance-probe.py" in hook["command"]
+        )
+        marker = shlex.split(command)[4]
+        Path(marker).write_text("invoked\n", encoding="utf-8")
+        write(marker)
+        return conformance.subprocess.CompletedProcess([_binary], 0, "{}", "")
+    return turn
+
+
+def _live_case_with(turn, name):
+    store = _store()
+    home = tempfile.mkdtemp(prefix="ihar-conf-home-")
+    workdir = tempfile.mkdtemp(prefix="ihar-conf-work-")
+    real_turn = conformance._vendor_turn
+    conformance._vendor_turn = turn
+    try:
+        conformance._stage(store, MANIFEST, "claude", home, auth_store=store)
+        return conformance._run_live_case("claude", "claude", home, workdir, name)
+    finally:
+        conformance._vendor_turn = real_turn
+        for directory in (store, home, workdir):
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_deny_fails_when_the_denied_command_still_ran():
+    def executed(marker):
+        Path(marker + ".decision").write_text("deny\n", encoding="utf-8")
+        target = marker[: -len("-hook")] + "-target"
+        Path(target).write_text("denied", encoding="utf-8")
+
+    status, detail = _live_case_with(_scripted_turn(executed), "deny-blocks-the-tool")
+    assert status == "failed", detail
+    assert "created its sentinel" in detail
+
+
+def test_timeout_rejects_a_hook_that_ended_before_the_limit():
+    # A probe that crashed right after starting also leaves no `.completed`; only the
+    # elapsed time tells it apart from a vendor that enforced the limit.
+    def crashed(marker):
+        Path(marker + ".ended").write_text("0.1", encoding="utf-8")
+
+    status, detail = _live_case_with(_scripted_turn(crashed), "timeout-behaviour")
+    assert status == "failed", detail
+
+
 def test_failed_rewrite_has_a_closed_reason():
     assert conformance._reason_for(
         "failed", "the vendor executed the unrewritten secret"

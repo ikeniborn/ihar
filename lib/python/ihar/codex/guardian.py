@@ -1507,9 +1507,12 @@ def run(store: Path, argv: list[str]) -> int:
                                 guest_resources=guest_resources)
                     finally:
                         connection.close()
-                # Drain the whole backlog: one accept per iteration made the excess
-                # client wait behind every pending one at the loop's per-pass cost.
-                while listener in readable:
+                # Drain the backlog, bounded so a flood of connects cannot stall the
+                # pass: one accept per pass made an excess client wait behind every
+                # pending one at the loop's per-pass cost.
+                for _ in range(_MAX_PENDING_CONTROL_CLIENTS + 1):
+                    if listener not in readable:
+                        break
                     try:
                         connection, _ = listener.accept()
                     except BlockingIOError:

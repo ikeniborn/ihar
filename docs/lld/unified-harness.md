@@ -3,7 +3,7 @@
 | Field | Value |
 |-------|-------|
 | Status | revision 25 (Claude vendor-owned `tui` setting beside `theme`) |
-| Date | 2026-09-23 |
+| Date | 2026-09-25 |
 | Derived from | `docs/hld/unified-harness.md` revision 4 (§6.10 console, R9 and R10) |
 | Review | `docs/lld/ihar_lld_architecture_review.md` — 9 P0, 11 P1, 5 P2 findings; disposition in §21 |
 | Verified against | Claude Code 2.1.274, Codex CLI 0.154.0 (`--help`, `app-server generate-json-schema`, binary strings), iclaude and icodex checkouts on this machine |

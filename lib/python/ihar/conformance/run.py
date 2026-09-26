@@ -61,7 +61,7 @@ if mode == "watch":
         try:
             with open(f"/proc/{parent}/stat", encoding="utf-8") as handle:
                 terminated = handle.read().rsplit(")", 1)[1].split()[0] == "Z"
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             terminated = True
         if terminated:
             ended.write_text(str(time.monotonic() - started), encoding="utf-8")
@@ -96,6 +96,7 @@ elif mode == "timeout":
             devnull = os.open(os.devnull, os.O_RDWR)
             for fd in (0, 1, 2):
                 os.dup2(devnull, fd)
+            os.closerange(3, os.sysconf("SC_OPEN_MAX"))
             os.execv(sys.executable, [sys.executable, __file__, "watch", str(parent),
                                       str(started), marker + ".ended"])
         os._exit(0)
@@ -684,6 +685,8 @@ def _run_live_case(vendor, binary, home, workdir, name):
     except (OSError, ValueError) as error:
         return "failed", f"the timeout probe did not record termination: {error}"
     maximum = _HOOK_TIMEOUT_SECONDS + _HOOK_TIMEOUT_TOLERANCE_SECONDS
+    if elapsed < _HOOK_TIMEOUT_SECONDS - 0.1:
+        return "failed", f"the timeout probe ended after {elapsed:.2f}s, before the limit"
     if elapsed > maximum:
         return "failed", f"the hook timeout took {elapsed:.2f}s, above {maximum:.2f}s"
     outcome = "executed" if os.path.isfile(target) else "blocked"
